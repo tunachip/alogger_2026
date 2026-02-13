@@ -374,6 +374,37 @@ class DB:
                 (local_video_path, job_id),
             )
 
+    def get_video(self, video_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT video_id, source_url, title, channel, duration_sec, upload_date
+                FROM videos
+                WHERE video_id=?
+                LIMIT 1
+                """,
+                (video_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def get_latest_done_job_for_video(self, video_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, video_id, local_video_path, transcript_json_path, finished_at
+                FROM ingest_jobs
+                WHERE video_id=? AND status='done'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (video_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
     def get_dashboard_snapshot(self, *, sample_size: int = 100) -> dict[str, Any]:
         with self.connect() as conn:
             count_rows = conn.execute(

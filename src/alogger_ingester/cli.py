@@ -41,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--url", help="Single youtube URL")
     enqueue.add_argument("--file", help="Path to text file containing one URL per line")
     enqueue.add_argument("--priority", type=int, default=0)
+    enqueue.add_argument(
+        "--allow-overwrite",
+        action="store_true",
+        help="Allow queueing URLs whose video_id already exists in DB",
+    )
 
     run = sub.add_parser("run", help="Run worker loop")
     run.add_argument("--workers", type=int, help="Override worker count")
@@ -80,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     oneshot.add_argument("--url", required=True, help="YouTube URL to process")
     oneshot.add_argument("--priority", type=int, default=0)
     oneshot.add_argument("--worker-id", type=int, default=99)
+    oneshot.add_argument(
+        "--allow-overwrite",
+        action="store_true",
+        help="Allow processing even if video already exists in DB",
+    )
     oneshot.add_argument(
         "--quiet-progress",
         action="store_true",
@@ -156,8 +166,29 @@ def main() -> None:
         if not urls:
             parser.error("enqueue requires --url and/or --file with at least one URL")
         service.init()
-        ids = service.enqueue(urls, priority=args.priority)
-        print(json.dumps({"queued": len(ids), "job_ids": ids}, indent=2))
+        result = service.enqueue_with_dedupe(
+            urls,
+            priority=args.priority,
+            allow_overwrite=bool(args.allow_overwrite),
+        )
+        print(
+            json.dumps(
+                {
+                    "queued": len(result["queued_ids"]),
+                    "job_ids": result["queued_ids"],
+                    "conflicts": [
+                        {
+                            "video_id": c.get("video_id"),
+                            "title": c.get("title"),
+                            "url": c.get("url"),
+                        }
+                        for c in result["conflicts"]
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return
 
     if args.command == "jobs":
@@ -213,8 +244,25 @@ def main() -> None:
 
     if args.command == "single-shot-test":
         service.init()
-        job_ids = service.enqueue([args.url], priority=args.priority)
-        job_id = int(job_ids[0])
+        queued = service.enqueue_with_dedupe(
+            [args.url],
+            priority=args.priority,
+            allow_overwrite=bool(args.allow_overwrite),
+        )
+        if not queued["queued_ids"]:
+            print(
+                json.dumps(
+                    {
+                        "queued": 0,
+                        "reason": "duplicate_video_id",
+                        "conflicts": queued["conflicts"],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return
+        job_id = int(queued["queued_ids"][0])
         if not args.quiet_progress:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] queued job_id={job_id} url={args.url}", flush=True)
 

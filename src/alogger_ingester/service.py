@@ -34,6 +34,42 @@ class IngesterService:
     def enqueue(self, urls: list[str], priority: int = 0) -> list[int]:
         return self.db.enqueue(urls, priority=priority)
 
+    def inspect_url(self, url: str) -> dict[str, object]:
+        self.init()
+        metadata = fetch_video_metadata(self.config, url)
+        video_id = str(metadata.get("id") or "")
+        if not video_id:
+            raise PipelineError("yt-dlp metadata did not include video id")
+        existing_video = self.db.get_video(video_id)
+        existing_done = self.db.get_latest_done_job_for_video(video_id)
+        return {
+            "url": url,
+            "video_id": video_id,
+            "title": metadata.get("title"),
+            "exists": existing_video is not None,
+            "existing_video": existing_video,
+            "existing_done_job": existing_done,
+        }
+
+    def enqueue_with_dedupe(
+        self,
+        urls: list[str],
+        *,
+        priority: int = 0,
+        allow_overwrite: bool = False,
+    ) -> dict[str, object]:
+        self.init()
+        queued_ids: list[int] = []
+        conflicts: list[dict[str, object]] = []
+        for url in urls:
+            info = self.inspect_url(url)
+            if bool(info.get("exists")) and not allow_overwrite:
+                conflicts.append(info)
+                continue
+            ids = self.db.enqueue([url], priority=priority)
+            queued_ids.extend(ids)
+        return {"queued_ids": queued_ids, "conflicts": conflicts}
+
     def run_forever(self) -> None:
         self.init()
         with ThreadPoolExecutor(max_workers=self.config.worker_count) as executor:

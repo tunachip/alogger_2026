@@ -1,6 +1,7 @@
 from __future__ import annotations
 import vlc
 import json
+import subprocess
 import sys
 import time
 import tkinter as tk
@@ -74,6 +75,8 @@ class TranscriptPlayer:
         self._search_results: list[dict[str, Any]] = []
         self.current_video_id: str | None = None
         self._load_fail_count = 0
+        self._startup_poll_count = 0
+        self._proxy_attempted = False
 
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
@@ -252,7 +255,7 @@ class TranscriptPlayer:
         self._row_text_ranges: list[tuple[str, str]] = []
 
         self.hint_var = tk.StringVar(value=(
-            "Type=precise filter | Up/Down=hover | Enter=jump | Ctrl-Space=play/pause | "
+            "Type=precise filter | Up/Down=hover | Enter=jump | Ctrl-Space/Ctrl-P play/pause | "
             "Left/Right=skim | PgUp/PgDn/Home/End move | Ctrl-C clear filter | "
             "Ctrl--/Ctrl-= text size | Ctrl-F search | Ctrl-N ingest | Ctrl-I jobs | Esc Esc=quit"
         ))
@@ -276,6 +279,7 @@ class TranscriptPlayer:
         self.root.bind("<Down>", self._on_down)
         self.root.bind("<Return>", self._on_return)
         self.root.bind("<Control-space>", self._on_toggle_play)
+        self.root.bind("<Control-KeyPress-p>", self._on_toggle_play)
         self.root.bind("<Left>", self._on_left)
         self.root.bind("<Right>", self._on_right)
         self.root.bind("<Prior>", self._on_page_up)
@@ -311,6 +315,7 @@ class TranscriptPlayer:
             raise FileNotFoundError(f"video path not found: {video_path}")
         self.video_path = video_path
         self.audio_path = audio_path
+        self.status_var.set(f"Loading media: {video_path.name}")
 
         try:
             self.player.stop()
@@ -330,7 +335,8 @@ class TranscriptPlayer:
         self._bind_video_output(handle)
 
         self.player.play()
-        self.root.after(550, lambda: self._post_media_load(start_sec, retry_without_audio=audio_path is not None))
+        self._startup_poll_count = 0
+        self.root.after(350, lambda: self._post_media_load(start_sec, retry_without_audio=audio_path is not None))
 
     def _bind_video_output(self, handle: int) -> None:
         if sys.platform.startswith("linux"):
@@ -344,6 +350,19 @@ class TranscriptPlayer:
 
     def _post_media_load(self, start_sec: float, *, retry_without_audio: bool) -> None:
         state = self.player.get_state()
+        if state in {vlc.State.Opening, vlc.State.Buffering, vlc.State.NothingSpecial}:
+            if self._startup_poll_count < 8:
+                self._startup_poll_count += 1
+                self.root.after(250, lambda: self._post_media_load(start_sec, retry_without_audio=retry_without_audio))
+                return
+
+        if state == vlc.State.Stopped:
+            if self._startup_poll_count < 3:
+                self._startup_poll_count += 1
+                self.player.play()
+                self.root.after(250, lambda: self._post_media_load(start_sec, retry_without_audio=retry_without_audio))
+                return
+
         if state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
             if retry_without_audio and self.audio_path is not None:
                 self.status_var.set("Media failed with sidecar audio, retrying video-only...")
@@ -359,12 +378,55 @@ class TranscriptPlayer:
                 self._set_player_media(alt, None, start_sec=start_sec)
                 return
 
+            if not self._proxy_attempted:
+                proxy = self._generate_proxy_playback(self.video_path, self.audio_path)
+                if proxy is not None and proxy.exists():
+                    self._proxy_attempted = True
+                    self.status_var.set(f"Retrying with compatibility proxy: {proxy.name}")
+                    self._set_player_media(proxy, None, start_sec=start_sec)
+                    return
+
             self.status_var.set(f"Failed to load media: {self.video_path} (state={state})")
             return
         if start_sec > 0:
             self.player.set_time(int(start_sec * 1000.0))
-        self.player.set_pause(1)
+        self.player.set_pause(0)
+        self.status_var.set("Ready")
         self._load_fail_count = 0
+        self._startup_poll_count = 0
+
+    def _generate_proxy_playback(self, video_path: Path, audio_path: Path | None) -> Path | None:
+        if not self.current_video_id:
+            return None
+        proxy_path = self.ingester_config.media_dir / f"{self.current_video_id}.proxy.mp4"
+        cmd: list[str] = [self.ingester_config.ffmpeg_binary, "-y", "-i", str(video_path)]
+        if audio_path and audio_path.exists():
+            cmd.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0"])
+        else:
+            cmd.extend(["-map", "0:v:0"])
+            if _media_has_audio_stream(video_path) is True:
+                cmd.extend(["-map", "0:a:0"])
+        cmd.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                str(proxy_path),
+            ]
+        )
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None
+        if not proxy_path.exists():
+            return None
+        return proxy_path
 
     def _pick_alternate_video_path(self) -> Path | None:
         if not self.current_video_id:
@@ -518,17 +580,19 @@ class TranscriptPlayer:
     def _on_toggle_play(self, _event: tk.Event[tk.Misc]) -> str:
         state = self.player.get_state()
         if state == vlc.State.Playing:
-            self.player.pause()
+            self.player.set_pause(1)
             self.status_var.set("Paused")
         elif state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
             self.player.set_time(0)
             self.player.play()
+            self.root.after(120, lambda: self.player.set_pause(0))
             self.status_var.set("Playing")
         elif state == vlc.State.Paused:
-            self.player.play()
+            self.player.set_pause(0)
             self.status_var.set("Playing")
         else:
             self.player.play()
+            self.root.after(120, lambda: self.player.set_pause(0))
             self.status_var.set("Playing")
         return "break"
 
@@ -670,15 +734,46 @@ class TranscriptPlayer:
         popup = tk.Toplevel(self.root)
         self._apply_popup_style(popup, "Search DB", "900x620")
         self._search_popup = popup
-        popup.rowconfigure(1, weight=1)
+        popup.rowconfigure(2, weight=1)
         popup.columnconfigure(0, weight=1)
 
         query_var = tk.StringVar(value=self.filter_var.get().strip())
         query_entry = ttk.Entry(popup, textvariable=query_var, style="Filter.TEntry")
         query_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
-        listbox = tk.Listbox(
+        header = tk.Label(
             popup,
+            text="Matches  Title (matches = number of matching caption segments)",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=4,
+        )
+        header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+
+        body = tk.Frame(popup, bg="#111111")
+        body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        count_list = tk.Listbox(
+            body,
+            bg="#000000",
+            fg="#f7d154",
+            selectbackground="#161616",
+            selectforeground="#f7d154",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            width=8,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2, "bold"),
+            exportselection=False,
+            takefocus=0,
+        )
+        title_list = tk.Listbox(
+            body,
             bg="#000000",
             fg="#ffffff",
             selectbackground="#161616",
@@ -689,7 +784,8 @@ class TranscriptPlayer:
             font=(FONT["STYLE"], FONT["SIZE"] - 2),
             exportselection=False,
         )
-        listbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        count_list.grid(row=0, column=0, sticky="ns")
+        title_list.grid(row=0, column=1, sticky="nsew")
 
         hint = tk.Label(
             popup,
@@ -701,11 +797,22 @@ class TranscriptPlayer:
             padx=8,
             pady=6,
         )
-        hint.grid(row=2, column=0, sticky="ew")
+        hint.grid(row=3, column=0, sticky="ew")
+
+        def _set_selection(idx: int) -> None:
+            if not self._search_results:
+                return
+            idx = max(0, min(idx, len(self._search_results) - 1))
+            for lb in (count_list, title_list):
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(idx)
+                lb.activate(idx)
+                lb.see(idx)
 
         def refresh_results(*_args: object) -> None:
             query = query_var.get().strip()
-            listbox.delete(0, tk.END)
+            count_list.delete(0, tk.END)
+            title_list.delete(0, tk.END)
             self._search_results = []
             if not query:
                 return
@@ -714,13 +821,13 @@ class TranscriptPlayer:
             for row in self._search_results:
                 title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
                 count = int(row.get("match_count") or 0)
-                listbox.insert(tk.END, f"{count:>4}  {title}")
+                count_list.insert(tk.END, f"{count:>4}")
+                title_list.insert(tk.END, title)
             if self._search_results:
-                listbox.selection_set(0)
-                listbox.activate(0)
+                _set_selection(0)
 
         def open_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
-            sel = listbox.curselection()
+            sel = title_list.curselection()
             if not sel:
                 return "break"
             idx = int(sel[0])
@@ -758,10 +865,23 @@ class TranscriptPlayer:
             self.filter_entry.focus_set()
             return "break"
 
+        def move_sel(delta: int) -> str:
+            sel = title_list.curselection()
+            cur = int(sel[0]) if sel else 0
+            _set_selection(cur + delta)
+            return "break"
+
         query_var.trace_add("write", refresh_results)
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
         popup.bind("<Return>", open_selected)
-        listbox.bind("<Double-Button-1>", open_selected)
+        popup.bind("<Up>", lambda _e: move_sel(-1))
+        popup.bind("<Down>", lambda _e: move_sel(1))
+        query_entry.bind("<Up>", lambda _e: move_sel(-1))
+        query_entry.bind("<Down>", lambda _e: move_sel(1))
+        title_list.bind("<Up>", lambda _e: move_sel(-1))
+        title_list.bind("<Down>", lambda _e: move_sel(1))
+        title_list.bind("<Double-Button-1>", open_selected)
+        count_list.bind("<Button-1>", lambda _e: "break")
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
         refresh_results()
         query_entry.focus_set()
@@ -792,6 +912,7 @@ class TranscriptPlayer:
             pady=6,
         )
         status_lbl.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        pending_confirm: dict[str, object] = {"video_id": None, "url": None}
 
         def enqueue_now(_event: tk.Event[tk.Misc] | None = None) -> str:
             url = url_var.get().strip()
@@ -799,7 +920,27 @@ class TranscriptPlayer:
                 status.set("URL required")
                 return "break"
             try:
-                ids = self.ingester.enqueue([url])
+                info = self.ingester.inspect_url(url)
+                exists = bool(info.get("exists"))
+                video_id = str(info.get("video_id") or "")
+                if exists:
+                    if pending_confirm.get("video_id") != video_id or pending_confirm.get("url") != url:
+                        pending_confirm["video_id"] = video_id
+                        pending_confirm["url"] = url
+                        title = str(info.get("title") or video_id)
+                        status.set(
+                            f"Exists: {title} ({video_id}). Press Enter again to save over, Esc to cancel."
+                        )
+                        return "break"
+                    result = self.ingester.enqueue_with_dedupe([url], allow_overwrite=True)
+                else:
+                    pending_confirm["video_id"] = None
+                    pending_confirm["url"] = None
+                    result = self.ingester.enqueue_with_dedupe([url], allow_overwrite=False)
+                ids = list(result.get("queued_ids") or [])
+                if not ids:
+                    status.set("Not queued")
+                    return "break"
                 status.set(f"Queued job_id={ids[0]}")
                 self.status_var.set(f"Queued ingest job {ids[0]}")
                 url_var.set("")
@@ -912,6 +1053,7 @@ class TranscriptPlayer:
     ) -> None:
         self.current_video_id = video_id
         self._load_fail_count = 0
+        self._proxy_attempted = False
         self.transcript_json = transcript_json
         self.segments = self._load_segments(transcript_json)
         self._segment_starts = [seg.start_sec for seg in self.segments]

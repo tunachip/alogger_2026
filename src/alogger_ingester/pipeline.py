@@ -138,6 +138,23 @@ def _media_has_video_stream(video_path: Path) -> bool | None:
     return any(str(s.get("codec_type")) == "video" for s in streams if isinstance(s, dict))
 
 
+def _decode_smoke_test(ffmpeg_bin: str, media_path: Path) -> bool:
+    cmd = [
+        ffmpeg_bin,
+        "-v",
+        "error",
+        "-t",
+        "2",
+        "-i",
+        str(media_path),
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode == 0
+
+
 def _pick_largest(paths: list[Path]) -> Path | None:
     if not paths:
         return None
@@ -454,8 +471,11 @@ def merge_streams_for_playback(
     if not video_source or not audio_source:
         return None
 
-    merged_path = config.media_dir / f"{video_id}.merged.mkv"
-    cmd = [
+    merged_mp4 = config.media_dir / f"{video_id}.merged.mp4"
+    merged_mkv = config.media_dir / f"{video_id}.merged.mkv"
+
+    # 1) Preferred: MP4 stream-copy remux (fastest).
+    cmd_copy_mp4 = [
         config.ffmpeg_binary,
         "-y",
         "-i",
@@ -468,9 +488,104 @@ def merge_streams_for_playback(
         "1:a:0",
         "-c",
         "copy",
-        str(merged_path),
+        str(merged_mp4),
     ]
-    run_cmd(cmd, on_process=on_process, should_terminate=should_terminate)
-    if merged_path.exists() and _media_has_audio_stream(merged_path) is True:
-        return merged_path
+    proc = subprocess.run(cmd_copy_mp4, capture_output=True, text=True)
+    if (
+        proc.returncode == 0
+        and merged_mp4.exists()
+        and _media_has_audio_stream(merged_mp4) is True
+        and _media_has_video_stream(merged_mp4) is True
+        and _decode_smoke_test(config.ffmpeg_binary, merged_mp4)
+    ):
+        return merged_mp4
+
+    # 2) MP4 with audio transcode fallback (keeps video stream).
+    cmd_aac_mp4 = [
+        config.ffmpeg_binary,
+        "-y",
+        "-i",
+        str(video_source),
+        "-i",
+        str(audio_source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        str(merged_mp4),
+    ]
+    proc = subprocess.run(cmd_aac_mp4, capture_output=True, text=True)
+    if (
+        proc.returncode == 0
+        and merged_mp4.exists()
+        and _media_has_audio_stream(merged_mp4) is True
+        and _media_has_video_stream(merged_mp4) is True
+        and _decode_smoke_test(config.ffmpeg_binary, merged_mp4)
+    ):
+        return merged_mp4
+
+    # 3) Last resort: MKV stream-copy remux.
+    cmd_copy_mkv = [
+        config.ffmpeg_binary,
+        "-y",
+        "-i",
+        str(video_source),
+        "-i",
+        str(audio_source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        str(merged_mkv),
+    ]
+    run_cmd(cmd_copy_mkv, on_process=on_process, should_terminate=should_terminate)
+    if (
+        merged_mkv.exists()
+        and _media_has_audio_stream(merged_mkv) is True
+        and _media_has_video_stream(merged_mkv) is True
+        and _decode_smoke_test(config.ffmpeg_binary, merged_mkv)
+    ):
+        return merged_mkv
+
+    # 4) compatibility transcode fallback for difficult codecs/containers.
+    compat_mp4 = config.media_dir / f"{video_id}.playback.mp4"
+    cmd_compat = [
+        config.ffmpeg_binary,
+        "-y",
+        "-i",
+        str(video_source),
+        "-i",
+        str(audio_source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        str(compat_mp4),
+    ]
+    run_cmd(cmd_compat, on_process=on_process, should_terminate=should_terminate)
+    if (
+        compat_mp4.exists()
+        and _media_has_audio_stream(compat_mp4) is True
+        and _media_has_video_stream(compat_mp4) is True
+        and _decode_smoke_test(config.ffmpeg_binary, compat_mp4)
+    ):
+        return compat_mp4
     return None
