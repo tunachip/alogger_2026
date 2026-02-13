@@ -161,7 +161,7 @@ class TranscriptPlayer:
             padx=10,
             pady=6,
         )
-        clock_box.grid(row=1, column=0, sticky="ew")
+        clock_box.grid(row=2, column=0, sticky="ew")
 
         self.caption_now_var = tk.StringVar(value="")
         self.caption_now_box = tk.Label(
@@ -176,7 +176,7 @@ class TranscriptPlayer:
             pady=8,
             wraplength=400,
         )
-        self.caption_now_box.grid(row=2, column=0, sticky="ew")
+        self.caption_now_box.grid(row=1, column=0, sticky="ew")
         self.left_panel.bind("<Configure>", self._on_left_resize)
 
         self.status_var = tk.StringVar(value="Idle")

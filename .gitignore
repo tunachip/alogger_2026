@@ -14,6 +14,9 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+build/
+dist/
+release/gui-only/upload_payload/
 
 # Local runtime data / artifacts
 data/media/

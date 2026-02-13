@@ -18,6 +18,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### GUI-Only Release
+
+```bash
+# local GUI entrypoint (no ingest CLI parser)
+PYTHONPATH=src python -m alogger_player
+
+# create a source payload with only GUI surface
+./release/gui-only/export_gui_only.sh
+
+# optional: build single-file GUI binary
+./release/gui-only/build_gui_binary.sh
+```
+
+The exported payload is written to `release/gui-only/upload_payload`.
+For Windows in that payload, run `install_windows.bat` then `run_gui.bat`.
+
 Install runtime binaries:
 - `yt-dlp`
 - `ffmpeg`
