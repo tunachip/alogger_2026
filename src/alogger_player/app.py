@@ -12,12 +12,12 @@ from tkinter import ttk
 from typing import Any
 
 from alogger_ingester.config import IngesterConfig
+from alogger_ingester.service import IngesterService
 from alogger_ingester.pipeline import (
     _media_has_audio_stream,
     _media_has_video_stream,
     resolve_playback_media_path,
 )
-from alogger_ingester.service import IngesterService
 
 # === Config ===
 FONT = {
@@ -88,7 +88,7 @@ class TranscriptPlayer:
 
         self.root = tk.Tk()
         self.root.title("Alogger Player")
-        self.root.geometry("1400x850")
+        self.root.geometry("1600x1050")
         self.root.configure(bg="#111111")
 
         self._text_font = tkfont.Font(family=FONT['STYLE'], size=FONT['SIZE'])
@@ -130,8 +130,8 @@ class TranscriptPlayer:
         self.shell = shell
 
         left = tk.Frame(shell, bg="#000000")
-        self.left_panel = left
         right = tk.Frame(shell, bg="#111111")
+        self.left_panel = left
         self.right_panel = right
         shell.add(left, minsize=1000)
         shell.add(right, minsize=200)
@@ -230,31 +230,12 @@ class TranscriptPlayer:
         )
         self.caption_view.configure(state="disabled")
 
-        self.caption_view.tag_configure(
-            "row",
-            lmargin1=0,
-            lmargin2=self._wrap_indent_px
-        )
-        self.caption_view.tag_configure(
-            "ts",
-            foreground="#8f8f8f"
-        )
-        self.caption_view.tag_configure(
-            "txt",
-            foreground="#ffffff"
-        )
-        self.caption_view.tag_configure(
-            "match",
-            foreground="#f7d154"
-        )
-        self.caption_view.tag_configure(
-            "selected",
-            background="#282828"
-        )
-        self.caption_view.tag_configure(
-            "selected_txt",
-            font=self._text_font_bold
-        )
+        self.caption_view.tag_configure("row", lmargin1=0, lmargin2=self._wrap_indent_px)
+        self.caption_view.tag_configure("ts", foreground="#8f8f8f")
+        self.caption_view.tag_configure("txt", foreground="#ffffff")
+        self.caption_view.tag_configure("match", foreground="#f7d154")
+        self.caption_view.tag_configure("selected", background="#282828")
+        self.caption_view.tag_configure("selected_txt", font=self._text_font_bold)
 
         self._row_ranges: list[tuple[str, str]] = []
         self._row_text_ranges: list[tuple[str, str]] = []
@@ -339,13 +320,11 @@ class TranscriptPlayer:
             if not audio_path.exists():
                 raise FileNotFoundError(f"audio path not found: {audio_path}")
             media.add_option(f"input-slave={audio_path}")
-        self.player.set_media(media)
 
+        self.player.set_media(media)
         self.root.update_idletasks()
         handle = self.video_panel.winfo_id()
-
         self._bind_video_output(handle)
-
         self.player.play()
         self._startup_poll_count = 0
         self.root.after(350, lambda: self._post_media_load(start_sec, retry_without_audio=audio_path is not None))
@@ -362,44 +341,41 @@ class TranscriptPlayer:
 
     def _post_media_load(self, start_sec: float, *, retry_without_audio: bool) -> None:
         state = self.player.get_state()
-        if state in {vlc.State.Opening, vlc.State.Buffering, vlc.State.NothingSpecial}:
-            if self._startup_poll_count < 8:
-                self._startup_poll_count += 1
-                self.root.after(250, lambda: self._post_media_load(start_sec, retry_without_audio=retry_without_audio))
-                return
-
-        if state == vlc.State.Stopped:
-            if self._startup_poll_count < 3:
-                self._startup_poll_count += 1
-                self.player.play()
-                self.root.after(250, lambda: self._post_media_load(start_sec, retry_without_audio=retry_without_audio))
-                return
-
-        if state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
-            if retry_without_audio and self.audio_path is not None:
-                self.status_var.set("Media failed with sidecar audio, retrying video-only...")
-                self._set_player_media(self.video_path, None, start_sec=start_sec)
-                return
-
-            alt = self._pick_alternate_video_path()
-            if alt is not None:
-                self._load_fail_count += 1
-                self.status_var.set(
-                    f"Media load failed ({self.video_path.name}, {state}); trying {alt.name}..."
-                )
-                self._set_player_media(alt, None, start_sec=start_sec)
-                return
-
-            if not self._proxy_attempted:
-                proxy = self._generate_proxy_playback(self.video_path, self.audio_path)
-                if proxy is not None and proxy.exists():
-                    self._proxy_attempted = True
-                    self.status_var.set(f"Retrying with compatibility proxy: {proxy.name}")
-                    self._set_player_media(proxy, None, start_sec=start_sec)
+        match state:
+            case vlc.State.Opening | vlc.State.Buffering | vlc.State.NothingSpecial:
+                if self._startup_poll_count < 8:
+                    self._startup_poll_count += 1
+                    self.root.after(250, lambda: self._post_media_load(start_sec, retry_without_audio=retry_without_audio))
                     return
 
-            self.status_var.set(f"Failed to load media: {self.video_path} (state={state})")
-            return
+            case vlc.State.Stopped:
+                if self._startup_poll_count < 3:
+                    self._startup_poll_count += 1
+                    self.player.play()
+                    self.root.after(250, lambda: self._post_media_load(start_sec, retry_without_audio=retry_without_audio))
+                    return
+
+            case vlc.State.Ended | vlc.State.Error | vlc.State.Stopped:
+                if retry_without_audio and self.audio_path is not None:
+                    self.status_var.set("Media failed with sidecar audio, retrying video-only...")
+                    self._set_player_media(self.video_path, None, start_sec=start_sec)
+                    return
+                alt = self._pick_alternate_video_path()
+                if alt is not None:
+                    self._load_fail_count += 1
+                    self.status_var.set(f"Media load failed ({self.video_path.name}, {state}); trying {alt.name}...")
+                    self._set_player_media(alt, None, start_sec=start_sec)
+                    return
+                if not self._proxy_attempted:
+                    proxy = self._generate_proxy_playback(self.video_path, self.audio_path)
+                    if proxy is not None and proxy.exists():
+                        self._proxy_attempted = True
+                        self.status_var.set(f"Retrying with compatibility proxy: {proxy.name}")
+                        self._set_player_media(proxy, None, start_sec=start_sec)
+                        return
+                self.status_var.set(f"Failed to load media: {self.video_path} (state={state})")
+                return
+
         if start_sec > 0:
             self.player.set_time(int(start_sec * 1000.0))
         self.player.set_pause(0)
@@ -489,15 +465,13 @@ class TranscriptPlayer:
                 continue
             start_sec = float(seg.get("start", 0.0))
             end_sec = float(seg.get("end", start_sec))
-            rows.append(
-                SegmentRow(
-                    index=i,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
-                    text=text,
-                    text_lc=text.lower(),
-                )
-            )
+            rows.append(SegmentRow(
+                index=i,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                text=text,
+                text_lc=text.lower(),
+            ))
         return rows
 
     def _on_filter_change(self, *_args: object) -> None:
@@ -505,9 +479,7 @@ class TranscriptPlayer:
         if not query:
             self.filtered_indexes = list(range(len(self.segments)))
         else:
-            self.filtered_indexes = [
-                idx for idx, seg in enumerate(self.segments) if query in seg.text_lc
-            ]
+            self.filtered_indexes = [idx for idx, seg in enumerate(self.segments) if query in seg.text_lc]
         self.selected_filtered_pos = 0
         self._refresh_caption_view()
 
@@ -524,15 +496,8 @@ class TranscriptPlayer:
             prefix = f"[{_fmt_hms(seg.start_sec)}] "
             self.caption_view.insert(tk.END, prefix + seg.text + "\n", ("row",))
             self.caption_view.tag_add("ts", line_start, f"{line_start}+{len(prefix)}c")
-            self.caption_view.tag_add(
-                "txt",
-                f"{line_start}+{len(prefix)}c",
-                f"{line_start}+{len(prefix) + len(seg.text)}c",
-            )
-            self._row_text_ranges.append((
-                f"{line_start}+{len(prefix)}c",
-                f"{line_start}+{len(prefix) + len(seg.text)}c",
-            ))
+            self.caption_view.tag_add( "txt", f"{line_start}+{len(prefix)}c", f"{line_start}+{len(prefix) + len(seg.text)}c",)
+            self._row_text_ranges.append(( f"{line_start}+{len(prefix)}c", f"{line_start}+{len(prefix) + len(seg.text)}c",))
             line_end = self.caption_view.index("end-1c")
             self._row_ranges.append((line_start, line_end))
 
@@ -576,7 +541,8 @@ class TranscriptPlayer:
         )
 
     def _current_segment(self) -> SegmentRow | None:
-        if not self.filtered_indexes: return None
+        if not self.filtered_indexes:
+            return None
         return self.segments[self.filtered_indexes[self.selected_filtered_pos]]
 
     def _on_up(self, _event: tk.Event[tk.Misc]) -> str:
@@ -593,7 +559,8 @@ class TranscriptPlayer:
 
     def _on_return(self, _event: tk.Event[tk.Misc]) -> str:
         seg = self._current_segment()
-        if seg is None: return "break"
+        if seg is None:
+            return "break"
         self._seek_to_absolute(seg.start_sec)
         self.status_var.set(f"Jumped to {_fmt_hms(seg.start_sec)}")
         return "break"
@@ -607,19 +574,20 @@ class TranscriptPlayer:
 
     def _on_toggle_play(self, _event: tk.Event[tk.Misc]) -> str:
         state = self.player.get_state()
-        if state == vlc.State.Playing:
-            self.player.set_pause(1)
-            self.status_var.set("Paused")
-        elif state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
-            self._seek_to_absolute(0.0)
-            self.status_var.set("Playing")
-        elif state == vlc.State.Paused:
-            self.player.set_pause(0)
-            self.status_var.set("Playing")
-        else:
-            self.player.play()
-            self.root.after(120, lambda: self.player.set_pause(0))
-            self.status_var.set("Playing")
+        match state:
+            case vlc.State.Playing:
+                self.player.set_pause(1)
+                self.status_var.set("Paused")
+            case vlc.State.Ended | vlc.State.Error | vlc.State.Stopped:
+                self._seek_to_absolute(0.0)
+                self.status_var.set("Playing")
+            case vlc.State.Paused:
+                self.player.set_pause(0)
+                self.status_var.set("Playing")
+            case _:
+                self.player.play()
+                self.root.after(120, lambda: self.player.set_pause(0))
+                self.status_var.set("Playing")
         return "break"
 
     def _on_left(self, _event: tk.Event[tk.Misc]) -> str:
@@ -694,7 +662,11 @@ class TranscriptPlayer:
     def _seek_to_absolute(self, sec: float) -> None:
         target_ms = int(max(0.0, sec) * 1000.0)
         state = self.player.get_state()
-        if state in {vlc.State.Ended, vlc.State.Stopped, vlc.State.Error}:
+        if state in {
+            vlc.State.Ended,
+            vlc.State.Stopped,
+            vlc.State.Error
+        }:
             self.player.stop()
             self.player.play()
             self.root.after(120, lambda: self.player.set_time(target_ms))
@@ -741,14 +713,13 @@ class TranscriptPlayer:
 
     def _update_progress_bar_width(self, panel_width: int | None = None) -> None:
         width = panel_width if panel_width is not None else int(self.left_panel.winfo_width())
-        if width <= 0:
-            return
+        if width <= 0: return
         available_px = max(120, width - 24)
         # Prefix is fixed-width and the bar uses mono block chars.
         prefix_px = self._text_font.measure("[00:00:00] ")
         block_px = max(1, self._text_font.measure("█"))
         bar_chars = max(12, min(140, int((available_px - prefix_px) / block_px)))
-        self._progress_bar_width = bar_chars
+        self._progress_bar_width = bar_chars + 24
 
     def _refresh_clock_now(self) -> None:
         pos_ms = self.player.get_time()
@@ -1256,7 +1227,9 @@ class TranscriptPlayer:
         self.filter_entry.focus_set()
 
     def _refresh_jobs_popup(self) -> None:
-        if not self._jobs_popup or not self._jobs_popup.winfo_exists() or not self._jobs_text:
+        if not self._jobs_popup \
+            or not self._jobs_popup.winfo_exists() \
+            or not self._jobs_text:
             return
         try:
             snapshot = self.ingester.jobs_summary(limit=30)
