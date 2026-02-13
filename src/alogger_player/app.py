@@ -3,7 +3,6 @@ import vlc
 import json
 import subprocess
 import sys
-import time
 import tkinter as tk
 import tkinter.font as tkfont
 from bisect import bisect_right
@@ -66,13 +65,14 @@ class TranscriptPlayer:
         self._segment_starts = [seg.start_sec for seg in self.segments]
         self.filtered_indexes = list(range(len(self.segments)))
         self.selected_filtered_pos = 0
-        self._last_esc_time = 0.0
         self._search_popup: tk.Toplevel | None = None
+        self._video_picker_popup: tk.Toplevel | None = None
         self._ingest_popup: tk.Toplevel | None = None
         self._jobs_popup: tk.Toplevel | None = None
         self._jobs_text: tk.Text | None = None
         self._jobs_after_id: str | None = None
         self._search_results: list[dict[str, Any]] = []
+        self._video_picker_results: list[dict[str, Any]] = []
         self.current_video_id: str | None = None
         self._load_fail_count = 0
         self._startup_poll_count = 0
@@ -101,7 +101,7 @@ class TranscriptPlayer:
 
         self._refresh_caption_view()
         if not self.video_path:
-            self.status_var.set("No video loaded. Press Ctrl-F to search DB and load one.")
+            self.status_var.set("No video loaded. Press Ctrl-O to open by title or Ctrl-F to search captions.")
         self._tick_ui()
 
     def _setup_styles(self) -> None:
@@ -257,7 +257,8 @@ class TranscriptPlayer:
         self.hint_var = tk.StringVar(value=(
             "Type=precise filter | Up/Down=hover | Enter=jump | Ctrl-Space/Ctrl-P play/pause | "
             "Left/Right=skim | PgUp/PgDn/Home/End move | Ctrl-C clear filter | "
-            "Ctrl--/Ctrl-= text size | Ctrl-F search | Ctrl-N ingest | Ctrl-I jobs | Esc Esc=quit"
+            "Ctrl--/Ctrl-= text size | Ctrl-F transcript search | Ctrl-O title search | "
+            "Ctrl-N ingest | Ctrl-I jobs | Ctrl-Q quit"
         ))
         hint = tk.Label(
             right,
@@ -286,12 +287,13 @@ class TranscriptPlayer:
         self.root.bind("<Next>", self._on_page_down)
         self.root.bind("<Home>", self._on_home)
         self.root.bind("<End>", self._on_end)
-        self.root.bind("<Escape>", self._on_escape)
+        self.root.bind("<Control-KeyPress-q>", self._on_quit)
         self.root.bind("<Control-c>", self._on_clear_filter)
         self.root.bind("<Control-minus>", self._on_font_smaller)
         self.root.bind("<Control-equal>", self._on_font_larger)
         self.root.bind("<Control-plus>", self._on_font_larger)
         self.root.bind("<Control-KeyPress-f>", self._on_open_search_popup)
+        self.root.bind("<Control-KeyPress-o>", self._on_open_video_picker_popup)
         self.root.bind("<Control-KeyPress-n>", self._on_open_ingest_popup)
         self.root.bind("<Control-KeyPress-i>", self._on_toggle_jobs_popup)
 
@@ -300,7 +302,11 @@ class TranscriptPlayer:
         self.root.after(50, lambda: self.filter_entry.focus_set())
 
     def _build_vlc(self) -> None:
-        self.instance = vlc.Instance("--quiet", "--no-video-title-show")
+        self.instance = vlc.Instance(
+            "--quiet",
+            "--no-video-title-show",
+            "--avcodec-hw=none",
+        )
         if not self.instance:
             raise Exception('self.instance failed to load.')
 
@@ -410,14 +416,26 @@ class TranscriptPlayer:
             [
                 "-c:v",
                 "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-profile:v",
+                "high",
+                "-level",
+                "4.1",
                 "-preset",
                 "veryfast",
                 "-crf",
                 "23",
                 "-c:a",
                 "aac",
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
                 "-b:a",
                 "160k",
+                "-movflags",
+                "+faststart",
                 str(proxy_path),
             ]
         )
@@ -566,7 +584,7 @@ class TranscriptPlayer:
     def _on_return(self, _event: tk.Event[tk.Misc]) -> str:
         seg = self._current_segment()
         if seg is None: return "break"
-        self.player.set_time(int(seg.start_sec * 1000.0))
+        self._seek_to_absolute(seg.start_sec)
         self.status_var.set(f"Jumped to {_fmt_hms(seg.start_sec)}")
         return "break"
 
@@ -583,9 +601,7 @@ class TranscriptPlayer:
             self.player.set_pause(1)
             self.status_var.set("Paused")
         elif state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
-            self.player.set_time(0)
-            self.player.play()
-            self.root.after(120, lambda: self.player.set_pause(0))
+            self._seek_to_absolute(0.0)
             self.status_var.set("Playing")
         elif state == vlc.State.Paused:
             self.player.set_pause(0)
@@ -604,13 +620,8 @@ class TranscriptPlayer:
         self._seek_relative(self.skim_seconds)
         return "break"
 
-    def _on_escape(self, _event: tk.Event[tk.Misc]) -> str:
-        now = time.monotonic()
-        if now - self._last_esc_time <= 0.45:
-            self.close()
-            return "break"
-        self._last_esc_time = now
-        self.status_var.set("Press Esc again to quit")
+    def _on_quit(self, _event: tk.Event[tk.Misc]) -> str:
+        self.close()
         return "break"
 
     def _on_page_up(self, _event: tk.Event[tk.Misc]) -> str:
@@ -659,8 +670,19 @@ class TranscriptPlayer:
         now_ms = self.player.get_time()
         if now_ms < 0: now_ms = 0
         target_ms = int(max(0.0, (now_ms / 1000.0) + delta_sec) * 1000.0)
-        self.player.set_time(target_ms)
+        self._seek_to_absolute(target_ms / 1000.0)
         self.status_var.set(f"Seek -> {_fmt_hms(target_ms / 1000.0)}")
+
+    def _seek_to_absolute(self, sec: float) -> None:
+        target_ms = int(max(0.0, sec) * 1000.0)
+        state = self.player.get_state()
+        if state in {vlc.State.Ended, vlc.State.Stopped, vlc.State.Error}:
+            self.player.stop()
+            self.player.play()
+            self.root.after(120, lambda: self.player.set_time(target_ms))
+            self.root.after(200, lambda: self.player.set_pause(0))
+            return
+        self.player.set_time(target_ms)
 
     def _tick_ui(self) -> None:
         state = self.player.get_state()
@@ -701,12 +723,16 @@ class TranscriptPlayer:
     def _set_initial_split_ratio(self) -> None:
         total_w = self.shell.winfo_width()
         if total_w <= 0: return
-        # 3:2 split means left pane should occupy 60% of total width.
-        x = int(total_w * 3 / 5)
+        # Video pane default: 3/4 width.
+        x = int(total_w * 3 / 4)
         self.shell.sash_place(0, x, 0)
 
     def _on_open_search_popup(self, _event: tk.Event[tk.Misc]) -> str:
         self._open_search_popup()
+        return "break"
+
+    def _on_open_video_picker_popup(self, _event: tk.Event[tk.Misc]) -> str:
+        self._open_video_picker_popup()
         return "break"
 
     def _on_open_ingest_popup(self, _event: tk.Event[tk.Misc]) -> str:
@@ -862,6 +888,162 @@ class TranscriptPlayer:
             )
             popup.destroy()
             self._search_popup = None
+            self.filter_entry.focus_set()
+            return "break"
+
+        def move_sel(delta: int) -> str:
+            sel = title_list.curselection()
+            cur = int(sel[0]) if sel else 0
+            _set_selection(cur + delta)
+            return "break"
+
+        query_var.trace_add("write", refresh_results)
+        popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
+        popup.bind("<Return>", open_selected)
+        popup.bind("<Up>", lambda _e: move_sel(-1))
+        popup.bind("<Down>", lambda _e: move_sel(1))
+        query_entry.bind("<Up>", lambda _e: move_sel(-1))
+        query_entry.bind("<Down>", lambda _e: move_sel(1))
+        title_list.bind("<Up>", lambda _e: move_sel(-1))
+        title_list.bind("<Down>", lambda _e: move_sel(1))
+        title_list.bind("<Double-Button-1>", open_selected)
+        count_list.bind("<Button-1>", lambda _e: "break")
+        popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
+        refresh_results()
+        query_entry.focus_set()
+
+    def _open_video_picker_popup(self) -> None:
+        if self._video_picker_popup and self._video_picker_popup.winfo_exists():
+            self._video_picker_popup.focus_force()
+            return
+
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Open Video", "900x620")
+        self._video_picker_popup = popup
+        popup.rowconfigure(2, weight=1)
+        popup.columnconfigure(0, weight=1)
+
+        query_var = tk.StringVar(value="")
+        query_entry = ttk.Entry(popup, textvariable=query_var, style="Filter.TEntry")
+        query_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+
+        header = tk.Label(
+            popup,
+            text="Matches  Title (matches = number of title matches)",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=4,
+        )
+        header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+
+        body = tk.Frame(popup, bg="#111111")
+        body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        count_list = tk.Listbox(
+            body,
+            bg="#000000",
+            fg="#f7d154",
+            selectbackground="#161616",
+            selectforeground="#f7d154",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            width=8,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2, "bold"),
+            exportselection=False,
+            takefocus=0,
+        )
+        title_list = tk.Listbox(
+            body,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            exportselection=False,
+        )
+        count_list.grid(row=0, column=0, sticky="ns")
+        title_list.grid(row=0, column=1, sticky="nsew")
+
+        hint = tk.Label(
+            popup,
+            text="Type title filter, Up/Down select, Enter open video, Esc close",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        hint.grid(row=3, column=0, sticky="ew")
+
+        def _set_selection(idx: int) -> None:
+            if not self._video_picker_results:
+                return
+            idx = max(0, min(idx, len(self._video_picker_results) - 1))
+            for lb in (count_list, title_list):
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(idx)
+                lb.activate(idx)
+                lb.see(idx)
+
+        def refresh_results(*_args: object) -> None:
+            query = query_var.get().strip()
+            count_list.delete(0, tk.END)
+            title_list.delete(0, tk.END)
+            self._video_picker_results = []
+            rows = self.ingester.search_video_titles(query, limit=300)
+            self._video_picker_results = [dict(r) for r in rows]
+            for row in self._video_picker_results:
+                title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+                count = int(row.get("match_count") or 0)
+                count_list.insert(tk.END, f"{count:>4}")
+                title_list.insert(tk.END, title)
+            if self._video_picker_results:
+                _set_selection(0)
+
+        def open_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sel = title_list.curselection()
+            if not sel:
+                return "break"
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(self._video_picker_results):
+                return "break"
+            row = self._video_picker_results[idx]
+            video_id = str(row.get("video_id") or "")
+            transcript_path = Path(str(row.get("transcript_json_path") or ""))
+            preferred = Path(str(row.get("local_video_path") or "")) if row.get("local_video_path") else None
+            if not transcript_path.exists():
+                self.status_var.set(f"Missing transcript for {video_id}")
+                return "break"
+            try:
+                video_path = resolve_playback_media_path(
+                    self.ingester_config,
+                    video_id=video_id,
+                    preferred_path=preferred,
+                )
+            except Exception as exc:
+                self.status_var.set(f"Playback path error: {exc}")
+                return "break"
+            audio_path = self._find_audio_sidecar(video_id, video_path)
+            self._load_session(
+                video_id=video_id,
+                transcript_json=transcript_path,
+                video_path=video_path,
+                audio_path=audio_path,
+                start_sec=0.0,
+                filter_text="",
+            )
+            popup.destroy()
+            self._video_picker_popup = None
             self.filter_entry.focus_set()
             return "break"
 
@@ -1069,6 +1251,8 @@ class TranscriptPlayer:
         self._close_jobs_popup()
         if self._search_popup and self._search_popup.winfo_exists():
             self._search_popup.destroy()
+        if self._video_picker_popup and self._video_picker_popup.winfo_exists():
+            self._video_picker_popup.destroy()
         if self._ingest_popup and self._ingest_popup.winfo_exists():
             self._ingest_popup.destroy()
         try:

@@ -273,6 +273,17 @@ class IngesterService:
     def search_videos(self, query_text: str, *, limit: int = 100) -> list[dict[str, object]]:
         return self.db.search_videos_by_transcript(query_text, limit=limit)
 
+    def search_video_titles(self, query_text: str, *, limit: int = 200) -> list[dict[str, object]]:
+        rows = self.db.search_videos_by_title(query_text, limit=limit)
+        needle = query_text.strip().lower()
+        out: list[dict[str, object]] = []
+        for row in rows:
+            payload = dict(row)
+            title = str(payload.get("title") or payload.get("video_id") or "")
+            payload["match_count"] = title.lower().count(needle) if needle else 1
+            out.append(payload)
+        return out
+
     def jobs_summary(self, limit: int = 25) -> dict[str, object]:
         return self.db.list_jobs_summary(limit=limit)
 
