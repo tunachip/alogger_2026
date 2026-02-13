@@ -125,12 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
     player.add_argument("--video-path", required=True, help="Path to video file")
     player.add_argument("--audio-path", help="Optional separate audio file")
     player.add_argument("--skim-seconds", type=float, default=5.0, help="Seek step for left/right keys")
+    player.add_argument("--workers", type=int, default=0, help="Run ingest workers in player process")
 
     player_db = sub.add_parser(
         "player-db",
         help="Launch player with no preloaded video; use Ctrl-F to pick from DB",
     )
     player_db.add_argument("--skim-seconds", type=float, default=5.0, help="Seek step for left/right keys")
+    player_db.add_argument("--workers", type=int, default=0, help="Run ingest workers in player process")
 
     return parser
 
@@ -365,6 +367,7 @@ def main() -> None:
             video_path=video_path,
             audio_path=audio_path,
             skim_seconds=float(args.skim_seconds),
+            workers=int(args.workers),
         )
         return
 
@@ -382,6 +385,7 @@ def main() -> None:
             transcript_json=None,
             video_path=None,
             skim_seconds=float(args.skim_seconds),
+            workers=int(args.workers),
         )
         return
 

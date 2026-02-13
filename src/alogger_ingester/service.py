@@ -25,6 +25,7 @@ class IngesterService:
         self.config = config
         self.db = DB(config.db_path)
         self._stop_event = threading.Event()
+        self._worker_threads: list[threading.Thread] = []
 
     def init(self) -> None:
         self.config.ensure_dirs()
@@ -82,6 +83,28 @@ class IngesterService:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.stop_background_workers()
+
+    def start_background_workers(self, worker_count: int) -> None:
+        self.init()
+        if worker_count <= 0:
+            return
+        if self._worker_threads:
+            return
+        self._stop_event.clear()
+        self._worker_threads = [
+            threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
+            for i in range(worker_count)
+        ]
+        for t in self._worker_threads:
+            t.start()
+
+    def stop_background_workers(self) -> None:
+        self._stop_event.set()
+        threads = self._worker_threads[:]
+        self._worker_threads = []
+        for t in threads:
+            t.join(timeout=2.0)
 
     def _worker_loop(self, worker_id: int) -> None:
         while not self._stop_event.is_set():

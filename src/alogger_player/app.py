@@ -52,12 +52,14 @@ class TranscriptPlayer:
         audio_path: Path | None = None,
         skim_seconds: float = 5.0,
         start_sec: float = 0.0,
+        workers: int = 0,
     ) -> None:
         self.transcript_json = transcript_json
         self.video_path = video_path
         self.audio_path = audio_path
         self.skim_seconds = skim_seconds
         self.start_sec = max(0.0, float(start_sec))
+        self.workers = max(0, int(workers))
 
         self.segments = self._load_segments(transcript_json) if transcript_json else []
         self._segment_starts = [seg.start_sec for seg in self.segments]
@@ -76,6 +78,8 @@ class TranscriptPlayer:
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
         self.ingester.init()
+        if self.workers > 0:
+            self.ingester.start_background_workers(self.workers)
 
         self.root = tk.Tk()
         self.root.title("Alogger Player")
@@ -926,6 +930,7 @@ class TranscriptPlayer:
         if self._ingest_popup and self._ingest_popup.winfo_exists():
             self._ingest_popup.destroy()
         try:
+            self.ingester.stop_background_workers()
             self.player.stop()
         finally:
             self.root.destroy()
@@ -945,6 +950,7 @@ def run_player(
     audio_path: Path | None = None,
     skim_seconds: float = 5.0,
     start_sec: float = 0.0,
+    workers: int = 0,
 ) -> None:
     app = TranscriptPlayer(
         transcript_json=transcript_json,
@@ -952,5 +958,6 @@ def run_player(
         audio_path=audio_path,
         skim_seconds=skim_seconds,
         start_sec=start_sec,
+        workers=workers,
     )
     app.run()

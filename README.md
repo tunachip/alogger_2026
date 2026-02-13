@@ -69,6 +69,9 @@ PYTHONPATH=src python -m alogger_ingester player-test \
 # launch player with no preloaded media (then Ctrl-F to pick from DB)
 PYTHONPATH=src python -m alogger_ingester player-db
 
+# launch player with built-in ingest workers (no separate run process needed)
+PYTHONPATH=src python -m alogger_ingester player-db --workers 2
+
 # run workers
 PYTHONPATH=src python -m alogger_ingester run --workers 4
 
