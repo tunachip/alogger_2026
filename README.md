@@ -22,6 +22,7 @@ Install runtime binaries:
 - `yt-dlp`
 - `ffmpeg`
 - `whisper` CLI (from `openai-whisper` package)
+- VLC (desktop app/libvlc) for player commands
 
 ### Commands
 
@@ -45,6 +46,12 @@ PYTHONPATH=src python -m alogger_ingester metadata-test --url "https://www.youtu
 PYTHONPATH=src python -m alogger_ingester search-play-test \
   --transcript-json data/transcripts/nID9gWrUfN4_test/nID9gWrUfN4.f251.json \
   --media-path data/media/nID9gWrUfN4.f399.mp4
+
+# custom keyboard player test (video left, transcript right)
+PYTHONPATH=src python -m alogger_ingester player-test \
+  --transcript-json data/transcripts/nID9gWrUfN4_test/nID9gWrUfN4.f251.json \
+  --video-path data/media/nID9gWrUfN4.f399.mp4 \
+  --audio-path data/media/nID9gWrUfN4.f251.webm
 
 # run workers
 PYTHONPATH=src python -m alogger_ingester run --workers 4
@@ -93,3 +100,13 @@ PYTHONPATH=src python -m alogger_ingester tui --refresh-sec 1.0 --workers 4
 - When no worker has an active job, the UI refreshes only on user input.
 - When at least one worker is active, the UI auto-refreshes on the configured interval.
 - Worker rows show coarse stage-based progress percentages instead of time estimates.
+
+### Player Controls
+
+- Left panel: embedded VLC video playback
+- Right panel: precise text filter over transcript segments (substring match, not fuzzy)
+- `Up/Down`: move hovered transcript option
+- `Enter`: jump video to selected segment start time
+- `Ctrl-Space`: toggle play/pause
+- `Left/Right`: skim backward/forward (default 5s)
+- `Esc` twice quickly: close player

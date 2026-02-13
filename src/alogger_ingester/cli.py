@@ -81,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
     search_play.add_argument("--fzf-bin", default="fzf", help="fzf binary (default: fzf)")
     search_play.add_argument("--vlc-bin", default="vlc", help="VLC binary (default: vlc)")
 
+    player = sub.add_parser(
+        "player-test",
+        help="Launch split player UI (video left, transcript list right)",
+    )
+    player.add_argument("--transcript-json", required=True, help="Path to Whisper JSON transcript")
+    player.add_argument("--video-path", required=True, help="Path to video file")
+    player.add_argument("--audio-path", help="Optional separate audio file")
+    player.add_argument("--skim-seconds", type=float, default=5.0, help="Seek step for left/right keys")
+
     return parser
 
 
@@ -185,6 +194,34 @@ def main() -> None:
             "selection": selection["raw_line"],
         }
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "player-test":
+        service.init()
+        try:
+            from alogger_player.app import run_player
+        except ImportError as exc:
+            parser.error(
+                "player-test requires Tk + VLC Python bindings. "
+                "Install tkinter system libs (e.g. tk/tcl packages) and `pip install -r requirements.txt`. "
+                f"Original import error: {exc}"
+            )
+
+        transcript_json = Path(args.transcript_json)
+        video_path = Path(args.video_path)
+        audio_path = Path(args.audio_path) if args.audio_path else None
+        if not transcript_json.exists():
+            parser.error(f"transcript json not found: {transcript_json}")
+        if not video_path.exists():
+            parser.error(f"video path not found: {video_path}")
+        if audio_path and not audio_path.exists():
+            parser.error(f"audio path not found: {audio_path}")
+        run_player(
+            transcript_json=transcript_json,
+            video_path=video_path,
+            audio_path=audio_path,
+            skim_seconds=float(args.skim_seconds),
+        )
         return
 
     if args.command == "tui":
