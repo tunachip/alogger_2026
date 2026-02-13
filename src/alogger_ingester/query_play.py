@@ -99,3 +99,66 @@ def launch_vlc_at_time(media_path: Path, start_sec: float, *, vlc_bin: str = "vl
     ]
     proc = subprocess.Popen(cmd)
     return int(proc.pid)
+
+
+def pick_db_match_with_fzf(
+    matches: list[dict[str, Any]],
+    *,
+    fzf_bin: str = "fzf",
+    initial_query: str | None = None,
+) -> dict[str, Any] | None:
+    if shutil.which(fzf_bin) is None:
+        raise PipelineError(f"fzf binary not found: {fzf_bin}")
+    if not matches:
+        return None
+
+    lines: list[str] = []
+    for i, row in enumerate(matches):
+        start_ms = int(row.get("start_ms", 0) or 0)
+        start_sec = max(0.0, start_ms / 1000.0)
+        title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+        if len(title) > 90:
+            title = title[:87] + "..."
+        caption_full = str(row.get("text") or "").replace("\n", " ").strip()
+        caption_short = caption_full if len(caption_full) <= 140 else caption_full[:137] + "..."
+        # Keep full caption in a hidden field for reliable searching; show short caption in main picker.
+        lines.append(f"{i}\t{title}\t{_format_hms(start_sec)}\t{caption_full}\t{caption_short}")
+
+    cmd = [
+        fzf_bin,
+        "--delimiter",
+        "\t",
+        "--with-nth",
+        "2,3,5",
+        "--layout",
+        "reverse",
+        "--prompt",
+        "db> ",
+        "--height",
+        "80%",
+        "--no-hscroll",
+        "--preview",
+        "echo {4}",
+        "--preview-window",
+        "down,35%,wrap",
+    ]
+    if initial_query:
+        cmd.extend(["--query", initial_query])
+
+    proc = subprocess.run(cmd, input="\n".join(lines), text=True, capture_output=True)
+    if proc.returncode == 130:
+        return None
+    if proc.returncode != 0:
+        raise PipelineError(f"fzf failed with code {proc.returncode}: {proc.stderr.strip()}")
+
+    selected = proc.stdout.strip()
+    if not selected:
+        return None
+    first = selected.split("\t", 1)[0]
+    try:
+        idx = int(first)
+    except ValueError as exc:
+        raise PipelineError("Failed to parse selected database row from fzf output") from exc
+    if idx < 0 or idx >= len(matches):
+        raise PipelineError("Selected database row index is out of range")
+    return matches[idx]

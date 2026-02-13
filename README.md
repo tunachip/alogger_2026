@@ -42,16 +42,28 @@ PYTHONPATH=src python -m alogger_ingester download-test --url "https://www.youtu
 # metadata only test (skip download + transcription)
 PYTHONPATH=src python -m alogger_ingester metadata-test --url "https://www.youtube.com/watch?v=nID9gWrUfN4"
 
+# single-shot ingest test (enqueue + download + transcribe + index)
+PYTHONPATH=src python -m alogger_ingester single-shot-test --url "https://www.youtube.com/watch?v=nID9gWrUfN4"
+
+# single-shot ingest without live stage lines
+PYTHONPATH=src python -m alogger_ingester single-shot-test --url "https://www.youtube.com/watch?v=nID9gWrUfN4" --quiet-progress
+
 # transcript query + VLC launch test
 PYTHONPATH=src python -m alogger_ingester search-play-test \
   --transcript-json data/transcripts/nID9gWrUfN4_test/nID9gWrUfN4.f251.json \
   --media-path data/media/nID9gWrUfN4.f399.mp4
+
+# full DB transcript search -> open custom player at selected timestamp
+PYTHONPATH=src python -m alogger_ingester db-search-play --query "verify identification"
 
 # custom keyboard player test (video left, transcript right)
 PYTHONPATH=src python -m alogger_ingester player-test \
   --transcript-json data/transcripts/nID9gWrUfN4_test/nID9gWrUfN4.f251.json \
   --video-path data/media/nID9gWrUfN4.f399.mp4 \
   --audio-path data/media/nID9gWrUfN4.f251.webm
+
+# launch player with no preloaded media (then Ctrl-F to pick from DB)
+PYTHONPATH=src python -m alogger_ingester player-db
 
 # run workers
 PYTHONPATH=src python -m alogger_ingester run --workers 4
@@ -109,4 +121,7 @@ PYTHONPATH=src python -m alogger_ingester tui --refresh-sec 1.0 --workers 4
 - `Enter`: jump video to selected segment start time
 - `Ctrl-Space`: toggle play/pause
 - `Left/Right`: skim backward/forward (default 5s)
+- `Ctrl-F`: open full-DB transcript search popup, then load selected video with query prefilled
+- `Ctrl-N`: open ingest popup and enqueue URL(s)
+- `Ctrl-I`: toggle ingest-jobs progress popup
 - `Esc` twice quickly: close player

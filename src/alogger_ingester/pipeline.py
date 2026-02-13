@@ -73,6 +73,23 @@ def _select_primary_media(paths: list[Path]) -> Path:
     )[0]
 
 
+def _select_primary_video(paths: list[Path]) -> Path:
+    if not paths:
+        raise PipelineError("No video-capable media files were found")
+    ext_rank = {
+        ".mkv": 5,
+        ".mp4": 4,
+        ".webm": 3,
+        ".mov": 2,
+        ".m4v": 2,
+    }
+    return sorted(
+        paths,
+        key=lambda p: (ext_rank.get(p.suffix.lower(), 0), p.stat().st_size),
+        reverse=True,
+    )[0]
+
+
 def _media_has_audio_stream(video_path: Path) -> bool | None:
     cmd = [
         "ffprobe",
@@ -95,6 +112,96 @@ def _media_has_audio_stream(video_path: Path) -> bool | None:
         return None
     streams = payload.get("streams", [])
     return any(str(s.get("codec_type")) == "audio" for s in streams if isinstance(s, dict))
+
+
+def _media_has_video_stream(video_path: Path) -> bool | None:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_streams",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    streams = payload.get("streams", [])
+    return any(str(s.get("codec_type")) == "video" for s in streams if isinstance(s, dict))
+
+
+def _pick_largest(paths: list[Path]) -> Path | None:
+    if not paths:
+        return None
+    return sorted(paths, key=lambda p: p.stat().st_size, reverse=True)[0]
+
+
+def _ensure_audio_ready_media(
+    config: IngesterConfig,
+    video_id: str,
+    candidates: list[Path],
+    *,
+    on_process: Callable[[subprocess.Popen[str]], None] | None = None,
+    should_terminate: Callable[[], bool] | None = None,
+) -> Path:
+    if not candidates:
+        raise PipelineError(f"Downloaded file not found for {video_id}")
+
+    with_audio: list[Path] = []
+    with_video: list[Path] = []
+    with_audio_and_video: list[Path] = []
+    for path in candidates:
+        has_audio = _media_has_audio_stream(path)
+        has_video = _media_has_video_stream(path)
+        if has_audio is True:
+            with_audio.append(path)
+        if has_video is True:
+            with_video.append(path)
+        if has_audio is True and has_video is True:
+            with_audio_and_video.append(path)
+
+    if with_audio_and_video:
+        return _select_primary_media(with_audio_and_video)
+
+    # If streams are split (common yt-dlp case), remux without re-encoding.
+    if with_audio and with_video:
+        video_source = _pick_largest(with_video)
+        audio_source = _pick_largest(with_audio)
+        if video_source and audio_source:
+            merged_path = config.media_dir / f"{video_id}.merged.mkv"
+            cmd = [
+                config.ffmpeg_binary,
+                "-y",
+                "-i",
+                str(video_source),
+                "-i",
+                str(audio_source),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                str(merged_path),
+            ]
+            run_cmd(cmd, on_process=on_process, should_terminate=should_terminate)
+            if merged_path.exists():
+                return merged_path
+
+    if with_audio:
+        # Transcription can still proceed on audio-only files.
+        return _pick_largest(with_audio) or with_audio[0]
+
+    # Fall back to previous primary selection if stream detection failed.
+    return _select_primary_media(candidates)
 
 
 def _resolve_whisper_output(output_dir: Path, video_path: Path) -> Path:
@@ -211,13 +318,17 @@ def download_video(
     run_cmd(cmd, on_process=on_process, should_terminate=should_terminate)
 
     mp4_path = config.media_dir / f"{video_id}.mp4"
-    if mp4_path.exists():
+    if mp4_path.exists() and _media_has_audio_stream(mp4_path) is True:
         return mp4_path
 
     matches = _fallback_paths(config.media_dir, video_id)
-    if not matches:
-        raise PipelineError(f"Downloaded file not found for {video_id}")
-    return _select_primary_media(matches)
+    return _ensure_audio_ready_media(
+        config,
+        video_id,
+        matches,
+        on_process=on_process,
+        should_terminate=should_terminate,
+    )
 
 
 def transcribe_video(
@@ -303,3 +414,32 @@ def download_url_only(config: IngesterConfig, url: str) -> Path:
         "Download finished but output file could not be resolved. "
         "Check ffmpeg availability and yt-dlp output."
     )
+
+
+def resolve_playback_media_path(
+    config: IngesterConfig,
+    *,
+    video_id: str,
+    preferred_path: Path | None = None,
+) -> Path:
+    candidates: list[Path] = []
+    if preferred_path and preferred_path.exists():
+        candidates.append(preferred_path)
+    candidates.extend(_fallback_paths(config.media_dir, video_id))
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for c in candidates:
+        r = c.resolve()
+        if r in seen:
+            continue
+        seen.add(r)
+        unique.append(c)
+
+    with_video = [p for p in unique if _media_has_video_stream(p) is True]
+    if not with_video:
+        raise PipelineError(
+            f"No playable video stream found for video_id={video_id}. "
+            "Check downloaded media files."
+        )
+    return _select_primary_video(with_video)

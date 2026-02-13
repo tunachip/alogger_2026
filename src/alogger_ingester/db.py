@@ -176,6 +176,40 @@ class DB:
                 priority=int(row["priority"]),
             )
 
+    def reserve_job_by_id(self, job_id: int) -> Job | None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id, source_url, status, priority
+                FROM ingest_jobs
+                WHERE id=?
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if not row:
+                conn.execute("COMMIT")
+                return None
+            if str(row["status"]) != "queued":
+                conn.execute("COMMIT")
+                return None
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status='downloading', started_at=?, error_text=NULL
+                WHERE id=? AND status='queued'
+                """,
+                (utc_now_iso(), job_id),
+            )
+            conn.execute("COMMIT")
+            return Job(
+                id=int(row["id"]),
+                url=str(row["source_url"]),
+                status="downloading",
+                priority=int(row["priority"]),
+            )
+
     def update_job_status(
         self,
         job_id: int,
@@ -290,6 +324,23 @@ class DB:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_job(self, job_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_url, status, priority, error_text,
+                       video_id, local_video_path, transcript_json_path,
+                       created_at, started_at, finished_at
+                FROM ingest_jobs
+                WHERE id=?
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
     def get_dashboard_snapshot(self, *, sample_size: int = 100) -> dict[str, Any]:
         with self.connect() as conn:
             count_rows = conn.execute(
@@ -371,4 +422,83 @@ class DB:
             "avg_duration_sec": avg_duration_sec,
             "median_duration_sec": median_duration_sec,
             "sample_size": len(durations),
+        }
+
+    def search_transcript_segments(self, query_text: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        needle = query_text.strip().lower()
+        if not needle:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                WITH latest_done AS (
+                    SELECT video_id, MAX(id) AS max_id
+                    FROM ingest_jobs
+                    WHERE status = 'done' AND video_id IS NOT NULL
+                    GROUP BY video_id
+                )
+                SELECT
+                    ts.video_id,
+                    ts.start_ms,
+                    ts.end_ms,
+                    ts.text,
+                    v.title,
+                    v.source_url,
+                    j.local_video_path,
+                    j.transcript_json_path
+                FROM transcript_segments ts
+                JOIN videos v
+                  ON v.video_id = ts.video_id
+                LEFT JOIN latest_done ld
+                  ON ld.video_id = ts.video_id
+                LEFT JOIN ingest_jobs j
+                  ON j.id = ld.max_id
+                WHERE LOWER(ts.text) LIKE ?
+                ORDER BY ts.video_id ASC, ts.start_ms ASC
+                LIMIT ?
+                """,
+                (f"%{needle}%", limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def search_videos_by_transcript(self, query_text: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        needle = query_text.strip().lower()
+        if not needle:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                WITH latest_done AS (
+                    SELECT video_id, MAX(id) AS max_id
+                    FROM ingest_jobs
+                    WHERE status = 'done' AND video_id IS NOT NULL
+                    GROUP BY video_id
+                )
+                SELECT
+                    ts.video_id,
+                    COALESCE(v.title, ts.video_id) AS title,
+                    COUNT(*) AS match_count,
+                    MIN(ts.start_ms) AS first_start_ms,
+                    j.local_video_path,
+                    j.transcript_json_path
+                FROM transcript_segments ts
+                JOIN videos v
+                  ON v.video_id = ts.video_id
+                LEFT JOIN latest_done ld
+                  ON ld.video_id = ts.video_id
+                LEFT JOIN ingest_jobs j
+                  ON j.id = ld.max_id
+                WHERE LOWER(ts.text) LIKE ?
+                GROUP BY ts.video_id, v.title, j.local_video_path, j.transcript_json_path
+                ORDER BY match_count DESC, first_start_ms ASC
+                LIMIT ?
+                """,
+                (f"%{needle}%", limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_jobs_summary(self, limit: int = 25) -> dict[str, Any]:
+        return {
+            "counts": self.get_dashboard_snapshot()["counts"],
+            "jobs": self.list_jobs(limit=limit),
         }
