@@ -22,11 +22,10 @@ from alogger_ingester.service import IngesterService
 # === Config ===
 FONT = {
     'STYLE': 'DejaVu Sans Mono',
-    'SIZE': 14,
+    'SIZE': 12,
 }
 
 THEME = {
-
 }
 
 def _fmt_hms(seconds: float) -> str:
@@ -73,6 +72,9 @@ class TranscriptPlayer:
         self._jobs_after_id: str | None = None
         self._search_results: list[dict[str, Any]] = []
         self._video_picker_results: list[dict[str, Any]] = []
+        self._split_initialized = False
+        self._transcript_hidden = False
+        self._split_x_before_hide: int | None = None
         self.current_video_id: str | None = None
         self._load_fail_count = 0
         self._startup_poll_count = 0
@@ -93,6 +95,7 @@ class TranscriptPlayer:
         self._text_font_bold = tkfont.Font(family=FONT['STYLE'], size=FONT['SIZE'], weight="bold")
         self._timestamp_prefix = "[00:00:00] "
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
+        self._progress_bar_width = 28
 
         self._setup_styles()
         self._build_layout()
@@ -129,8 +132,10 @@ class TranscriptPlayer:
         left = tk.Frame(shell, bg="#000000")
         self.left_panel = left
         right = tk.Frame(shell, bg="#111111")
-        shell.add(left, minsize=700)
-        shell.add(right, minsize=450)
+        self.right_panel = right
+        shell.add(left, minsize=1000)
+        shell.add(right, minsize=200)
+        shell.bind("<Configure>", self._on_shell_configure)
         self.root.after(0, self._set_initial_split_ratio)
 
         left.rowconfigure(0, weight=1)
@@ -258,7 +263,7 @@ class TranscriptPlayer:
             "Type=precise filter | Up/Down=hover | Enter=jump | Ctrl-Space/Ctrl-P play/pause | "
             "Left/Right=skim | PgUp/PgDn/Home/End move | Ctrl-C clear filter | "
             "Ctrl--/Ctrl-= text size | Ctrl-F transcript search | Ctrl-O title search | "
-            "Ctrl-N ingest | Ctrl-I jobs | Ctrl-Q quit"
+            "Ctrl-N ingest | Ctrl-I jobs | Ctrl-L toggle log | Ctrl-Q quit"
         ))
         hint = tk.Label(
             right,
@@ -292,6 +297,7 @@ class TranscriptPlayer:
         self.root.bind("<Control-minus>", self._on_font_smaller)
         self.root.bind("<Control-equal>", self._on_font_larger)
         self.root.bind("<Control-plus>", self._on_font_larger)
+        self.root.bind("<Control-KeyPress-l>", self._on_toggle_transcript_log)
         self.root.bind("<Control-KeyPress-f>", self._on_open_search_popup)
         self.root.bind("<Control-KeyPress-o>", self._on_open_video_picker_popup)
         self.root.bind("<Control-KeyPress-n>", self._on_open_ingest_popup)
@@ -574,10 +580,14 @@ class TranscriptPlayer:
         return self.segments[self.filtered_indexes[self.selected_filtered_pos]]
 
     def _on_up(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            return "break"
         self._select_pos(self.selected_filtered_pos - 1)
         return "break"
 
     def _on_down(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            return "break"
         self._select_pos(self.selected_filtered_pos + 1)
         return "break"
 
@@ -625,18 +635,26 @@ class TranscriptPlayer:
         return "break"
 
     def _on_page_up(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            return "break"
         self._select_pos(self.selected_filtered_pos - 10)
         return "break"
 
     def _on_page_down(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            return "break"
         self._select_pos(self.selected_filtered_pos + 10)
         return "break"
 
     def _on_home(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            return "break"
         self._select_pos(0)
         return "break"
 
     def _on_end(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            return "break"
         if self.filtered_indexes:
             self._select_pos(len(self.filtered_indexes) - 1)
         return "break"
@@ -706,7 +724,7 @@ class TranscriptPlayer:
         return ""
 
     def _render_time_progress(self, pos_sec: float, length_sec: float) -> str:
-        bar_width = 28
+        bar_width = self._progress_bar_width
         if length_sec <= 0:
             return f"[{_fmt_hms(pos_sec)}] {'░' * bar_width}"
         ratio = max(0.0, min(1.0, pos_sec / length_sec))
@@ -719,13 +737,43 @@ class TranscriptPlayer:
         if width <= 0: return
         # Keep caption wrapping inside the left panel with padding.
         self.caption_now_box.configure(wraplength=max(120, width - 24))
+        self._update_progress_bar_width(width)
+
+    def _update_progress_bar_width(self, panel_width: int | None = None) -> None:
+        width = panel_width if panel_width is not None else int(self.left_panel.winfo_width())
+        if width <= 0:
+            return
+        available_px = max(120, width - 24)
+        # Prefix is fixed-width and the bar uses mono block chars.
+        prefix_px = self._text_font.measure("[00:00:00] ")
+        block_px = max(1, self._text_font.measure("█"))
+        bar_chars = max(12, min(140, int((available_px - prefix_px) / block_px)))
+        self._progress_bar_width = bar_chars
+
+    def _refresh_clock_now(self) -> None:
+        pos_ms = self.player.get_time()
+        if pos_ms < 0:
+            pos_ms = 0
+        pos_sec = pos_ms / 1000.0
+        length_ms = self.player.get_length()
+        length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
+        self.clock_var.set(self._render_time_progress(pos_sec, length_sec))
 
     def _set_initial_split_ratio(self) -> None:
+        if self._split_initialized:
+            return
         total_w = self.shell.winfo_width()
-        if total_w <= 0: return
-        # Video pane default: 3/4 width.
-        x = int(total_w * 3 / 4)
+        if total_w <= 0:
+            return
+        # Default: video pane 3/4, transcript pane 1/4.
+        x = int(total_w * 3 / 5)
         self.shell.sash_place(0, x, 0)
+        self._split_initialized = True
+
+    def _on_shell_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        # Wait for real geometry so ratio is set from the parent pane container.
+        if not self._split_initialized:
+            self._set_initial_split_ratio()
 
     def _on_open_search_popup(self, _event: tk.Event[tk.Misc]) -> str:
         self._open_search_popup()
@@ -744,6 +792,39 @@ class TranscriptPlayer:
             self._close_jobs_popup()
         else:
             self._open_jobs_popup()
+        return "break"
+
+    def _on_toggle_transcript_log(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            self.shell.add(self.right_panel, minsize=200)
+            if self._split_x_before_hide is not None:
+                self.shell.sash_place(0, self._split_x_before_hide, 0)
+            self.filter_entry.configure(state="normal")
+            self.filter_entry.focus_set()
+            self._transcript_hidden = False
+            self.root.update_idletasks()
+            self._update_progress_bar_width()
+            self._refresh_clock_now()
+            self.status_var.set("Transcript log shown")
+            return "break"
+
+        total_w = self.shell.winfo_width()
+        if total_w > 0:
+            try:
+                self._split_x_before_hide = int(self.shell.sash_coord(0)[0])
+            except Exception:
+                self._split_x_before_hide = int(total_w * 3 / 4)
+        self.filter_entry.configure(state="disabled")
+        self.video_panel.focus_set()
+        try:
+            self.shell.forget(self.right_panel)
+        except Exception:
+            pass
+        self._transcript_hidden = True
+        self.root.update_idletasks()
+        self._update_progress_bar_width()
+        self._refresh_clock_now()
+        self.status_var.set("Transcript log hidden")
         return "break"
 
     def _apply_popup_style(self, popup: tk.Toplevel, title: str, size: str) -> None:
