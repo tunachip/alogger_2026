@@ -1,4 +1,4 @@
-"""Alogger ingester service package."""
+"""Alog package."""
 
 from .config import IngesterConfig
 from .service import IngesterService

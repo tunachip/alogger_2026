@@ -32,7 +32,7 @@ def _read_urls(url: str | None, file_path: str | None) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Alogger ingester service")
+    parser = argparse.ArgumentParser(description="Alog service")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init-db", help="Initialize sqlite schema")

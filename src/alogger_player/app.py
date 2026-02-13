@@ -11,9 +11,9 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Any
 
-from alogger_ingester.config import IngesterConfig
-from alogger_ingester.service import IngesterService
-from alogger_ingester.pipeline import (
+from alog.config import IngesterConfig
+from alog.service import IngesterService
+from alog.pipeline import (
     _media_has_audio_stream,
     _media_has_video_stream,
     resolve_playback_media_path,
