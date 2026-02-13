@@ -1,6 +1,7 @@
 from __future__ import annotations
 import vlc
 import json
+import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -69,6 +70,8 @@ class TranscriptPlayer:
         self._jobs_text: tk.Text | None = None
         self._jobs_after_id: str | None = None
         self._search_results: list[dict[str, Any]] = []
+        self.current_video_id: str | None = None
+        self._load_fail_count = 0
 
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
@@ -320,13 +323,66 @@ class TranscriptPlayer:
         self.root.update_idletasks()
         handle = self.video_panel.winfo_id()
 
-        # Linux/X11 embedding
-        self.player.set_xwindow(handle)
+        self._bind_video_output(handle)
 
         self.player.play()
+        self.root.after(550, lambda: self._post_media_load(start_sec, retry_without_audio=audio_path is not None))
+
+    def _bind_video_output(self, handle: int) -> None:
+        if sys.platform.startswith("linux"):
+            self.player.set_xwindow(handle)
+            return
+        if sys.platform == "win32":
+            self.player.set_hwnd(handle)
+            return
+        if sys.platform == "darwin":
+            self.player.set_nsobject(handle)
+
+    def _post_media_load(self, start_sec: float, *, retry_without_audio: bool) -> None:
+        state = self.player.get_state()
+        if state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
+            if retry_without_audio and self.audio_path is not None:
+                self.status_var.set("Media failed with sidecar audio, retrying video-only...")
+                self._set_player_media(self.video_path, None, start_sec=start_sec)
+                return
+
+            alt = self._pick_alternate_video_path()
+            if alt is not None:
+                self._load_fail_count += 1
+                self.status_var.set(
+                    f"Media load failed ({self.video_path.name}, {state}); trying {alt.name}..."
+                )
+                self._set_player_media(alt, None, start_sec=start_sec)
+                return
+
+            self.status_var.set(f"Failed to load media: {self.video_path} (state={state})")
+            return
         if start_sec > 0:
-            self.root.after(200, lambda: self.player.set_time(int(start_sec * 1000.0)))
-        self.root.after(260, lambda: self.player.set_pause(1))
+            self.player.set_time(int(start_sec * 1000.0))
+        self.player.set_pause(1)
+        self._load_fail_count = 0
+
+    def _pick_alternate_video_path(self) -> Path | None:
+        if not self.current_video_id:
+            return None
+        if self._load_fail_count >= 2:
+            return None
+
+        candidates: list[Path] = []
+        for p in sorted(self.ingester_config.media_dir.glob(f"{self.current_video_id}*")):
+            if not p.is_file() or p == self.video_path:
+                continue
+            if _media_has_video_stream(p) is True:
+                candidates.append(p)
+        if not candidates:
+            return None
+
+        ext_rank = {".mkv": 5, ".mp4": 4, ".webm": 3, ".mov": 2, ".m4v": 2}
+        candidates.sort(
+            key=lambda p: (ext_rank.get(p.suffix.lower(), 0), p.stat().st_size),
+            reverse=True,
+        )
+        return candidates[0]
 
     def _load_segments(self, transcript_json: Path) -> list[SegmentRow]:
         if not transcript_json.exists():
@@ -456,16 +512,20 @@ class TranscriptPlayer:
         return self._on_return(event)
 
     def _on_toggle_play(self, _event: tk.Event[tk.Misc]) -> str:
-        self.player.pause()
         state = self.player.get_state()
-        if not vlc:
-            raise Exception('state not found')
         if state == vlc.State.Playing:
+            self.player.pause()
+            self.status_var.set("Paused")
+        elif state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
+            self.player.set_time(0)
+            self.player.play()
             self.status_var.set("Playing")
         elif state == vlc.State.Paused:
-            self.status_var.set("Paused")
+            self.player.play()
+            self.status_var.set("Playing")
         else:
-            self.status_var.set(f"State: {state}")
+            self.player.play()
+            self.status_var.set("Playing")
         return "break"
 
     def _on_left(self, _event: tk.Event[tk.Misc]) -> str:
@@ -682,6 +742,7 @@ class TranscriptPlayer:
             audio_path = self._find_audio_sidecar(video_id, video_path)
             start_sec = float(int(row.get("first_start_ms") or 0)) / 1000.0
             self._load_session(
+                video_id=video_id,
                 transcript_json=transcript_path,
                 video_path=video_path,
                 audio_path=audio_path,
@@ -838,12 +899,15 @@ class TranscriptPlayer:
     def _load_session(
         self,
         *,
+        video_id: str,
         transcript_json: Path,
         video_path: Path,
         audio_path: Path | None,
         start_sec: float,
         filter_text: str,
     ) -> None:
+        self.current_video_id = video_id
+        self._load_fail_count = 0
         self.transcript_json = transcript_json
         self.segments = self._load_segments(transcript_json)
         self._segment_starts = [seg.start_sec for seg in self.segments]

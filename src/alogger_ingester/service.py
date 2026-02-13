@@ -10,9 +10,12 @@ from .db import DB, Job
 from .notify import send_webhook
 from .pipeline import (
     PipelineError,
+    _media_has_audio_stream,
+    _media_has_video_stream,
     download_video,
     fetch_video_metadata,
     load_whisper_segments,
+    merge_streams_for_playback,
     transcribe_video,
 )
 
@@ -149,12 +152,25 @@ class IngesterService:
                 "index_done",
                 {"job_id": job.id, "video_id": str(video_id), "segment_count": len(segments)},
             )
+            progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
+
+        playback_path = merge_streams_for_playback(self.config, video_id=video_id)
+        final_media_path = playback_path if playback_path is not None else local_video_path
+        if progress_cb:
+            progress_cb(
+                "merge_done",
+                {
+                    "job_id": job.id,
+                    "video_id": str(video_id),
+                    "local_video_path": str(final_media_path),
+                },
+            )
 
         self.db.update_job_status(
             job.id,
             "done",
             video_id=video_id,
-            local_video_path=str(local_video_path),
+            local_video_path=str(final_media_path),
             transcript_json_path=str(transcript_json_path),
         )
         if progress_cb:
@@ -163,7 +179,7 @@ class IngesterService:
                 {
                     "job_id": job.id,
                     "video_id": str(video_id),
-                    "local_video_path": str(local_video_path),
+                    "local_video_path": str(final_media_path),
                     "transcript_json_path": str(transcript_json_path),
                 },
             )
@@ -200,3 +216,63 @@ class IngesterService:
 
     def jobs_summary(self, limit: int = 25) -> dict[str, object]:
         return self.db.list_jobs_summary(limit=limit)
+
+    def backfill_merge_playback_paths(
+        self,
+        *,
+        limit: int | None = None,
+        dry_run: bool = False,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> dict[str, object]:
+        self.init()
+        rows = self.db.list_latest_done_jobs(limit=limit)
+        scanned = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+
+        for row in rows:
+            scanned += 1
+            job_id = int(row.get("id") or 0)
+            video_id = str(row.get("video_id") or "")
+            current_path = str(row.get("local_video_path") or "")
+            payload = {"job_id": job_id, "video_id": video_id, "local_video_path": current_path}
+            try:
+                merged = merge_streams_for_playback(self.config, video_id=video_id)
+                if merged is None:
+                    skipped += 1
+                    if progress_cb:
+                        progress_cb("skip_no_merge_candidate", payload)
+                    continue
+                merged_str = str(merged)
+                has_av = _media_has_video_stream(merged) is True and _media_has_audio_stream(merged) is True
+                if not has_av:
+                    skipped += 1
+                    if progress_cb:
+                        progress_cb("skip_not_av", {**payload, "resolved_path": merged_str})
+                    continue
+                if current_path == merged_str:
+                    skipped += 1
+                    if progress_cb:
+                        progress_cb("skip_already_set", {**payload, "resolved_path": merged_str})
+                    continue
+                if not dry_run:
+                    self.db.update_job_local_video_path(job_id, merged_str)
+                updated += 1
+                if progress_cb:
+                    progress_cb(
+                        "updated" if not dry_run else "would_update",
+                        {**payload, "resolved_path": merged_str},
+                    )
+            except Exception as exc:
+                failed += 1
+                if progress_cb:
+                    progress_cb("failed", {**payload, "error": str(exc)})
+
+        return {
+            "scanned": scanned,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+            "dry_run": dry_run,
+        }

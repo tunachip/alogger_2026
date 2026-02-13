@@ -7,8 +7,9 @@ Bottom-up build of a high-performance YouTube ingest and query system.
 The ingester accepts one or many YouTube URLs and runs:
 1. Download video (prefers 1080p with highest fps via `yt-dlp` sorting)
 2. Transcribe audio with `whisper` to JSON timestamps
-3. Persist metadata + transcript segments to SQLite
-4. Mark job `done` and emit completion event (stdout + optional webhook)
+3. Merge split A/V streams into a playback-ready file (no re-encode, `ffmpeg -c copy`)
+4. Persist metadata + transcript segments to SQLite
+5. Mark job `done` and emit completion event (stdout + optional webhook)
 
 ### Setup
 
@@ -47,6 +48,9 @@ PYTHONPATH=src python -m alogger_ingester single-shot-test --url "https://www.yo
 
 # single-shot ingest without live stage lines
 PYTHONPATH=src python -m alogger_ingester single-shot-test --url "https://www.youtube.com/watch?v=nID9gWrUfN4" --quiet-progress
+
+# backfill old done jobs so local_video_path points to merged playback A/V
+PYTHONPATH=src python -m alogger_ingester backfill-merge
 
 # transcript query + VLC launch test
 PYTHONPATH=src python -m alogger_ingester search-play-test \

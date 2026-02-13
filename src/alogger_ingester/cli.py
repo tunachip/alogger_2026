@@ -86,6 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable stage-by-stage live progress lines",
     )
 
+    backfill_merge = sub.add_parser(
+        "backfill-merge",
+        help="Backfill merged A/V playback paths for latest completed videos",
+    )
+    backfill_merge.add_argument("--limit", type=int, help="Optional max number of videos to scan")
+    backfill_merge.add_argument("--dry-run", action="store_true", help="Show what would change, don't write DB")
+    backfill_merge.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Disable per-item progress lines",
+    )
+
     search_play = sub.add_parser(
         "search-play-test",
         help="Search transcript with fzf and launch VLC at chosen segment time",
@@ -224,6 +236,28 @@ def main() -> None:
             progress_cb=_progress,
         )
         print(json.dumps({"job_id": job_id, **result}, indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "backfill-merge":
+        service.init()
+
+        def _progress(stage: str, payload: dict[str, object]) -> None:
+            if args.quiet_progress:
+                return
+            ts = datetime.now().strftime("%H:%M:%S")
+            msg = f"[{ts}] {stage} video_id={payload.get('video_id')} job_id={payload.get('job_id')}"
+            if "resolved_path" in payload:
+                msg += f" path={payload.get('resolved_path')}"
+            if "error" in payload:
+                msg += f" error={payload.get('error')}"
+            print(msg, flush=True)
+
+        summary = service.backfill_merge_playback_paths(
+            limit=args.limit,
+            dry_run=bool(args.dry_run),
+            progress_cb=_progress,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
 
     if args.command == "search-play-test":

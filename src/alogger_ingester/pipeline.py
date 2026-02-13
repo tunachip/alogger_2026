@@ -171,31 +171,6 @@ def _ensure_audio_ready_media(
     if with_audio_and_video:
         return _select_primary_media(with_audio_and_video)
 
-    # If streams are split (common yt-dlp case), remux without re-encoding.
-    if with_audio and with_video:
-        video_source = _pick_largest(with_video)
-        audio_source = _pick_largest(with_audio)
-        if video_source and audio_source:
-            merged_path = config.media_dir / f"{video_id}.merged.mkv"
-            cmd = [
-                config.ffmpeg_binary,
-                "-y",
-                "-i",
-                str(video_source),
-                "-i",
-                str(audio_source),
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-c",
-                "copy",
-                str(merged_path),
-            ]
-            run_cmd(cmd, on_process=on_process, should_terminate=should_terminate)
-            if merged_path.exists():
-                return merged_path
-
     if with_audio:
         # Transcription can still proceed on audio-only files.
         return _pick_largest(with_audio) or with_audio[0]
@@ -437,9 +412,65 @@ def resolve_playback_media_path(
         unique.append(c)
 
     with_video = [p for p in unique if _media_has_video_stream(p) is True]
+    with_audio_video = [p for p in with_video if _media_has_audio_stream(p) is True]
+    if with_audio_video:
+        return _select_primary_video(with_audio_video)
+
+    # Try to generate a merged playback container on demand.
+    merged = merge_streams_for_playback(config, video_id=video_id)
+    if merged is not None and merged.exists():
+        return merged
+
     if not with_video:
         raise PipelineError(
             f"No playable video stream found for video_id={video_id}. "
             "Check downloaded media files."
         )
     return _select_primary_video(with_video)
+
+
+def merge_streams_for_playback(
+    config: IngesterConfig,
+    *,
+    video_id: str,
+    on_process: Callable[[subprocess.Popen[str]], None] | None = None,
+    should_terminate: Callable[[], bool] | None = None,
+) -> Path | None:
+    candidates = _fallback_paths(config.media_dir, video_id)
+    if not candidates:
+        return None
+
+    with_video = [p for p in candidates if _media_has_video_stream(p) is True]
+    with_audio = [p for p in candidates if _media_has_audio_stream(p) is True]
+    with_audio_video = [p for p in with_video if _media_has_audio_stream(p) is True]
+    if with_audio_video:
+        return _select_primary_video(with_audio_video)
+
+    video_source = _pick_largest(with_video)
+    audio_only = [
+        p for p in with_audio if p not in with_video and _media_has_video_stream(p) is False
+    ]
+    audio_source = _pick_largest(audio_only)
+    if not video_source or not audio_source:
+        return None
+
+    merged_path = config.media_dir / f"{video_id}.merged.mkv"
+    cmd = [
+        config.ffmpeg_binary,
+        "-y",
+        "-i",
+        str(video_source),
+        "-i",
+        str(audio_source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        str(merged_path),
+    ]
+    run_cmd(cmd, on_process=on_process, should_terminate=should_terminate)
+    if merged_path.exists() and _media_has_audio_stream(merged_path) is True:
+        return merged_path
+    return None

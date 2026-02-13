@@ -341,6 +341,39 @@ class DB:
                 return None
             return dict(row)
 
+    def list_latest_done_jobs(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        query = """
+            WITH latest_done AS (
+                SELECT video_id, MAX(id) AS max_id
+                FROM ingest_jobs
+                WHERE status = 'done' AND video_id IS NOT NULL
+                GROUP BY video_id
+            )
+            SELECT j.id, j.video_id, j.local_video_path, j.transcript_json_path
+            FROM ingest_jobs j
+            JOIN latest_done ld
+              ON ld.max_id = j.id
+            ORDER BY j.id DESC
+        """
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (limit,)
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_job_local_video_path(self, job_id: int, local_video_path: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET local_video_path=?
+                WHERE id=?
+                """,
+                (local_video_path, job_id),
+            )
+
     def get_dashboard_snapshot(self, *, sample_size: int = 100) -> dict[str, Any]:
         with self.connect() as conn:
             count_rows = conn.execute(
