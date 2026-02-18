@@ -37,21 +37,21 @@ def _fmt_hms(seconds: float) -> str:
 
 @dataclass(slots=True)
 class SegmentRow:
-    index: int
+    index:     int
     start_sec: float
-    end_sec: float
-    text: str
-    text_lc: str
+    end_sec:   float
+    text:      str
+    text_lc:   str
 
 class TranscriptPlayer:
     def __init__(
         self,
         transcript_json: Path | None = None,
-        video_path: Path | None = None,
-        audio_path: Path | None = None,
-        skim_seconds: float = 5.0,
-        start_sec: float = 0.0,
-        workers: int = 0,
+        video_path:      Path | None = None,
+        audio_path:      Path | None = None,
+        skim_seconds:    float = 5.0,
+        start_sec:       float = 0.0,
+        workers:         int = 0,
     ) -> None:
         self.transcript_json = transcript_json
         self.video_path = video_path
@@ -64,21 +64,22 @@ class TranscriptPlayer:
         self._segment_starts = [seg.start_sec for seg in self.segments]
         self.filtered_indexes = list(range(len(self.segments)))
         self.selected_filtered_pos = 0
-        self._search_popup: tk.Toplevel | None = None
-        self._video_picker_popup: tk.Toplevel | None = None
-        self._ingest_popup: tk.Toplevel | None = None
-        self._jobs_popup: tk.Toplevel | None = None
-        self._jobs_text: tk.Text | None = None
-        self._jobs_after_id: str | None = None
-        self._search_results: list[dict[str, Any]] = []
+        
+        self._search_popup:         tk.Toplevel | None = None
+        self._video_picker_popup:   tk.Toplevel | None = None
+        self._ingest_popup:         tk.Toplevel | None = None
+        self._jobs_popup:           tk.Toplevel | None = None
+        self._jobs_text:            tk.Text | None = None
+        self._jobs_after_id:        str | None = None
+        self._search_results:       list[dict[str, Any]] = []
         self._video_picker_results: list[dict[str, Any]] = []
-        self._split_initialized = False
-        self._transcript_hidden = False
-        self._split_x_before_hide: int | None = None
-        self.current_video_id: str | None = None
-        self._load_fail_count = 0
-        self._startup_poll_count = 0
-        self._proxy_attempted = False
+        self._split_initialized =   False
+        self._transcript_hidden =   False
+        self._split_x_before_hide:  int | None = None
+        self.current_video_id:      str | None = None
+        self._load_fail_count =     0
+        self._startup_poll_count =  0
+        self._proxy_attempted =     False
 
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
@@ -88,7 +89,7 @@ class TranscriptPlayer:
 
         self.root = tk.Tk()
         self.root.title("Alogger Player")
-        self.root.geometry("1600x1050")
+        self.root.geometry("1640x880")
         self.root.configure(bg="#111111")
 
         self._text_font = tkfont.Font(family=FONT['STYLE'], size=FONT['SIZE'])
@@ -133,8 +134,10 @@ class TranscriptPlayer:
         right = tk.Frame(shell, bg="#111111")
         self.left_panel = left
         self.right_panel = right
+        
         shell.add(left, minsize=1000)
         shell.add(right, minsize=200)
+        
         shell.bind("<Configure>", self._on_shell_configure)
         self.root.after(0, self._set_initial_split_ratio)
 
@@ -603,27 +606,22 @@ class TranscriptPlayer:
         return "break"
 
     def _on_page_up(self, _event: tk.Event[tk.Misc]) -> str:
-        if self._transcript_hidden:
-            return "break"
-        self._select_pos(self.selected_filtered_pos - 10)
+        if not self._transcript_hidden:
+            self._select_pos(self.selected_filtered_pos - 10)
         return "break"
 
     def _on_page_down(self, _event: tk.Event[tk.Misc]) -> str:
-        if self._transcript_hidden:
-            return "break"
-        self._select_pos(self.selected_filtered_pos + 10)
+        if not self._transcript_hidden:
+            self._select_pos(self.selected_filtered_pos + 10)
         return "break"
 
     def _on_home(self, _event: tk.Event[tk.Misc]) -> str:
-        if self._transcript_hidden:
-            return "break"
-        self._select_pos(0)
+        if not self._transcript_hidden:
+            self._select_pos(0)
         return "break"
 
     def _on_end(self, _event: tk.Event[tk.Misc]) -> str:
-        if self._transcript_hidden:
-            return "break"
-        if self.filtered_indexes:
+        if not self._transcript_hidden and self.filtered_indexes:
             self._select_pos(len(self.filtered_indexes) - 1)
         return "break"
 
@@ -644,7 +642,8 @@ class TranscriptPlayer:
     def _resize_caption_font(self, delta: int) -> None:
         current = int(self._text_font.cget("size"))
         new_size = max(8, min(30, current + delta))
-        if new_size == current: return
+        if new_size == current:
+            return
         self._text_font.configure(size=new_size)
         self._text_font_bold.configure(size=new_size)
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
@@ -654,7 +653,8 @@ class TranscriptPlayer:
 
     def _seek_relative(self, delta_sec: float) -> None:
         now_ms = self.player.get_time()
-        if now_ms < 0: now_ms = 0
+        if now_ms < 0:
+            now_ms = 0
         target_ms = int(max(0.0, (now_ms / 1000.0) + delta_sec) * 1000.0)
         self._seek_to_absolute(target_ms / 1000.0)
         self.status_var.set(f"Seek -> {_fmt_hms(target_ms / 1000.0)}")
@@ -676,8 +676,7 @@ class TranscriptPlayer:
 
     def _tick_ui(self) -> None:
         state = self.player.get_state()
-        pos_ms = self.player.get_time()
-        if pos_ms < 0: pos_ms = 0
+        pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
         length_ms = self.player.get_length()
         length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
@@ -688,11 +687,14 @@ class TranscriptPlayer:
         self.root.after(250, self._tick_ui)
 
     def _caption_text_at(self, pos_sec: float) -> str:
-        if not self.segments: return ""
+        if not self.segments:
+            return ""
         idx = bisect_right(self._segment_starts, pos_sec) - 1
-        if idx < 0 or idx >= len(self.segments): return ""
+        if idx < 0 or idx >= len(self.segments):
+            return ""
         seg = self.segments[idx]
-        if seg.start_sec <= pos_sec <= seg.end_sec: return seg.text
+        if seg.start_sec <= pos_sec <= seg.end_sec:
+            return seg.text
         return ""
 
     def _render_time_progress(self, pos_sec: float, length_sec: float) -> str:
@@ -706,25 +708,25 @@ class TranscriptPlayer:
 
     def _on_left_resize(self, event: tk.Event[tk.Misc]) -> None:
         width = int(getattr(event, "width", 0))
-        if width <= 0: return
+        if width <= 0:
+            return
         # Keep caption wrapping inside the left panel with padding.
         self.caption_now_box.configure(wraplength=max(120, width - 24))
         self._update_progress_bar_width(width)
 
     def _update_progress_bar_width(self, panel_width: int | None = None) -> None:
         width = panel_width if panel_width is not None else int(self.left_panel.winfo_width())
-        if width <= 0: return
+        if width <= 0:
+            return
         available_px = max(120, width - 24)
         # Prefix is fixed-width and the bar uses mono block chars.
         prefix_px = self._text_font.measure("[00:00:00] ")
-        block_px = max(1, self._text_font.measure("█"))
+        block_px =  max(1, self._text_font.measure("█"))
         bar_chars = max(12, min(140, int((available_px - prefix_px) / block_px)))
         self._progress_bar_width = bar_chars + 24
 
     def _refresh_clock_now(self) -> None:
-        pos_ms = self.player.get_time()
-        if pos_ms < 0:
-            pos_ms = 0
+        pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
         length_ms = self.player.get_length()
         length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
@@ -736,13 +738,11 @@ class TranscriptPlayer:
         total_w = self.shell.winfo_width()
         if total_w <= 0:
             return
-        # Default: video pane 3/4, transcript pane 1/4.
         x = int(total_w * 3 / 5)
         self.shell.sash_place(0, x, 0)
         self._split_initialized = True
 
     def _on_shell_configure(self, _event: tk.Event[tk.Misc]) -> None:
-        # Wait for real geometry so ratio is set from the parent pane container.
         if not self._split_initialized:
             self._set_initial_split_ratio()
 
@@ -897,7 +897,11 @@ class TranscriptPlayer:
             rows = self.ingester.search_videos(query, limit=200)
             self._search_results = [dict(r) for r in rows]
             for row in self._search_results:
-                title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+                title = str(
+                    row.get("title") \
+                    or row.get("video_id") \
+                    or "untitled"
+                ).replace("\n", " ").strip()
                 count = int(row.get("match_count") or 0)
                 count_list.insert(tk.END, f"{count:>4}")
                 title_list.insert(tk.END, title)
@@ -931,12 +935,12 @@ class TranscriptPlayer:
             audio_path = self._find_audio_sidecar(video_id, video_path)
             start_sec = float(int(row.get("first_start_ms") or 0)) / 1000.0
             self._load_session(
-                video_id=video_id,
-                transcript_json=transcript_path,
-                video_path=video_path,
-                audio_path=audio_path,
-                start_sec=start_sec,
-                filter_text=query,
+                video_id =video_id,
+                transcript_json = transcript_path,
+                video_path = video_path,
+                audio_path = audio_path,
+                start_sec = start_sec,
+                filter_text = query,
             )
             popup.destroy()
             self._search_popup = None
@@ -965,7 +969,8 @@ class TranscriptPlayer:
         query_entry.focus_set()
 
     def _open_video_picker_popup(self) -> None:
-        if self._video_picker_popup and self._video_picker_popup.winfo_exists():
+        if self._video_picker_popup and \
+            self._video_picker_popup.winfo_exists():
             self._video_picker_popup.focus_force()
             return
 
@@ -1055,7 +1060,11 @@ class TranscriptPlayer:
             rows = self.ingester.search_video_titles(query, limit=300)
             self._video_picker_results = [dict(r) for r in rows]
             for row in self._video_picker_results:
-                title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+                title = str(
+                    row.get("title") \
+                    or row.get("video_id") \
+                    or "untitled"
+                ).replace("\n", " ").strip()
                 count = int(row.get("match_count") or 0)
                 count_list.insert(tk.END, f"{count:>4}")
                 title_list.insert(tk.END, title)
@@ -1303,11 +1312,14 @@ class TranscriptPlayer:
 
     def close(self) -> None:
         self._close_jobs_popup()
-        if self._search_popup and self._search_popup.winfo_exists():
+        if self._search_popup and \
+            self._search_popup.winfo_exists():
             self._search_popup.destroy()
-        if self._video_picker_popup and self._video_picker_popup.winfo_exists():
+        if self._video_picker_popup and \
+            self._video_picker_popup.winfo_exists():
             self._video_picker_popup.destroy()
-        if self._ingest_popup and self._ingest_popup.winfo_exists():
+        if self._ingest_popup and \
+            self._ingest_popup.winfo_exists():
             self._ingest_popup.destroy()
         try:
             self.ingester.stop_background_workers()
@@ -1325,12 +1337,12 @@ class TranscriptPlayer:
 
 def run_player(
     transcript_json: Path | None = None,
-    video_path: Path | None = None,
+    video_path:      Path | None = None,
     *,
-    audio_path: Path | None = None,
-    skim_seconds: float = 5.0,
-    start_sec: float = 0.0,
-    workers: int = 0,
+    audio_path:      Path | None = None,
+    skim_seconds:    float = 5.0,
+    start_sec:       float = 0.0,
+    workers:         int = 0,
 ) -> None:
     app = TranscriptPlayer(
         transcript_json=transcript_json,
