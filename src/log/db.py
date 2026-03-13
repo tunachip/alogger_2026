@@ -696,6 +696,36 @@ class DB:
             "jobs": self.list_jobs(limit=limit),
         }
 
+    def delete_jobs_by_status(self, statuses: list[str]) -> int:
+        states = [s.strip().lower() for s in statuses if s and s.strip()]
+        if not states:
+            return 0
+        placeholders = ",".join("?" for _ in states)
+        with self.connect() as conn:
+            n = conn.execute(
+                f"DELETE FROM ingest_jobs WHERE status IN ({placeholders})",
+                tuple(states),
+            ).rowcount
+            return int(n or 0)
+
+    def fail_jobs_by_status(self, statuses: list[str], *, error_text: str | None = None) -> int:
+        states = [s.strip().lower() for s in statuses if s and s.strip()]
+        if not states:
+            return 0
+        placeholders = ",".join("?" for _ in states)
+        with self.connect() as conn:
+            n = conn.execute(
+                f"""
+                UPDATE ingest_jobs
+                SET status='failed',
+                    error_text=COALESCE(?, error_text),
+                    finished_at=COALESCE(finished_at, ?)
+                WHERE status IN ({placeholders})
+                """,
+                (error_text, utc_now_iso(), *states),
+            ).rowcount
+            return int(n or 0)
+
     def upsert_channel_subscription(
         self,
         *,

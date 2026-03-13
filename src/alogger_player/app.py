@@ -40,6 +40,7 @@ DEFAULT_KEYBINDS: dict[str, str] = {
     "open_video": "Ctrl+O",
     "open_finder": "Ctrl+F",
     "open_ai": "Ctrl+A",
+    "open_goto": "Ctrl+G",
     "toggle_skim": "Ctrl+S",
     "open_settings": "Ctrl+M",
     "quit": "Ctrl+Q",
@@ -143,11 +144,16 @@ class TranscriptPlayer:
         self._ingest_popup:         tk.Toplevel | None = None
         self._ai_popup:             tk.Toplevel | None = None
         self._settings_popup:       tk.Toplevel | None = None
+        self._goto_popup:           tk.Toplevel | None = None
         self._channel_popup:        tk.Toplevel | None = None
         self._subscriptions_popup:  tk.Toplevel | None = None
         self._jobs_popup:           tk.Toplevel | None = None
         self._jobs_text:            tk.Text | None = None
         self._workers_cmd_list:     tk.Listbox | None = None
+        self._jobs_queue_list:      tk.Listbox | None = None
+        self._jobs_done_list:       tk.Listbox | None = None
+        self._jobs_dl_text:         tk.Text | None = None
+        self._jobs_tr_text:         tk.Text | None = None
         self._jobs_after_id:        str | None = None
         self._search_results:       list[dict[str, Any]] = []
         self._video_picker_results: list[dict[str, Any]] = []
@@ -168,6 +174,8 @@ class TranscriptPlayer:
         self._skim_cursor =         0
         self._skim_last_seek_at =   0.0
         self._worker_target_count = self.workers
+        self._downloader_target_count = self.workers if self.workers > 0 else 1
+        self._transcriber_target_count = self.workers if self.workers > 0 else 1
         self._workers_paused =      False
         self._popup_paused_player = False
         self._popup_video_hidden =  False
@@ -175,6 +183,7 @@ class TranscriptPlayer:
         self._workers_eta_next_recalc_at: float = 0.0
         self._workers_eta_last_tick_at: float = time.monotonic()
         self._workers_eta_recalc_interval_sec: float = 60.0
+        self._worker_anim_tick = 0
         self._bound_shortcut_sequences: list[str] = []
         self._ollama_proc:          subprocess.Popen[str] | None = None
         self._ollama_started_by_app = False
@@ -193,12 +202,20 @@ class TranscriptPlayer:
         if self.workers <= 0:
             self.workers = max(0, int(self._ai_settings.get("default_worker_count") or 0))
             self._worker_target_count = self.workers
+        self._downloader_target_count = max(0, int(self._ai_settings.get("default_downloaders") or self._worker_target_count or 1))
+        self._transcriber_target_count = max(0, int(self._ai_settings.get("default_transcribers") or self._worker_target_count or 1))
+        if self._worker_target_count <= 0:
+            self._worker_target_count = max(self._downloader_target_count, self._transcriber_target_count)
         self.ingester.set_runtime_options(
             auto_transcribe_default=bool(self._ai_settings.get("auto_transcribe_default", True)),
             subscription_db_max_videos=max(0, int(self._ai_settings.get("subscription_db_max_videos") or 0)),
         )
         if self.workers > 0:
-            self.ingester.start_background_workers(self.workers)
+            self.ingester.start_background_workers(
+                max(self.workers, self._downloader_target_count + self._transcriber_target_count),
+                downloader_count=self._downloader_target_count,
+                transcriber_count=self._transcriber_target_count,
+            )
         if str(self._ai_settings.get("ai_provider") or "ollama").lower() == "ollama":
             self._start_ollama_bootstrap(background=True)
 
@@ -217,10 +234,12 @@ class TranscriptPlayer:
         self._timestamp_prefix = "[00:00:00] "
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
         self._progress_bar_width = 28
+        self._font_size_delta = 0
 
         self._setup_styles()
         self._build_layout()
         self._apply_theme()
+        self._apply_font_scale_tree(self.root, reset_base=True)
         self._bind_keys()
         self._build_vlc()
 
@@ -237,6 +256,19 @@ class TranscriptPlayer:
             fieldbackground="#151515",
             foreground="#f0f0f0"
         )
+        style.configure("Terminal.TNotebook", background="#111111", borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure(
+            "Terminal.TNotebook.Tab",
+            background="#0d0d0d",
+            foreground="#8f8f8f",
+            borderwidth=0,
+            padding=(8, 4),
+        )
+        style.map(
+            "Terminal.TNotebook.Tab",
+            background=[("selected", "#000000"), ("active", "#161616")],
+            foreground=[("selected", "#ffffff"), ("active", "#d2d2d2")],
+        )
 
     def _apply_theme(self) -> None:
         bg = str(self._ai_settings.get("theme_bg") or "#111111")
@@ -246,10 +278,11 @@ class TranscriptPlayer:
         accent = str(self._ai_settings.get("theme_accent_fg") or "#f7d154")
         try:
             family = str(self._ai_settings.get("font_family") or FONT["STYLE"])
-            size = max(8, int(self._ai_settings.get("font_size") or FONT["SIZE"]))
+            base_size = max(8, int(self._ai_settings.get("font_size") or FONT["SIZE"]))
         except Exception:
             family = FONT["STYLE"]
-            size = FONT["SIZE"]
+            base_size = FONT["SIZE"]
+        size = max(8, min(64, base_size + int(self._font_size_delta)))
         self._text_font.configure(family=family, size=size)
         self._text_font_bold.configure(family=family, size=size)
 
@@ -268,7 +301,58 @@ class TranscriptPlayer:
         self.caption_view.tag_configure("selected_txt", font=self._text_font_bold)
 
         style = ttk.Style(self.root)
-        style.configure("Filter.TEntry", fieldbackground="#151515", foreground=fg)
+        style.configure(
+            "Filter.TEntry",
+            fieldbackground="#151515",
+            foreground=fg,
+            font=(family, max(8, size - 1)),
+        )
+        style.configure("Terminal.TNotebook.Tab", font=(family, max(8, size - 3)))
+
+    def _apply_font_scale_tree(self, root_widget: tk.Misc | None = None, *, reset_base: bool = False) -> None:
+        root = root_widget or self.root
+        if not root:
+            return
+
+        def _visit(widget: tk.Misc) -> None:
+            try:
+                keys = set(widget.keys())
+            except Exception:
+                keys = set()
+            if "font" in keys:
+                try:
+                    if reset_base and hasattr(widget, "_alog_base_font"):
+                        delattr(widget, "_alog_base_font")
+                    base = getattr(widget, "_alog_base_font", None)
+                    if base is None:
+                        fobj = tkfont.Font(root=self.root, font=widget.cget("font"))
+                        actual = fobj.actual()
+                        base = {
+                            "family": str(actual.get("family") or FONT["STYLE"]),
+                            "size": int(actual.get("size") or FONT["SIZE"]) - int(self._font_size_delta),
+                            "weight": str(actual.get("weight") or "normal"),
+                            "slant": str(actual.get("slant") or "roman"),
+                            "underline": int(actual.get("underline") or 0),
+                            "overstrike": int(actual.get("overstrike") or 0),
+                        }
+                        setattr(widget, "_alog_base_font", base)
+                    new_size = max(8, min(64, int(base["size"]) + int(self._font_size_delta)))
+                    parts: list[Any] = [base["family"], new_size]
+                    if str(base.get("weight")) == "bold":
+                        parts.append("bold")
+                    if str(base.get("slant")) == "italic":
+                        parts.append("italic")
+                    if int(base.get("underline") or 0):
+                        parts.append("underline")
+                    if int(base.get("overstrike") or 0):
+                        parts.append("overstrike")
+                    widget.configure(font=tuple(parts))
+                except Exception:
+                    pass
+            for child in widget.winfo_children():
+                _visit(child)
+
+        _visit(root)
 
     def _load_gui_settings(self) -> dict[str, Any]:
         defaults: dict[str, Any] = {
@@ -279,6 +363,8 @@ class TranscriptPlayer:
             "api_key_env": "OPENAI_API_KEY",
             "api_model": "gpt-4o-mini",
             "default_worker_count": 0,
+            "default_downloaders": 1,
+            "default_transcribers": 1,
             "auto_transcribe_default": True,
             "subscription_db_max_videos": 0,
             "theme_bg": "#111111",
@@ -462,6 +548,7 @@ class TranscriptPlayer:
             "workers": "_jobs_popup",
             "ai": "_ai_popup",
             "settings": "_settings_popup",
+            "goto": "_goto_popup",
             "channel": "_channel_popup",
             "subscriptions": "_subscriptions_popup",
         }.get(name)
@@ -707,6 +794,7 @@ class TranscriptPlayer:
             "open_video": self._on_open_video_picker_popup,
             "open_finder": self._on_open_search_popup,
             "open_ai": self._on_open_ai_popup,
+            "open_goto": self._on_open_goto_popup,
             "toggle_skim": self._on_ctrl_s,
             "open_settings": self._on_open_settings_popup,
             "quit": self._on_quit,
@@ -739,26 +827,37 @@ class TranscriptPlayer:
             if not seq:
                 continue
             try:
-                self.root.bind(seq, handler)
+                def _wrapped(event: tk.Event[tk.Misc], _h: Callable[[tk.Event[tk.Misc]], str] = handler) -> str:
+                    if self._active_popup_name is not None:
+                        return "break"
+                    return _h(event)
+                self.root.bind(seq, _wrapped)
                 self._bound_shortcut_sequences.append(seq)
             except Exception:
                 continue
 
+    def _guard_key_handler(self, handler: Callable[[tk.Event[tk.Misc]], str]) -> Callable[[tk.Event[tk.Misc]], str]:
+        def _wrapped(event: tk.Event[tk.Misc]) -> str:
+            if self._active_popup_name is not None:
+                return "break"
+            return handler(event)
+        return _wrapped
+
     def _bind_keys(self) -> None:
         self.filter_var.trace_add("write", self._on_filter_change)
 
-        self.root.bind("<Up>", self._on_up)
-        self.root.bind("<Down>", self._on_down)
-        self.root.bind("<Return>", self._on_return)
-        self.root.bind("<Left>", self._on_left)
-        self.root.bind("<Right>", self._on_right)
-        self.root.bind("<Prior>", self._on_page_up)
-        self.root.bind("<Next>", self._on_page_down)
-        self.root.bind("<Home>", self._on_home)
-        self.root.bind("<End>", self._on_end)
-        self.root.bind("<Control-minus>", self._on_font_smaller)
-        self.root.bind("<Control-equal>", self._on_font_larger)
-        self.root.bind("<Control-plus>", self._on_font_larger)
+        self.root.bind("<Up>", self._guard_key_handler(self._on_up))
+        self.root.bind("<Down>", self._guard_key_handler(self._on_down))
+        self.root.bind("<Return>", self._guard_key_handler(self._on_return))
+        self.root.bind("<Left>", self._guard_key_handler(self._on_left))
+        self.root.bind("<Right>", self._guard_key_handler(self._on_right))
+        self.root.bind("<Prior>", self._guard_key_handler(self._on_page_up))
+        self.root.bind("<Next>", self._guard_key_handler(self._on_page_down))
+        self.root.bind("<Home>", self._guard_key_handler(self._on_home))
+        self.root.bind("<End>", self._guard_key_handler(self._on_end))
+        self.root.bind("<Control-minus>", self._guard_key_handler(self._on_font_smaller))
+        self.root.bind("<Control-equal>", self._guard_key_handler(self._on_font_larger))
+        self.root.bind("<Control-plus>", self._guard_key_handler(self._on_font_larger))
         self.root.bind("<Escape>", self._on_escape, add="+")
         self.root.bind("<KeyPress>", self._on_type_to_filter, add="+")
         self._apply_shortcut_bindings()
@@ -1215,16 +1314,21 @@ class TranscriptPlayer:
         return "break"
 
     def _resize_caption_font(self, delta: int) -> None:
-        current = int(self._text_font.cget("size"))
-        new_size = max(8, min(30, current + delta))
+        try:
+            base_size = max(8, int(self._ai_settings.get("font_size") or FONT["SIZE"]))
+        except Exception:
+            base_size = FONT["SIZE"]
+        current = base_size + int(self._font_size_delta)
+        new_size = max(8, min(64, current + delta))
         if new_size == current:
             return
-        self._text_font.configure(size=new_size)
-        self._text_font_bold.configure(size=new_size)
+        self._font_size_delta = new_size - base_size
+        self._apply_theme()
+        self._apply_font_scale_tree(self.root)
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
         self.caption_view.tag_configure("row", lmargin1=0, lmargin2=self._wrap_indent_px)
         self._refresh_caption_view()
-        self.status_var.set(f"Caption text size: {new_size}")
+        self.status_var.set(f"Text size: {new_size}")
 
     def _seek_relative(self, delta_sec: float) -> None:
         now_ms = self.player.get_time()
@@ -1440,6 +1544,10 @@ class TranscriptPlayer:
         self._toggle_popup("ai", self._open_ai_popup)
         return "break"
 
+    def _on_open_goto_popup(self, _event: tk.Event[tk.Misc]) -> str:
+        self._open_goto_popup()
+        return "break"
+
     def _on_open_settings_popup(self, _event: tk.Event[tk.Misc]) -> str:
         self._toggle_popup("settings", self._open_settings_popup)
         return "break"
@@ -1485,7 +1593,7 @@ class TranscriptPlayer:
 
     def _on_type_to_filter(self, event: tk.Event[tk.Misc]) -> str | None:
         if self._active_popup_name is not None:
-            return None
+            return "break"
         if self._transcript_hidden:
             return None
         char = getattr(event, "char", "")
@@ -1628,6 +1736,7 @@ class TranscriptPlayer:
         popup.configure(bg="#111111")
         popup.lift()
         popup.focus_set()
+        self._apply_font_scale_tree(popup)
 
     def _open_command_popup(self) -> None:
         popup = OverlayPanel(self.root)
@@ -1661,6 +1770,7 @@ class TranscriptPlayer:
             ("Open Video", lambda: self._toggle_popup("open_video", self._open_video_picker_popup)),
             ("Finder", lambda: self._toggle_popup("finder", self._open_search_popup)),
             ("AI Agent", lambda: self._toggle_popup("ai", self._open_ai_popup)),
+            ("Goto Timestamp", self._open_goto_popup),
             ("Settings", lambda: self._toggle_popup("settings", self._open_settings_popup)),
             ("Channel Browser", lambda: self._toggle_popup("channel", self._open_channel_popup)),
             ("Subscriptions", lambda: self._toggle_popup("subscriptions", self._open_subscriptions_popup)),
@@ -1872,233 +1982,165 @@ class TranscriptPlayer:
         entry.focus_set()
         _tick_status()
 
+    def _open_goto_popup(self) -> None:
+        if self._goto_popup and self._goto_popup.winfo_exists():
+            self._goto_popup.focus_force()
+            return
+        popup = OverlayPanel(self.root)
+        self._apply_popup_style(popup, "Goto Timestamp", "420x160")
+        self._goto_popup = popup
+        self._register_popup("goto", popup)
+        popup.columnconfigure(0, weight=1)
+
+        value_var = tk.StringVar(value="")
+        entry = ttk.Entry(popup, textvariable=value_var, style="Filter.TEntry")
+        entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        status_var = tk.StringVar(value="Enter time as seconds or HH:MM:SS")
+        tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            padx=8,
+            pady=6,
+        ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        def parse_time(raw: str) -> float | None:
+            token = raw.strip()
+            if not token:
+                return None
+            if ":" not in token:
+                try:
+                    return max(0.0, float(token))
+                except ValueError:
+                    return None
+            parts = token.split(":")
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError:
+                return None
+            if len(nums) == 2:
+                return max(0.0, nums[0] * 60.0 + nums[1])
+            if len(nums) == 3:
+                return max(0.0, nums[0] * 3600.0 + nums[1] * 60.0 + nums[2])
+            return None
+
+        def apply_goto(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sec = parse_time(value_var.get())
+            if sec is None:
+                status_var.set("Invalid format. Use seconds or HH:MM:SS")
+                return "break"
+            self._seek_to_absolute(sec)
+            self.status_var.set(f"Jumped to {_fmt_hms(sec)}")
+            popup.destroy()
+            return "break"
+
+        popup.bind("<Return>", apply_goto)
+        entry.bind("<Return>", apply_goto)
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        entry.focus_set()
+
     def _open_settings_popup(self) -> None:
         popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Settings", "980x700")
         self._settings_popup = popup
         self._register_popup("settings", popup)
         popup.rowconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=0)
+        popup.rowconfigure(2, weight=0)
         popup.columnconfigure(0, weight=1)
 
-        tabs = ttk.Notebook(popup)
+        tabs = ttk.Notebook(popup, style="Terminal.TNotebook")
         tabs.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
 
-        ingest_tab = tk.Frame(tabs, bg="#111111")
-        theme_tab = tk.Frame(tabs, bg="#111111")
-        subs_tab = tk.Frame(tabs, bg="#111111")
-        ai_tab = tk.Frame(tabs, bg="#111111")
-        keybind_tab = tk.Frame(tabs, bg="#111111")
-        tabs.add(ingest_tab, text="Ingest")
-        tabs.add(theme_tab, text="Theme")
-        tabs.add(subs_tab, text="Subscription")
-        tabs.add(ai_tab, text="AI")
-        tabs.add(keybind_tab, text="Keybinds")
+        tab_names = ["Ingest", "Theme", "Subscription", "AI", "Keybinds"]
+        tab_frames: list[tk.Frame] = []
+        key_lists: list[tk.Listbox] = []
+        val_lists: list[tk.Listbox] = []
+        for name in tab_names:
+            frame = tk.Frame(tabs, bg="#111111")
+            frame.rowconfigure(1, weight=1)
+            frame.columnconfigure(0, weight=1)
+            frame.columnconfigure(1, weight=1)
+            tabs.add(frame, text=name)
+            tab_frames.append(frame)
 
-        # Ingest tab
-        ingest_workers_var = tk.StringVar(value=str(self._ai_settings.get("default_worker_count", self._worker_target_count)))
-        ingest_auto_var = tk.BooleanVar(value=bool(self._ai_settings.get("auto_transcribe_default", True)))
-        skim_pre_var = tk.StringVar(value=str(self._skim_pre_ms))
-        skim_post_var = tk.StringVar(value=str(self._skim_post_ms))
-        for i, (label, var) in enumerate(
-            [
-                ("Default worker count", ingest_workers_var),
-                ("Skim pre-buffer ms", skim_pre_var),
-                ("Skim post-buffer ms", skim_post_var),
-            ]
-        ):
-            tk.Label(ingest_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
-                row=i, column=0, sticky="w", padx=(10, 6), pady=(10 if i == 0 else 6, 0)
-            )
-            ttk.Entry(ingest_tab, textvariable=var, style="Filter.TEntry").grid(
-                row=i, column=1, sticky="ew", padx=(0, 10), pady=(10 if i == 0 else 6, 0)
-            )
-        ttk.Checkbutton(ingest_tab, text="Auto-transcribe downloaded videos", variable=ingest_auto_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 0)
-        )
-        ingest_tab.columnconfigure(1, weight=1)
+            tk.Label(
+                frame,
+                text="Key",
+                anchor="w",
+                bg="#0d0d0d",
+                fg="#8f8f8f",
+                font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                padx=8,
+                pady=4,
+            ).grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(8, 4))
+            tk.Label(
+                frame,
+                text="Value",
+                anchor="w",
+                bg="#0d0d0d",
+                fg="#8f8f8f",
+                font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                padx=8,
+                pady=4,
+            ).grid(row=0, column=1, sticky="ew", padx=(4, 8), pady=(8, 4))
 
-        # Theme tab
-        theme_vars = {
-            "theme_bg": tk.StringVar(value=str(self._ai_settings.get("theme_bg") or "#111111")),
-            "theme_panel_bg": tk.StringVar(value=str(self._ai_settings.get("theme_panel_bg") or "#000000")),
-            "theme_fg": tk.StringVar(value=str(self._ai_settings.get("theme_fg") or "#ffffff")),
-            "theme_muted_fg": tk.StringVar(value=str(self._ai_settings.get("theme_muted_fg") or "#8f8f8f")),
-            "theme_accent_fg": tk.StringVar(value=str(self._ai_settings.get("theme_accent_fg") or "#f7d154")),
-            "font_family": tk.StringVar(value=str(self._ai_settings.get("font_family") or FONT["STYLE"])),
-            "font_size": tk.StringVar(value=str(self._ai_settings.get("font_size") or FONT["SIZE"])),
-        }
-        theme_labels = [
-            ("App background", "theme_bg"),
-            ("Panel background", "theme_panel_bg"),
-            ("Primary text", "theme_fg"),
-            ("Muted text", "theme_muted_fg"),
-            ("Accent text", "theme_accent_fg"),
-            ("Font family", "font_family"),
-            ("Font size", "font_size"),
-        ]
-        for i, (label, key) in enumerate(theme_labels):
-            tk.Label(theme_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
-                row=i, column=0, sticky="w", padx=(10, 6), pady=(10 if i == 0 else 6, 0)
+            k_list = tk.Listbox(
+                frame,
+                bg="#000000",
+                fg="#d2d2d2",
+                selectbackground="#161616",
+                selectforeground="#ffffff",
+                activestyle="none",
+                borderwidth=0,
+                highlightthickness=0,
+                exportselection=False,
+                font=(FONT["STYLE"], FONT["SIZE"] - 2),
             )
-            ttk.Entry(theme_tab, textvariable=theme_vars[key], style="Filter.TEntry").grid(
-                row=i, column=1, sticky="ew", padx=(0, 10), pady=(10 if i == 0 else 6, 0)
+            v_list = tk.Listbox(
+                frame,
+                bg="#000000",
+                fg="#ffffff",
+                selectbackground="#161616",
+                selectforeground="#ffffff",
+                activestyle="none",
+                borderwidth=0,
+                highlightthickness=0,
+                exportselection=False,
+                font=(FONT["STYLE"], FONT["SIZE"] - 2),
             )
-        theme_tab.columnconfigure(1, weight=1)
+            k_list.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
+            v_list.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
+            key_lists.append(k_list)
+            val_lists.append(v_list)
 
-        # Subscription tab
-        sub_cap_var = tk.StringVar(value=str(self._ai_settings.get("subscription_db_max_videos") or 0))
+        edit_var = tk.StringVar(value="")
+        edit_entry = ttk.Entry(popup, textvariable=edit_var, style="Filter.TEntry")
+        edit_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        edit_entry.grid_remove()
+
+        status_var = tk.StringVar(value="Up/Down select row | Left/Right change tab | Enter edit | Esc close")
         tk.Label(
-            subs_tab,
-            text="DB max videos for auto-download (0 = unlimited)",
-            anchor="w",
-            bg="#111111",
-            fg="#d2d2d2",
-        ).grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(10, 0))
-        ttk.Entry(subs_tab, textvariable=sub_cap_var, style="Filter.TEntry").grid(
-            row=0, column=1, sticky="ew", padx=(0, 10), pady=(10, 0)
-        )
-        sub_list = tk.Listbox(
-            subs_tab,
-            bg="#000000",
-            fg="#ffffff",
-            selectbackground="#161616",
-            selectforeground="#ffffff",
-            activestyle="none",
-            borderwidth=0,
-            highlightthickness=0,
-            exportselection=False,
-            font=(FONT["STYLE"], max(8, FONT["SIZE"] - 2)),
-        )
-        sub_list.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(8, 6))
-        subs_tab.rowconfigure(1, weight=1)
-        subs_tab.columnconfigure(1, weight=1)
-        sub_rows: list[dict[str, Any]] = []
-
-        def _sub_mode_text(row: dict[str, Any]) -> str:
-            mode = row.get("auto_transcribe")
-            if mode is None:
-                return "default"
-            return "on" if int(mode) == 1 else "off"
-
-        def refresh_sub_list(_event: tk.Event[tk.Misc] | None = None) -> str:
-            nonlocal sub_rows
-            try:
-                sub_rows = [dict(r) for r in self.ingester.list_channel_subscriptions(active_only=False)]
-                sub_list.delete(0, tk.END)
-                for row in sub_rows:
-                    title = str(row.get("channel_title") or row.get("channel_key") or "")
-                    key = str(row.get("channel_key") or "")
-                    active = "on" if int(row.get("active") or 0) == 1 else "off"
-                    mode = _sub_mode_text(row)
-                    sub_list.insert(tk.END, f"{title} | {key} | active={active} | transcribe={mode}")
-                if sub_rows:
-                    sub_list.selection_set(0)
-                status_var.set(f"Subscriptions: {len(sub_rows)} loaded")
-            except Exception as exc:
-                status_var.set(f"Subscriptions load failed: {exc}")
-            return "break"
-
-        def _selected_sub() -> tuple[int, dict[str, Any]] | tuple[None, None]:
-            sel = sub_list.curselection()
-            if not sel:
-                return None, None
-            idx = int(sel[0])
-            if idx < 0 or idx >= len(sub_rows):
-                return None, None
-            return idx, sub_rows[idx]
-
-        def remove_sub(_event: tk.Event[tk.Misc] | None = None) -> str:
-            _idx, row = _selected_sub()
-            if not row:
-                return "break"
-            key = str(row.get("channel_key") or "")
-            try:
-                self.ingester.remove_channel_subscription(key)
-                return refresh_sub_list()
-            except Exception as exc:
-                status_var.set(f"Remove failed: {exc}")
-            return "break"
-
-        def toggle_sub_active(_event: tk.Event[tk.Misc] | None = None) -> str:
-            _idx, row = _selected_sub()
-            if not row:
-                return "break"
-            key = str(row.get("channel_key") or "")
-            active_now = int(row.get("active") or 0) == 1
-            try:
-                self.ingester.update_channel_subscription(key, active=not active_now)
-                return refresh_sub_list()
-            except Exception as exc:
-                status_var.set(f"Update failed: {exc}")
-            return "break"
-
-        def cycle_sub_mode(_event: tk.Event[tk.Misc] | None = None) -> str:
-            _idx, row = _selected_sub()
-            if not row:
-                return "break"
-            key = str(row.get("channel_key") or "")
-            cur = row.get("auto_transcribe")
-            try:
-                if cur is None:
-                    self.ingester.update_channel_subscription(key, auto_transcribe=True)
-                elif int(cur) == 1:
-                    self.ingester.update_channel_subscription(key, auto_transcribe=False)
-                else:
-                    self.ingester.update_channel_subscription(key, clear_auto_transcribe=True)
-                return refresh_sub_list()
-            except Exception as exc:
-                status_var.set(f"Mode update failed: {exc}")
-            return "break"
-
-        sub_help = tk.Label(
-            subs_tab,
-            text="R refresh | A toggle active | T cycle transcribe(default/on/off) | Delete remove",
+            popup,
+            textvariable=status_var,
             anchor="w",
             bg="#0d0d0d",
             fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
             padx=8,
             pady=6,
-        )
-        sub_help.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
-        sub_list.bind("<Delete>", remove_sub)
-        sub_list.bind("<KeyPress-a>", toggle_sub_active)
-        sub_list.bind("<KeyPress-t>", cycle_sub_mode)
-        sub_list.bind("<KeyPress-r>", refresh_sub_list)
+        ).grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
 
-        # AI tab
-        ai_vars = {
-            "ai_provider": tk.StringVar(value=str(self._ai_settings.get("ai_provider") or "ollama")),
-            "ollama_model": tk.StringVar(value=str(self._ai_settings.get("ollama_model") or "llama3.2:3b")),
-            "ollama_base_url": tk.StringVar(value=str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")),
-            "api_base_url": tk.StringVar(value=str(self._ai_settings.get("api_base_url") or "https://api.openai.com")),
-            "api_key_env": tk.StringVar(value=str(self._ai_settings.get("api_key_env") or "OPENAI_API_KEY")),
-            "api_model": tk.StringVar(value=str(self._ai_settings.get("api_model") or "gpt-4o-mini")),
-        }
-        ai_labels = [
-            ("AI provider (ollama/api)", "ai_provider"),
-            ("Ollama model", "ollama_model"),
-            ("Ollama base URL", "ollama_base_url"),
-            ("API base URL", "api_base_url"),
-            ("API key env var", "api_key_env"),
-            ("API model", "api_model"),
-        ]
-        for i, (label, key) in enumerate(ai_labels):
-            tk.Label(ai_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
-                row=i, column=0, sticky="w", padx=(10, 6), pady=(10 if i == 0 else 6, 0)
-            )
-            ttk.Entry(ai_tab, textvariable=ai_vars[key], style="Filter.TEntry").grid(
-                row=i, column=1, sticky="ew", padx=(0, 10), pady=(10 if i == 0 else 6, 0)
-            )
-        ai_tab.columnconfigure(1, weight=1)
-
-        # Keybind tab
-        keybind_defs = [
+        keybind_defs: list[tuple[str, str]] = [
             ("Command menu", "open_command"),
             ("Ingest menu", "open_ingest"),
             ("Workers", "open_workers"),
             ("Open video", "open_video"),
             ("Finder", "open_finder"),
             ("AI", "open_ai"),
+            ("Goto", "open_goto"),
             ("Skim toggle", "toggle_skim"),
             ("Settings", "open_settings"),
             ("Quit", "quit"),
@@ -2115,72 +2157,209 @@ class TranscriptPlayer:
             ("Toggle transcript", "toggle_transcript"),
             ("Toggle details", "toggle_details"),
         ]
-        keybind_vars: dict[str, tk.StringVar] = {}
-        keybind_tab.columnconfigure(1, weight=1)
-        for i, (label, key) in enumerate(keybind_defs):
-            tk.Label(keybind_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
-                row=i, column=0, sticky="w", padx=(10, 6), pady=(8 if i == 0 else 4, 0)
-            )
-            var = tk.StringVar(value=str((self._ai_settings.get("keybinds") or {}).get(key, DEFAULT_KEYBINDS.get(key, ""))))
-            keybind_vars[key] = var
-            ttk.Entry(keybind_tab, textvariable=var, style="Filter.TEntry").grid(
-                row=i, column=1, sticky="ew", padx=(0, 10), pady=(8 if i == 0 else 4, 0)
-            )
 
-        status_var = tk.StringVar(value="Enter saves all tabs")
-        tk.Label(
-            popup,
-            textvariable=status_var,
-            anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
-            padx=8,
-            pady=6,
-        ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
-        actions = tk.Frame(popup, bg="#111111")
-        actions.grid(row=2, column=0, sticky="e", padx=8, pady=(0, 8))
+        color_fields = {"theme_bg", "theme_panel_bg", "theme_fg", "theme_muted_fg", "theme_accent_fg"}
 
-        def save_now(_event: tk.Event[tk.Misc] | None = None) -> str:
+        def _norm_hex(value: str) -> str | None:
+            token = value.strip().lower()
+            if not token.startswith("#"):
+                token = "#" + token
+            if len(token) != 7:
+                return None
             try:
-                prev_provider = str(self._ai_settings.get("ai_provider") or "ollama")
-                prev_model = str(self._ai_settings.get("ollama_model") or "llama3.2:3b")
-                prev_base = str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")
+                int(token[1:], 16)
+                return token
+            except Exception:
+                return None
 
-                target_workers = max(0, int(ingest_workers_var.get().strip() or "0"))
-                self._ai_settings["default_worker_count"] = target_workers
-                self._ai_settings["auto_transcribe_default"] = bool(ingest_auto_var.get())
-                self._skim_pre_ms = max(0, int(skim_pre_var.get().strip() or "0"))
-                self._skim_post_ms = max(0, int(skim_post_var.get().strip() or "0"))
+        def _sub_mode_text(row: dict[str, Any]) -> str:
+            mode = row.get("auto_transcribe")
+            if mode is None:
+                return "default"
+            return "on" if int(mode) == 1 else "off"
 
-                for key, var in theme_vars.items():
-                    value = var.get().strip()
-                    if key == "font_size":
-                        self._ai_settings[key] = max(8, int(value or "12"))
+        def _rows_for_tab(tab_idx: int) -> list[dict[str, str]]:
+            if tab_idx == 0:
+                return [
+                    {"id": "default_downloaders", "key": "Downloaders", "value": str(self._ai_settings.get("default_downloaders", 1))},
+                    {"id": "default_transcribers", "key": "Transcribers", "value": str(self._ai_settings.get("default_transcribers", 1))},
+                    {"id": "auto_transcribe_default", "key": "Auto Transcribe", "value": ("on" if self._auto_transcribe_default() else "off")},
+                    {"id": "skim_pre", "key": "Skim Pre (ms)", "value": str(self._skim_pre_ms)},
+                    {"id": "skim_post", "key": "Skim Post (ms)", "value": str(self._skim_post_ms)},
+                ]
+            if tab_idx == 1:
+                return [
+                    {"id": "theme_bg", "key": "App Background", "value": str(self._ai_settings.get("theme_bg") or "#111111")},
+                    {"id": "theme_panel_bg", "key": "Panel Background", "value": str(self._ai_settings.get("theme_panel_bg") or "#000000")},
+                    {"id": "theme_fg", "key": "Primary Text", "value": str(self._ai_settings.get("theme_fg") or "#ffffff")},
+                    {"id": "theme_muted_fg", "key": "Muted Text", "value": str(self._ai_settings.get("theme_muted_fg") or "#8f8f8f")},
+                    {"id": "theme_accent_fg", "key": "Accent Text", "value": str(self._ai_settings.get("theme_accent_fg") or "#f7d154")},
+                    {"id": "font_family", "key": "Font Family", "value": str(self._ai_settings.get("font_family") or FONT["STYLE"])},
+                    {"id": "font_size", "key": "Font Size", "value": str(self._ai_settings.get("font_size") or FONT["SIZE"])},
+                ]
+            if tab_idx == 2:
+                rows = [
+                    {
+                        "id": "subscription_db_max_videos",
+                        "key": "DB Max Videos",
+                        "value": str(self._ai_settings.get("subscription_db_max_videos") or 0),
+                    }
+                ]
+                try:
+                    subs = self.ingester.list_channel_subscriptions(active_only=False)
+                    for row in subs:
+                        key = str(row.get("channel_key") or "")
+                        title = str(row.get("channel_title") or key)
+                        active = "on" if int(row.get("active") or 0) == 1 else "off"
+                        mode = _sub_mode_text(dict(row))
+                        rows.append(
+                            {
+                                "id": f"sub:{key}",
+                                "key": f"{title} ({key})",
+                                "value": f"active={active} mode={mode}",
+                            }
+                        )
+                except Exception:
+                    pass
+                return rows
+            if tab_idx == 3:
+                return [
+                    {"id": "ai_provider", "key": "Provider", "value": str(self._ai_settings.get("ai_provider") or "ollama")},
+                    {"id": "ollama_model", "key": "Ollama Model", "value": str(self._ai_settings.get("ollama_model") or "llama3.2:3b")},
+                    {"id": "ollama_base_url", "key": "Ollama Base URL", "value": str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")},
+                    {"id": "api_base_url", "key": "API Base URL", "value": str(self._ai_settings.get("api_base_url") or "https://api.openai.com")},
+                    {"id": "api_key_env", "key": "API Key Env", "value": str(self._ai_settings.get("api_key_env") or "OPENAI_API_KEY")},
+                    {"id": "api_model", "key": "API Model", "value": str(self._ai_settings.get("api_model") or "gpt-4o-mini")},
+                ]
+            rows: list[dict[str, str]] = []
+            kb = self._ai_settings.get("keybinds") or {}
+            for label, key in keybind_defs:
+                rows.append({"id": f"kb:{key}", "key": label, "value": str(kb.get(key, DEFAULT_KEYBINDS.get(key, "")))})
+            return rows
+
+        selected_idx = [0 for _ in tab_names]
+        tab_rows: list[list[dict[str, str]]] = [[] for _ in tab_names]
+        editing = {"active": False, "tab": 0, "row": 0, "orig": ""}
+
+        def _sync_selection(tab_idx: int) -> None:
+            rows = tab_rows[tab_idx]
+            if not rows:
+                return
+            idx = max(0, min(selected_idx[tab_idx], len(rows) - 1))
+            selected_idx[tab_idx] = idx
+            k = key_lists[tab_idx]
+            v = val_lists[tab_idx]
+            k.selection_clear(0, tk.END)
+            v.selection_clear(0, tk.END)
+            k.selection_set(idx)
+            v.selection_set(idx)
+            k.activate(idx)
+            v.activate(idx)
+            k.see(idx)
+            v.see(idx)
+
+        def _render_tab(tab_idx: int) -> None:
+            tab_rows[tab_idx] = _rows_for_tab(tab_idx)
+            k = key_lists[tab_idx]
+            v = val_lists[tab_idx]
+            k.delete(0, tk.END)
+            v.delete(0, tk.END)
+            for row in tab_rows[tab_idx]:
+                k.insert(tk.END, row["key"])
+                v.insert(tk.END, row["value"])
+            _sync_selection(tab_idx)
+
+        def _render_current() -> None:
+            _render_tab(int(tabs.index("current")))
+
+        def _apply_row_value(row_id: str, value: str) -> str | None:
+            prev_provider = str(self._ai_settings.get("ai_provider") or "ollama")
+            prev_model = str(self._ai_settings.get("ollama_model") or "llama3.2:3b")
+            prev_base = str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")
+            token = value.strip()
+            try:
+                if row_id == "default_downloaders":
+                    self._ai_settings["default_downloaders"] = max(0, int(token or "0"))
+                elif row_id == "default_transcribers":
+                    self._ai_settings["default_transcribers"] = max(0, int(token or "0"))
+                elif row_id == "auto_transcribe_default":
+                    self._ai_settings["auto_transcribe_default"] = token.lower() in {"1", "true", "yes", "on"}
+                elif row_id == "skim_pre":
+                    self._skim_pre_ms = max(0, int(token or "0"))
+                elif row_id == "skim_post":
+                    self._skim_post_ms = max(0, int(token or "0"))
+                elif row_id in {"theme_bg", "theme_panel_bg", "theme_fg", "theme_muted_fg", "theme_accent_fg"}:
+                    color = _norm_hex(token)
+                    if not color:
+                        return "Invalid hex color; use #RRGGBB"
+                    self._ai_settings[row_id] = color
+                elif row_id == "font_family":
+                    self._ai_settings["font_family"] = token or FONT["STYLE"]
+                elif row_id == "font_size":
+                    self._ai_settings["font_size"] = max(8, int(token or "12"))
+                elif row_id == "subscription_db_max_videos":
+                    self._ai_settings["subscription_db_max_videos"] = max(0, int(token or "0"))
+                elif row_id.startswith("sub:"):
+                    channel_key = row_id.split(":", 1)[1]
+                    if token.lower() in {"remove", "rm", "delete"}:
+                        self.ingester.remove_channel_subscription(channel_key)
                     else:
-                        self._ai_settings[key] = value
+                        parts = token.replace(",", " ").split()
+                        active_val: bool | None = None
+                        mode_val: str | None = None
+                        for part in parts:
+                            if "=" not in part:
+                                continue
+                            k, v = part.split("=", 1)
+                            kl = k.strip().lower()
+                            vl = v.strip().lower()
+                            if kl == "active":
+                                active_val = vl in {"on", "1", "true", "yes"}
+                            if kl in {"mode", "transcribe"}:
+                                mode_val = vl
+                        if active_val is not None:
+                            self.ingester.update_channel_subscription(channel_key, active=active_val)
+                        if mode_val is not None:
+                            if mode_val == "default":
+                                self.ingester.update_channel_subscription(channel_key, clear_auto_transcribe=True)
+                            elif mode_val in {"on", "true", "1", "yes"}:
+                                self.ingester.update_channel_subscription(channel_key, auto_transcribe=True)
+                            elif mode_val in {"off", "false", "0", "no"}:
+                                self.ingester.update_channel_subscription(channel_key, auto_transcribe=False)
+                elif row_id in {"ai_provider", "ollama_model", "ollama_base_url", "api_base_url", "api_key_env", "api_model"}:
+                    self._ai_settings[row_id] = token
+                    if row_id == "ai_provider" and not token:
+                        self._ai_settings[row_id] = "ollama"
+                elif row_id.startswith("kb:"):
+                    action = row_id.split(":", 1)[1]
+                    kb = self._ai_settings.get("keybinds")
+                    if not isinstance(kb, dict):
+                        kb = dict(DEFAULT_KEYBINDS)
+                    kb[action] = token or DEFAULT_KEYBINDS.get(action, "")
+                    self._ai_settings["keybinds"] = kb
+                else:
+                    return "Unknown setting"
 
-                self._ai_settings["subscription_db_max_videos"] = max(0, int(sub_cap_var.get().strip() or "0"))
-
-                for key, var in ai_vars.items():
-                    self._ai_settings[key] = var.get().strip()
-                if not str(self._ai_settings.get("ai_provider") or "").strip():
-                    self._ai_settings["ai_provider"] = "ollama"
-
-                kb: dict[str, str] = {}
-                for _label, key in keybind_defs:
-                    val = keybind_vars[key].get().strip()
-                    kb[key] = val or DEFAULT_KEYBINDS.get(key, "")
-                self._ai_settings["keybinds"] = kb
-
+                self._ai_settings["default_worker_count"] = max(
+                    int(self._ai_settings.get("default_downloaders") or 0),
+                    int(self._ai_settings.get("default_transcribers") or 0),
+                )
                 self.ingester.set_runtime_options(
                     auto_transcribe_default=bool(self._ai_settings.get("auto_transcribe_default", True)),
                     subscription_db_max_videos=int(self._ai_settings.get("subscription_db_max_videos") or 0),
                 )
-                if self._worker_target_count != target_workers:
-                    self._restart_workers(target_workers)
+                target_downloaders = max(0, int(self._ai_settings.get("default_downloaders") or 0))
+                target_transcribers = max(0, int(self._ai_settings.get("default_transcribers") or 0))
+                target_workers = max(target_downloaders, target_transcribers)
+                if (
+                    self._worker_target_count != target_workers
+                    or self._downloader_target_count != target_downloaders
+                    or self._transcriber_target_count != target_transcribers
+                ):
+                    self._restart_workers(target_workers, target_downloaders, target_transcribers)
 
                 self._apply_theme()
+                self._apply_font_scale_tree(self.root, reset_base=True)
                 self._refresh_caption_view()
                 self._apply_shortcut_bindings()
                 self._save_gui_settings()
@@ -2193,34 +2372,102 @@ class TranscriptPlayer:
                         or prev_base != str(self._ai_settings.get("ollama_base_url"))
                     ):
                         self._start_ollama_bootstrap(background=True, force_reset=True)
-                status_var.set("Saved")
                 self.status_var.set("Settings saved")
+                return None
             except Exception as exc:
-                status_var.set(f"Save failed: {exc}")
+                return str(exc)
+
+        for i in range(len(tab_names)):
+            _render_tab(i)
+
+        def _start_edit() -> None:
+            tab = int(tabs.index("current"))
+            rows = tab_rows[tab]
+            if not rows:
+                return
+            row = max(0, min(selected_idx[tab], len(rows) - 1))
+            editing["active"] = True
+            editing["tab"] = tab
+            editing["row"] = row
+            editing["orig"] = rows[row]["value"]
+            edit_var.set(rows[row]["value"])
+            edit_entry.grid()
+            edit_entry.focus_set()
+            edit_entry.selection_range(0, tk.END)
+            status_var.set(f"Editing `{rows[row]['key']}` | Enter commit | Esc revert")
+
+        def _stop_edit(*, revert: bool) -> None:
+            if not editing["active"]:
+                return
+            tab = int(editing["tab"])
+            row = int(editing["row"])
+            rows = tab_rows[tab]
+            if not revert and rows and row < len(rows):
+                err = _apply_row_value(rows[row]["id"], edit_var.get())
+                if err:
+                    status_var.set(f"Apply failed: {err}")
+                    return
+                status_var.set("Saved")
+            if revert:
+                status_var.set("Edit canceled")
+            editing["active"] = False
+            edit_entry.grid_remove()
+            _render_current()
+            key_lists[int(tabs.index("current"))].focus_set()
+
+        def _move_row(delta: int) -> None:
+            tab = int(tabs.index("current"))
+            rows = tab_rows[tab]
+            if not rows:
+                return
+            selected_idx[tab] = max(0, min(selected_idx[tab] + delta, len(rows) - 1))
+            _sync_selection(tab)
+
+        def _switch_tab(delta: int) -> None:
+            cur = int(tabs.index("current"))
+            nxt = max(0, min(cur + delta, len(tab_names) - 1))
+            tabs.select(nxt)
+            _render_tab(nxt)
+            key_lists[nxt].focus_set()
+
+        def _on_key(event: tk.Event[tk.Misc]) -> str | None:
+            keysym = str(getattr(event, "keysym", ""))
+            if editing["active"]:
+                if keysym == "Return":
+                    _stop_edit(revert=False)
+                    return "break"
+                if keysym == "Escape":
+                    _stop_edit(revert=True)
+                    return "break"
+                return None
+
+            if keysym == "Escape":
+                popup.destroy()
+                return "break"
+            if keysym in {"Left", "h", "H"}:
+                _switch_tab(-1)
+                return "break"
+            if keysym in {"Right", "l", "L"}:
+                _switch_tab(1)
+                return "break"
+            if keysym in {"Up", "k", "K"}:
+                _move_row(-1)
+                return "break"
+            if keysym in {"Down", "j", "J"}:
+                _move_row(1)
+                return "break"
+            if keysym == "Return":
+                _start_edit()
+                return "break"
             return "break"
 
-        tk.Button(
-            actions,
-            text="Save",
-            command=lambda: save_now(None),
-            bg="#151515",
-            fg="#ffffff",
-            activebackground="#202020",
-            activeforeground="#ffffff",
-            relief=tk.FLAT,
-            padx=10,
-            pady=4,
-        ).grid(row=0, column=0, sticky="e")
-
-        popup.bind("<Escape>", lambda _e: popup.destroy())
-        popup.bind("<Return>", save_now)
-        def _bind_return_recursive(parent: tk.Misc) -> None:
-            for child in parent.winfo_children():
-                if isinstance(child, (tk.Entry, ttk.Entry, ttk.Checkbutton, tk.Button)):
-                    child.bind("<Return>", save_now, add="+")
-                _bind_return_recursive(child)
-        _bind_return_recursive(popup)
-        refresh_sub_list()
+        for lb in [*key_lists, *val_lists]:
+            lb.bind("<KeyPress>", _on_key, add="+")
+            lb.bind("<Button-1>", lambda _e: "break")
+        edit_entry.bind("<KeyPress>", _on_key, add="+")
+        popup.bind("<KeyPress>", _on_key, add="+")
+        tabs.bind("<<NotebookTabChanged>>", lambda _e: (_render_current(), key_lists[int(tabs.index("current"))].focus_set()), add="+")
+        key_lists[0].focus_set()
 
     def _open_search_popup(self) -> None:
         if self._search_popup and self._search_popup.winfo_exists():
@@ -3074,38 +3321,60 @@ class TranscriptPlayer:
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
         refresh_rows()
 
-    def _restart_workers(self, target: int) -> None:
+    def _restart_workers(self, target: int, downloaders: int | None = None, transcribers: int | None = None) -> None:
         target = max(0, int(target))
+        if downloaders is None:
+            downloaders = self._downloader_target_count
+        if transcribers is None:
+            transcribers = self._transcriber_target_count
+        downloaders = max(0, int(downloaders))
+        transcribers = max(0, int(transcribers))
+        target = max(target, downloaders, transcribers)
         self.ingester.stop_background_workers()
         if target > 0:
-            self.ingester.start_background_workers(target)
+            self.ingester.start_background_workers(
+                max(target, downloaders + transcribers),
+                downloader_count=downloaders,
+                transcriber_count=transcribers,
+            )
         self._worker_target_count = target
+        self._downloader_target_count = downloaders
+        self._transcriber_target_count = transcribers
         self._workers_paused = False
         self._workers_eta_next_recalc_at = 0.0
 
     def _run_worker_command(self, command: str) -> str:
         label = command.strip().lower()
-        if label == "create":
-            self._restart_workers(self._worker_target_count + 1)
-            return f"Workers: {self._worker_target_count}"
-        if label == "retire":
-            self._restart_workers(max(0, self._worker_target_count - 1))
-            return f"Workers: {self._worker_target_count}"
-        if label == "pause":
-            self.ingester.stop_background_workers()
-            self._workers_paused = True
-            self._workers_eta_next_recalc_at = 0.0
-            return "Workers paused"
-        if label == "resume":
-            if self._worker_target_count > 0:
-                self.ingester.start_background_workers(self._worker_target_count)
-            self._workers_paused = False
-            self._workers_eta_next_recalc_at = 0.0
-            return f"Workers resumed ({self._worker_target_count})"
-        if label == "cancel":
-            return "Cancel is not yet wired to per-job interruption"
-        if label == "assign":
-            return "Assign task via Ctrl-N Ingest popup"
+        if label == "add downloader":
+            self._restart_workers(self._worker_target_count, self._downloader_target_count + 1, self._transcriber_target_count)
+            return f"Downloaders: {self._downloader_target_count}"
+        if label == "remove downloader":
+            self._restart_workers(self._worker_target_count, max(0, self._downloader_target_count - 1), self._transcriber_target_count)
+            return f"Downloaders: {self._downloader_target_count}"
+        if label == "add transcriber":
+            self._restart_workers(self._worker_target_count, self._downloader_target_count, self._transcriber_target_count + 1)
+            return f"Transcribers: {self._transcriber_target_count}"
+        if label == "remove transcriber":
+            self._restart_workers(self._worker_target_count, self._downloader_target_count, max(0, self._transcriber_target_count - 1))
+            return f"Transcribers: {self._transcriber_target_count}"
+        if label == "kill jobs":
+            try:
+                n = int(self.ingester.kill_active_jobs())
+                return f"Killed active jobs: {n}"
+            except Exception as exc:
+                return f"Kill failed: {exc}"
+        if label == "clear queue":
+            try:
+                n = int(self.ingester.clear_queue())
+                return f"Cleared queued jobs: {n}"
+            except Exception as exc:
+                return f"Clear queue failed: {exc}"
+        if label == "poll subscriptions":
+            try:
+                summary = self.ingester.poll_subscriptions_once()
+                return f"Poll: scanned={summary.get('scanned', 0)} queued={summary.get('queued', 0)}"
+            except Exception as exc:
+                return f"Poll failed: {exc}"
         return "Unknown command"
 
     def _recalculate_workers_eta(self) -> None:
@@ -3130,7 +3399,7 @@ class TranscriptPlayer:
                 avg = snapshot.get("avg_duration_sec")
             avg_sec = float(avg) if avg is not None else 300.0
             avg_sec = max(30.0, avg_sec)
-            workers = max(1, int(self._worker_target_count or 1))
+            workers = max(1, int((self._downloader_target_count + self._transcriber_target_count) or self._worker_target_count or 1))
             self._workers_eta_remaining_sec = float(pending) * avg_sec / float(workers)
         except Exception:
             # Keep prior countdown if snapshot fails.
@@ -3162,15 +3431,56 @@ class TranscriptPlayer:
 
     def _open_jobs_popup(self) -> None:
         popup = OverlayPanel(self.root)
-        self._apply_popup_style(popup, "Workers", "980x560")
+        self._apply_popup_style(popup, "Workers", "1320x620")
         self._jobs_popup = popup
         self._register_popup("workers", popup)
         popup.rowconfigure(0, weight=1)
-        popup.columnconfigure(0, weight=2)
-        popup.columnconfigure(1, weight=1)
+        popup.rowconfigure(1, weight=0)
+        popup.columnconfigure(0, weight=1)
 
-        text = tk.Text(
-            popup,
+        visual = tk.Frame(popup, bg="#111111")
+        visual.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+        # Prioritize queue/finished readability over worker stack columns.
+        for col, wt in enumerate((5, 2, 2, 5)):
+            visual.columnconfigure(col, weight=wt)
+        visual.grid_columnconfigure(0, minsize=300)
+        visual.grid_columnconfigure(3, minsize=300)
+        visual.rowconfigure(1, weight=1)
+
+        def head(col: int, text: str) -> None:
+            tk.Label(
+                visual,
+                text=text,
+                anchor="w",
+                bg="#0d0d0d",
+                fg="#8f8f8f",
+                font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                padx=8,
+                pady=4,
+            ).grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(0, 4))
+
+        head(0, "Queue")
+        head(1, "Downloaders")
+        head(2, "Transcribers")
+        head(3, "Finished")
+
+        queue_list = tk.Listbox(
+            visual,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            exportselection=False,
+        )
+        queue_list.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        self._jobs_queue_list = queue_list
+
+        dl_text = tk.Text(
+            visual,
             bg="#000000",
             fg="#ffffff",
             borderwidth=0,
@@ -3180,9 +3490,39 @@ class TranscriptPlayer:
             padx=8,
             pady=8,
         )
-        text.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=(8, 8))
-        text.configure(state="disabled")
-        self._jobs_text = text
+        dl_text.grid(row=1, column=1, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        dl_text.configure(state="disabled")
+        self._jobs_dl_text = dl_text
+
+        tr_text = tk.Text(
+            visual,
+            bg="#000000",
+            fg="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            wrap="none",
+            padx=8,
+            pady=8,
+        )
+        tr_text.grid(row=1, column=2, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        tr_text.configure(state="disabled")
+        self._jobs_tr_text = tr_text
+
+        done_list = tk.Listbox(
+            visual,
+            bg="#000000",
+            fg="#d2d2d2",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            exportselection=False,
+        )
+        done_list.grid(row=1, column=3, sticky="nsew", pady=(0, 8))
+        self._jobs_done_list = done_list
 
         cmd_list = tk.Listbox(
             popup,
@@ -3195,15 +3535,16 @@ class TranscriptPlayer:
             highlightthickness=0,
             font=(FONT["STYLE"], FONT["SIZE"] - 2),
             exportselection=False,
+            height=6,
         )
-        cmd_list.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=(8, 8))
+        cmd_list.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
         self._workers_cmd_list = cmd_list
-        commands = ["Create", "Retire", "Assign", "Pause", "Resume", "Cancel"]
+        commands = ["Add Downloader", "Remove Downloader", "Add Transcriber", "Remove Transcriber", "Kill Jobs", "Clear Queue", "Poll Subscriptions"]
         for cmd in commands:
             cmd_list.insert(tk.END, cmd)
         cmd_list.selection_set(0)
 
-        status_var = tk.StringVar(value="Enter executes worker command")
+        status_var = tk.StringVar(value="Enter executes command | Up/Down move command cursor")
         status_lbl = tk.Label(
             popup,
             textvariable=status_var,
@@ -3214,7 +3555,7 @@ class TranscriptPlayer:
             padx=8,
             pady=6,
         )
-        status_lbl.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        status_lbl.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         def run_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
             sel = cmd_list.curselection()
@@ -3255,43 +3596,107 @@ class TranscriptPlayer:
         self._jobs_popup = None
         self._jobs_text = None
         self._workers_cmd_list = None
+        self._jobs_queue_list = None
+        self._jobs_done_list = None
+        self._jobs_dl_text = None
+        self._jobs_tr_text = None
         self.filter_entry.focus_set()
 
     def _refresh_jobs_popup(self) -> None:
-        if not self._jobs_popup \
-            or not self._jobs_popup.winfo_exists() \
-            or not self._jobs_text:
+        if not self._jobs_popup or not self._jobs_popup.winfo_exists():
             return
         try:
             snapshot = self.ingester.jobs_summary(limit=30)
+            dash = self.ingester.dashboard_snapshot()
             counts = snapshot.get("counts", {})
-            jobs = snapshot.get("jobs", [])
-            lines = [
-                f"workers_target={self._worker_target_count} paused={self._workers_paused}",
-                self._workers_eta_line(),
-                f"queued={counts.get('queued', 0)}  "
-                f"downloading={counts.get('downloading', 0)}  "
-                f"transcribing={counts.get('transcribing', 0)}  "
-                f"done={counts.get('done', 0)}  "
-                f"failed={counts.get('failed', 0)}",
-                "",
-                "id    status        video_id       created_at",
-            ]
-            for row in jobs:
-                lines.append(
-                    f"{str(row.get('id', '')):<5} "
-                    f"{str(row.get('status', '')):<12} "
-                    f"{str(row.get('video_id') or '-'):<13} "
-                    f"{str(row.get('created_at') or '-')}"
-                )
-            payload = "\n".join(lines)
-        except Exception as exc:
-            payload = f"Failed to load ingest jobs: {exc}"
+            jobs = [dict(r) for r in (snapshot.get("jobs", []) or [])]
+            active_jobs = [dict(r) for r in (dash.get("active_jobs", []) or [])]
+            self._worker_anim_tick = (self._worker_anim_tick + 1) % 1000
 
-        self._jobs_text.configure(state="normal")
-        self._jobs_text.delete("1.0", tk.END)
-        self._jobs_text.insert("1.0", payload)
-        self._jobs_text.configure(state="disabled")
+            queued_jobs = [r for r in jobs if str(r.get("status")) in {"queued", "downloading", "transcribing"}]
+            finished_jobs = [r for r in jobs if str(r.get("status")) in {"done", "failed"}]
+            if self._jobs_queue_list and self._jobs_queue_list.winfo_exists():
+                self._jobs_queue_list.delete(0, tk.END)
+                for row in queued_jobs:
+                    self._jobs_queue_list.insert(
+                        tk.END,
+                        f"{row.get('id')} {str(row.get('status')):<11} {str(row.get('video_id') or '-')}",
+                    )
+            if self._jobs_done_list and self._jobs_done_list.winfo_exists():
+                self._jobs_done_list.delete(0, tk.END)
+                for row in finished_jobs:
+                    self._jobs_done_list.insert(
+                        tk.END,
+                        f"{row.get('id')} {str(row.get('status')):<6} {str(row.get('video_id') or '-')}",
+                    )
+
+            downloading_active = [r for r in active_jobs if str(r.get("status")) == "downloading"]
+            transcribing_active = [r for r in active_jobs if str(r.get("status")) == "transcribing"]
+
+            def _worker_lines(kind: str, count: int, active: list[dict[str, Any]]) -> list[str]:
+                lines: list[str] = []
+                blink = "█" if (self._worker_anim_tick % 2 == 0) else "."
+                z_phase = (self._worker_anim_tick % 3) + 1
+                for i in range(max(0, count)):
+                    if i < len(active):
+                        job = active[i]
+                        elapsed = float(job.get("elapsed_sec") or 0.0)
+                        target = 120.0 if kind == "downloading" else 300.0
+                        fill = max(0, min(10, int((elapsed / max(1.0, target)) * 10.0)))
+                        bar = "[" + ("█" * max(0, fill - 1)) + (blink if fill > 0 else ".") + ("." * max(0, 10 - fill)) + "]"
+                        lines.append(f"⛑{i+1:02d} ({kind})")
+                        lines.append(f"{bar} job={job.get('id')}")
+                    else:
+                        z = "z" * z_phase
+                        lines.append(f"⛑{i+1:02d} (idle)")
+                        lines.append(f"[{z:<10}]")
+                    lines.append("")
+                return lines or ["(none)"]
+
+            dl_lines = [
+                f"downloaders={self._downloader_target_count}",
+                f"transcribers={self._transcriber_target_count}",
+                self._workers_eta_line(),
+                "",
+                *_worker_lines("downloading", self._downloader_target_count, downloading_active),
+            ]
+            tr_lines = [
+                f"queued={counts.get('queued', 0)} done={counts.get('done', 0)} failed={counts.get('failed', 0)}",
+                "",
+                *_worker_lines("transcribing", self._transcriber_target_count, transcribing_active),
+            ]
+            if self._jobs_dl_text and self._jobs_dl_text.winfo_exists():
+                self._jobs_dl_text.configure(state="normal")
+                self._jobs_dl_text.delete("1.0", tk.END)
+                self._jobs_dl_text.tag_configure("idle", foreground="#39d5ff")
+                self._jobs_dl_text.tag_configure("hat", foreground="#f7d154")
+                for line in dl_lines:
+                    tag = None
+                    if line.startswith("[") and "z" in line:
+                        tag = "idle"
+                    elif line.startswith("⛑"):
+                        tag = "hat"
+                    self._jobs_dl_text.insert(tk.END, line + "\n", (() if tag is None else (tag,)))
+                self._jobs_dl_text.configure(state="disabled")
+            if self._jobs_tr_text and self._jobs_tr_text.winfo_exists():
+                self._jobs_tr_text.configure(state="normal")
+                self._jobs_tr_text.delete("1.0", tk.END)
+                self._jobs_tr_text.tag_configure("idle", foreground="#39d5ff")
+                self._jobs_tr_text.tag_configure("hat", foreground="#f7d154")
+                for line in tr_lines:
+                    tag = None
+                    if line.startswith("[") and "z" in line:
+                        tag = "idle"
+                    elif line.startswith("⛑"):
+                        tag = "hat"
+                    self._jobs_tr_text.insert(tk.END, line + "\n", (() if tag is None else (tag,)))
+                self._jobs_tr_text.configure(state="disabled")
+        except Exception as exc:
+            if self._jobs_dl_text and self._jobs_dl_text.winfo_exists():
+                self._jobs_dl_text.configure(state="normal")
+                self._jobs_dl_text.delete("1.0", tk.END)
+                self._jobs_dl_text.insert("1.0", f"Failed to load ingest jobs: {exc}")
+                self._jobs_dl_text.configure(state="disabled")
         self._jobs_after_id = self.root.after(1000, self._refresh_jobs_popup)
 
     def _find_audio_sidecar(self, video_id: str, video_path: Path) -> Path | None:

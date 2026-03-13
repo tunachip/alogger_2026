@@ -30,6 +30,10 @@ class IngesterService:
         self.db = DB(config.db_path)
         self.auto_transcribe_default = True
         self.subscription_db_max_videos = 0
+        self.downloader_worker_count = max(1, int(config.worker_count))
+        self.transcriber_worker_count = max(1, int(config.worker_count))
+        self._download_sem = threading.Semaphore(self.downloader_worker_count)
+        self._transcribe_sem = threading.Semaphore(self.transcriber_worker_count)
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
         self._subscription_thread: threading.Thread | None = None
@@ -150,16 +154,31 @@ class IngesterService:
         self._stop_event.set()
         self.stop_background_workers()
 
-    def start_background_workers(self, worker_count: int) -> None:
+    def start_background_workers(
+        self,
+        worker_count: int,
+        *,
+        downloader_count: int | None = None,
+        transcriber_count: int | None = None,
+    ) -> None:
         self.init()
-        if worker_count <= 0:
+        if worker_count <= 0 and (downloader_count or 0) <= 0 and (transcriber_count or 0) <= 0:
             return
         if self._worker_threads:
             return
+        d_count = max(0, int(self.downloader_worker_count if downloader_count is None else downloader_count))
+        t_count = max(0, int(self.transcriber_worker_count if transcriber_count is None else transcriber_count))
+        if d_count <= 0 and t_count <= 0:
+            return
+        self.downloader_worker_count = max(1, d_count or 1)
+        self.transcriber_worker_count = max(1, t_count or 1)
+        self._download_sem = threading.Semaphore(self.downloader_worker_count)
+        self._transcribe_sem = threading.Semaphore(self.transcriber_worker_count)
+        total_threads = max(int(worker_count), self.downloader_worker_count + self.transcriber_worker_count)
         self._stop_event.clear()
         self._worker_threads = [
             threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
-            for i in range(worker_count)
+            for i in range(total_threads)
         ]
         for t in self._worker_threads:
             t.start()
@@ -228,14 +247,15 @@ class IngesterService:
 
         self.db.upsert_video(video_id=video_id, source_url=job.url, metadata=metadata)
 
-        if progress_cb:
-            progress_cb("download_start", {"job_id": job.id, "video_id": str(video_id)})
-        local_video_path = download_video(self.config, job.url, video_id)
-        if progress_cb:
-            progress_cb(
-                "download_done",
-                {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
-            )
+        with self._download_sem:
+            if progress_cb:
+                progress_cb("download_start", {"job_id": job.id, "video_id": str(video_id)})
+            local_video_path = download_video(self.config, job.url, video_id)
+            if progress_cb:
+                progress_cb(
+                    "download_done",
+                    {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
+                )
         self.db.update_job_status(
             job.id,
             "transcribing",
@@ -249,30 +269,31 @@ class IngesterService:
         )
         transcript_json_path: Path | None = None
         if should_transcribe:
-            if progress_cb:
-                progress_cb(
-                    "transcribe_start",
-                    {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
-                )
-            transcript_json_path = transcribe_video(self.config, local_video_path, video_id)
-            if progress_cb:
-                progress_cb(
-                    "transcribe_done",
-                    {
-                        "job_id": job.id,
-                        "video_id": str(video_id),
-                        "transcript_json_path": str(transcript_json_path),
-                    },
-                )
-                progress_cb("index_start", {"job_id": job.id, "video_id": str(video_id)})
-            segments = load_whisper_segments(transcript_json_path)
-            self.db.replace_transcript_segments(video_id=video_id, segments=segments)
-            if progress_cb:
-                progress_cb(
-                    "index_done",
-                    {"job_id": job.id, "video_id": str(video_id), "segment_count": len(segments)},
-                )
-                progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
+            with self._transcribe_sem:
+                if progress_cb:
+                    progress_cb(
+                        "transcribe_start",
+                        {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
+                    )
+                transcript_json_path = transcribe_video(self.config, local_video_path, video_id)
+                if progress_cb:
+                    progress_cb(
+                        "transcribe_done",
+                        {
+                            "job_id": job.id,
+                            "video_id": str(video_id),
+                            "transcript_json_path": str(transcript_json_path),
+                        },
+                    )
+                    progress_cb("index_start", {"job_id": job.id, "video_id": str(video_id)})
+                segments = load_whisper_segments(transcript_json_path)
+                self.db.replace_transcript_segments(video_id=video_id, segments=segments)
+                if progress_cb:
+                    progress_cb(
+                        "index_done",
+                        {"job_id": job.id, "video_id": str(video_id), "segment_count": len(segments)},
+                    )
+                    progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
         elif progress_cb:
             progress_cb("transcribe_skipped", {"job_id": job.id, "video_id": str(video_id)})
             progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
@@ -351,6 +372,17 @@ class IngesterService:
 
     def jobs_summary(self, limit: int = 25) -> dict[str, object]:
         return self.db.list_jobs_summary(limit=limit)
+
+    def clear_queue(self) -> int:
+        self.init()
+        return self.db.delete_jobs_by_status(["queued"])
+
+    def kill_active_jobs(self) -> int:
+        self.init()
+        return self.db.fail_jobs_by_status(
+            ["downloading", "transcribing"],
+            error_text="killed from worker popup",
+        )
 
     def list_channel_videos(self, channel_ref: str, *, limit: int = 30) -> dict[str, object]:
         return list_channel_videos(self.config, channel_ref, limit=limit)
