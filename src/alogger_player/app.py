@@ -234,6 +234,8 @@ class TranscriptPlayer:
         self._timestamp_prefix = "[00:00:00] "
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
         self._progress_bar_width = 28
+        self._clock_prefix_len = len("[00:00:00] ")
+        self._clock_last_length_sec = 0.0
         self._font_size_delta = 0
 
         self._setup_styles()
@@ -290,7 +292,7 @@ class TranscriptPlayer:
         self.left_panel.configure(bg=panel_bg)
         self.right_panel.configure(bg=bg)
         self.video_panel.configure(bg=panel_bg)
-        self.clock_box.configure(bg="#0d0d0d", fg=fg, font=(family, size - 2, "bold"))
+        self.clock_view.configure(bg="#0d0d0d", fg=fg, insertbackground=fg, font=(family, max(8, size - 2), "bold"))
         self.caption_now_box.configure(bg="#0d0d0d", fg=fg, font=(family, size - 2))
         self.root_status_box.configure(bg="#0d0d0d", fg=fg, font=(family, size))
         self.caption_view.configure(bg=panel_bg, fg=fg, insertbackground=fg, font=self._text_font)
@@ -308,6 +310,7 @@ class TranscriptPlayer:
             font=(family, max(8, size - 1)),
         )
         style.configure("Terminal.TNotebook.Tab", font=(family, max(8, size - 3)))
+        self._refresh_clock_now()
 
     def _apply_font_scale_tree(self, root_widget: tk.Misc | None = None, *, reset_base: bool = False) -> None:
         root = root_widget or self.root
@@ -655,20 +658,24 @@ class TranscriptPlayer:
         )
         self.video_panel.grid(row=0, column=0, sticky="nsew")
 
-        self.clock_var = tk.StringVar(value="00:00:00")
-        clock_box = tk.Label(
+        clock_view = tk.Text(
             left,
-            textvariable=self.clock_var,
-            anchor="w",
-            justify="left",
-            bg="#000000",
+            bg="#0d0d0d",
             fg="#f7d154",
+            borderwidth=0,
+            highlightthickness=0,
             font=(FONT['STYLE'], FONT['SIZE']-2, "bold"),
+            wrap="none",
+            height=1,
             padx=10,
             pady=6,
+            cursor="hand2",
+            insertbackground="#f7d154",
         )
-        clock_box.grid(row=2, column=0, sticky="ew")
-        self.clock_box = clock_box
+        clock_view.grid(row=2, column=0, sticky="ew")
+        clock_view.configure(state="disabled")
+        clock_view.bind("<Button-1>", self._on_click_clock_progress)
+        self.clock_view = clock_view
 
         self.caption_now_var = tk.StringVar(value="")
         self.caption_now_box = tk.Label(
@@ -1365,7 +1372,7 @@ class TranscriptPlayer:
         self._tick_skim(state, pos_sec)
         length_ms = self.player.get_length()
         length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
-        self.clock_var.set(self._render_time_progress(pos_sec, length_sec))
+        self._update_clock_view(pos_sec, length_sec)
         self.caption_now_var.set(self._caption_text_at(pos_sec))
         if state == vlc.State.Playing:
             next_status = f"Playing @ {_fmt_hms(pos_sec)}"
@@ -1476,13 +1483,53 @@ class TranscriptPlayer:
         return ""
 
     def _render_time_progress(self, pos_sec: float, length_sec: float) -> str:
+        prefix, bar = self._render_time_progress_parts(pos_sec, length_sec)
+        return prefix + bar
+
+    def _render_time_progress_parts(self, pos_sec: float, length_sec: float) -> tuple[str, str]:
         bar_width = self._progress_bar_width
+        prefix = f"[{_fmt_hms(pos_sec)}] "
         if length_sec <= 0:
-            return f"[{_fmt_hms(pos_sec)}] {'░' * bar_width}"
+            return prefix, ("░" * bar_width)
         ratio = max(0.0, min(1.0, pos_sec / length_sec))
         filled = int(round(ratio * bar_width))
         bar = ("█" * filled) + ("░" * (bar_width - filled))
-        return f"[{_fmt_hms(pos_sec)}] {bar}"
+        return prefix, bar
+
+    def _update_clock_view(self, pos_sec: float, length_sec: float) -> None:
+        self._clock_last_length_sec = max(0.0, float(length_sec))
+        prefix, bar = self._render_time_progress_parts(pos_sec, length_sec)
+        self._clock_prefix_len = len(prefix)
+        payload = prefix + bar
+        self.clock_view.configure(state="normal")
+        self.clock_view.delete("1.0", tk.END)
+        self.clock_view.insert("1.0", payload)
+        self.clock_view.tag_remove("bar", "1.0", tk.END)
+        self.clock_view.tag_add("bar", f"1.{self._clock_prefix_len}", f"1.{self._clock_prefix_len + len(bar)}")
+        self.clock_view.tag_configure("bar", foreground="#f7d154")
+        self.clock_view.configure(state="disabled")
+
+    def _on_click_clock_progress(self, event: tk.Event[tk.Misc]) -> str:
+        if self._clock_last_length_sec <= 0:
+            return "break"
+        index = self.clock_view.index(f"@{event.x},{event.y}")
+        try:
+            col = int(index.split(".", 1)[1])
+        except Exception:
+            return "break"
+        start = int(self._clock_prefix_len)
+        end = start + int(self._progress_bar_width)
+        if col < start:
+            target = 0.0
+        elif col >= end:
+            target = self._clock_last_length_sec
+        else:
+            cell = max(0, min(self._progress_bar_width - 1, col - start))
+            ratio = (cell + 0.5) / float(max(1, self._progress_bar_width))
+            target = ratio * self._clock_last_length_sec
+        self._seek_to_absolute(target)
+        self.status_var.set(f"Jumped to {_fmt_hms(target)}")
+        return "break"
 
     def _on_left_resize(self, event: tk.Event[tk.Misc]) -> None:
         width = int(getattr(event, "width", 0))
@@ -1491,6 +1538,7 @@ class TranscriptPlayer:
         # Keep caption wrapping inside the left panel with padding.
         self.caption_now_box.configure(wraplength=max(120, width - 24))
         self._update_progress_bar_width(width)
+        self._refresh_clock_now()
 
     def _update_progress_bar_width(self, panel_width: int | None = None) -> None:
         width = panel_width if panel_width is not None else int(self.left_panel.winfo_width())
@@ -1504,11 +1552,14 @@ class TranscriptPlayer:
         self._progress_bar_width = bar_chars + 24
 
     def _refresh_clock_now(self) -> None:
+        if not hasattr(self, "player"):
+            self._update_clock_view(0.0, 0.0)
+            return
         pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
         length_ms = self.player.get_length()
         length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
-        self.clock_var.set(self._render_time_progress(pos_sec, length_sec))
+        self._update_clock_view(pos_sec, length_sec)
 
     def _set_initial_split_ratio(self) -> None:
         if self._split_initialized:
@@ -1581,13 +1632,13 @@ class TranscriptPlayer:
     def _on_toggle_details(self, _event: tk.Event[tk.Misc]) -> str:
         if self._details_hidden:
             self.caption_now_box.grid(row=1, column=0, sticky="ew")
-            self.clock_box.grid(row=2, column=0, sticky="ew")
+            self.clock_view.grid(row=2, column=0, sticky="ew")
             self._details_hidden = False
             self._refresh_clock_now()
             self.status_var.set("Details shown")
             return "break"
         self.caption_now_box.grid_remove()
-        self.clock_box.grid_remove()
+        self.clock_view.grid_remove()
         self._details_hidden = True
         return "break"
 
