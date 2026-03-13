@@ -28,6 +28,7 @@ class Job:
     url: str
     status: str
     priority: int
+    auto_transcribe: int | None = None
 
 
 class DB:
@@ -57,6 +58,7 @@ class DB:
                     status TEXT NOT NULL CHECK(status IN (
                         'queued','downloading','transcribing','done','failed'
                     )),
+                    auto_transcribe INTEGER,
                     priority INTEGER NOT NULL DEFAULT 0,
                     retries INTEGER NOT NULL DEFAULT 0,
                     error_text TEXT,
@@ -135,6 +137,7 @@ class DB:
                     channel_title TEXT,
                     feed_url TEXT NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1,
+                    auto_transcribe INTEGER,
                     last_seen_video_id TEXT,
                     last_checked_at TEXT,
                     created_at TEXT NOT NULL,
@@ -145,18 +148,39 @@ class DB:
                 ON channel_subscriptions(active, updated_at);
                 """
             )
+            self._ensure_column(conn, "ingest_jobs", "auto_transcribe", "INTEGER")
+            self._ensure_column(conn, "channel_subscriptions", "auto_transcribe", "INTEGER")
 
-    def enqueue(self, urls: list[str], priority: int = 0) -> list[int]:
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        column_type_sql: str,
+    ) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        if column in existing:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type_sql}")
+
+    def enqueue(
+        self,
+        urls: list[str],
+        priority: int = 0,
+        *,
+        auto_transcribe: bool | None = None,
+    ) -> list[int]:
         now = utc_now_iso()
         ids: list[int] = []
         with self.connect() as conn:
             for url in urls:
                 cur = conn.execute(
                     """
-                    INSERT INTO ingest_jobs(source_url, status, priority, created_at)
-                    VALUES (?, 'queued', ?, ?)
+                    INSERT INTO ingest_jobs(source_url, status, auto_transcribe, priority, created_at)
+                    VALUES (?, 'queued', ?, ?, ?)
                     """,
-                    (url, priority, now),
+                    (url, None if auto_transcribe is None else (1 if auto_transcribe else 0), priority, now),
                 )
                 ids.append(int(cur.lastrowid))
         return ids
@@ -166,7 +190,7 @@ class DB:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT id, source_url, status, priority
+                SELECT id, source_url, status, priority, auto_transcribe
                 FROM ingest_jobs
                 WHERE status = 'queued'
                 ORDER BY priority DESC, created_at ASC
@@ -190,6 +214,7 @@ class DB:
                 url=str(row["source_url"]),
                 status="downloading",
                 priority=int(row["priority"]),
+                auto_transcribe=(None if row["auto_transcribe"] is None else int(row["auto_transcribe"])),
             )
 
     def reserve_job_by_id(self, job_id: int) -> Job | None:
@@ -197,7 +222,7 @@ class DB:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT id, source_url, status, priority
+                SELECT id, source_url, status, priority, auto_transcribe
                 FROM ingest_jobs
                 WHERE id=?
                 LIMIT 1
@@ -224,6 +249,7 @@ class DB:
                 url=str(row["source_url"]),
                 status="downloading",
                 priority=int(row["priority"]),
+                auto_transcribe=(None if row["auto_transcribe"] is None else int(row["auto_transcribe"])),
             )
 
     def update_job_status(
@@ -338,7 +364,7 @@ class DB:
             rows = conn.execute(
                 """
                 SELECT id, source_url, status, priority, error_text,
-                       video_id, created_at, started_at, finished_at
+                       auto_transcribe, video_id, created_at, started_at, finished_at
                 FROM ingest_jobs
                 ORDER BY id DESC
                 LIMIT ?
@@ -352,7 +378,7 @@ class DB:
             row = conn.execute(
                 """
                 SELECT id, source_url, status, priority, error_text,
-                       video_id, local_video_path, transcript_json_path,
+                       auto_transcribe, video_id, local_video_path, transcript_json_path,
                        created_at, started_at, finished_at
                 FROM ingest_jobs
                 WHERE id=?
@@ -678,6 +704,7 @@ class DB:
         feed_url: str,
         channel_title: str | None = None,
         active: bool = True,
+        auto_transcribe: bool | None = None,
         last_seen_video_id: str | None = None,
     ) -> int:
         now = utc_now_iso()
@@ -686,13 +713,14 @@ class DB:
                 """
                 INSERT INTO channel_subscriptions(
                     channel_key, source_ref, channel_title, feed_url,
-                    active, last_seen_video_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    active, auto_transcribe, last_seen_video_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel_key) DO UPDATE SET
                     source_ref=excluded.source_ref,
                     channel_title=excluded.channel_title,
                     feed_url=excluded.feed_url,
                     active=excluded.active,
+                    auto_transcribe=COALESCE(excluded.auto_transcribe, channel_subscriptions.auto_transcribe),
                     last_seen_video_id=COALESCE(excluded.last_seen_video_id, channel_subscriptions.last_seen_video_id),
                     updated_at=excluded.updated_at
                 """,
@@ -702,6 +730,7 @@ class DB:
                     channel_title,
                     feed_url,
                     1 if active else 0,
+                    None if auto_transcribe is None else (1 if auto_transcribe else 0),
                     last_seen_video_id,
                     now,
                     now,
@@ -727,6 +756,7 @@ class DB:
                     channel_title,
                     feed_url,
                     active,
+                    auto_transcribe,
                     last_seen_video_id,
                     last_checked_at,
                     created_at,
@@ -745,6 +775,50 @@ class DB:
                 (channel_key,),
             ).rowcount
             return int(n or 0)
+
+    def update_channel_subscription(
+        self,
+        *,
+        channel_key: str,
+        active: bool | None = None,
+        auto_transcribe: bool | None = None,
+    ) -> int:
+        sets: list[str] = []
+        params: list[Any] = []
+        if active is not None:
+            sets.append("active=?")
+            params.append(1 if active else 0)
+        if auto_transcribe is not None:
+            sets.append("auto_transcribe=?")
+            params.append(1 if auto_transcribe else 0)
+        if not sets:
+            return 0
+        sets.append("updated_at=?")
+        params.append(utc_now_iso())
+        params.append(channel_key)
+        with self.connect() as conn:
+            n = conn.execute(
+                f"UPDATE channel_subscriptions SET {', '.join(sets)} WHERE channel_key=?",
+                tuple(params),
+            ).rowcount
+            return int(n or 0)
+
+    def clear_channel_subscription_auto_transcribe(self, *, channel_key: str) -> int:
+        with self.connect() as conn:
+            n = conn.execute(
+                """
+                UPDATE channel_subscriptions
+                SET auto_transcribe=NULL, updated_at=?
+                WHERE channel_key=?
+                """,
+                (utc_now_iso(), channel_key),
+            ).rowcount
+            return int(n or 0)
+
+    def count_videos(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM videos").fetchone()
+            return int(row["n"]) if row else 0
 
     def update_subscription_poll_state(
         self,

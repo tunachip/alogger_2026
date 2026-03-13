@@ -28,6 +28,8 @@ class IngesterService:
     def __init__(self, config: IngesterConfig) -> None:
         self.config = config
         self.db = DB(config.db_path)
+        self.auto_transcribe_default = True
+        self.subscription_db_max_videos = 0
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
         self._subscription_thread: threading.Thread | None = None
@@ -36,8 +38,14 @@ class IngesterService:
         self.config.ensure_dirs()
         self.db.init_schema()
 
-    def enqueue(self, urls: list[str], priority: int = 0) -> list[int]:
-        return self.db.enqueue(urls, priority=priority)
+    def enqueue(
+        self,
+        urls: list[str],
+        priority: int = 0,
+        *,
+        auto_transcribe: bool | None = None,
+    ) -> list[int]:
+        return self.db.enqueue(urls, priority=priority, auto_transcribe=auto_transcribe)
 
     def inspect_url(self, url: str) -> dict[str, object]:
         self.init()
@@ -62,6 +70,7 @@ class IngesterService:
         *,
         priority: int = 0,
         allow_overwrite: bool = False,
+        auto_transcribe: bool | None = None,
     ) -> dict[str, object]:
         self.init()
         queued_ids: list[int] = []
@@ -71,9 +80,20 @@ class IngesterService:
             if bool(info.get("exists")) and not allow_overwrite:
                 conflicts.append(info)
                 continue
-            ids = self.db.enqueue([url], priority=priority)
+            ids = self.db.enqueue([url], priority=priority, auto_transcribe=auto_transcribe)
             queued_ids.extend(ids)
         return {"queued_ids": queued_ids, "conflicts": conflicts}
+
+    def set_runtime_options(
+        self,
+        *,
+        auto_transcribe_default: bool | None = None,
+        subscription_db_max_videos: int | None = None,
+    ) -> None:
+        if auto_transcribe_default is not None:
+            self.auto_transcribe_default = bool(auto_transcribe_default)
+        if subscription_db_max_videos is not None:
+            self.subscription_db_max_videos = max(0, int(subscription_db_max_videos))
 
     def run_forever(self) -> None:
         self.init()
@@ -222,30 +242,39 @@ class IngesterService:
             video_id=video_id,
             local_video_path=str(local_video_path),
         )
-
-        if progress_cb:
-            progress_cb(
-                "transcribe_start",
-                {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
-            )
-        transcript_json_path = transcribe_video(self.config, local_video_path, video_id)
-        if progress_cb:
-            progress_cb(
-                "transcribe_done",
-                {
-                    "job_id": job.id,
-                    "video_id": str(video_id),
-                    "transcript_json_path": str(transcript_json_path),
-                },
-            )
-            progress_cb("index_start", {"job_id": job.id, "video_id": str(video_id)})
-        segments = load_whisper_segments(transcript_json_path)
-        self.db.replace_transcript_segments(video_id=video_id, segments=segments)
-        if progress_cb:
-            progress_cb(
-                "index_done",
-                {"job_id": job.id, "video_id": str(video_id), "segment_count": len(segments)},
-            )
+        should_transcribe = (
+            self.auto_transcribe_default
+            if job.auto_transcribe is None
+            else bool(int(job.auto_transcribe))
+        )
+        transcript_json_path: Path | None = None
+        if should_transcribe:
+            if progress_cb:
+                progress_cb(
+                    "transcribe_start",
+                    {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
+                )
+            transcript_json_path = transcribe_video(self.config, local_video_path, video_id)
+            if progress_cb:
+                progress_cb(
+                    "transcribe_done",
+                    {
+                        "job_id": job.id,
+                        "video_id": str(video_id),
+                        "transcript_json_path": str(transcript_json_path),
+                    },
+                )
+                progress_cb("index_start", {"job_id": job.id, "video_id": str(video_id)})
+            segments = load_whisper_segments(transcript_json_path)
+            self.db.replace_transcript_segments(video_id=video_id, segments=segments)
+            if progress_cb:
+                progress_cb(
+                    "index_done",
+                    {"job_id": job.id, "video_id": str(video_id), "segment_count": len(segments)},
+                )
+                progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
+        elif progress_cb:
+            progress_cb("transcribe_skipped", {"job_id": job.id, "video_id": str(video_id)})
             progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
 
         playback_path = merge_streams_for_playback(self.config, video_id=video_id)
@@ -265,7 +294,7 @@ class IngesterService:
             "done",
             video_id=video_id,
             local_video_path=str(final_media_path),
-            transcript_json_path=str(transcript_json_path),
+            transcript_json_path=(str(transcript_json_path) if transcript_json_path else None),
         )
         if progress_cb:
             progress_cb(
@@ -274,7 +303,7 @@ class IngesterService:
                     "job_id": job.id,
                     "video_id": str(video_id),
                     "local_video_path": str(final_media_path),
-                    "transcript_json_path": str(transcript_json_path),
+                    "transcript_json_path": (str(transcript_json_path) if transcript_json_path else None),
                 },
             )
         self._notify(
@@ -282,8 +311,9 @@ class IngesterService:
             job_id=job.id,
             url=job.url,
             video_id=video_id,
-            transcript_json_path=str(transcript_json_path),
+            transcript_json_path=(str(transcript_json_path) if transcript_json_path else None),
             worker_id=worker_id,
+            transcribed=should_transcribe,
         )
 
     def _notify(self, event: str, **payload: object) -> None:
@@ -330,6 +360,7 @@ class IngesterService:
         channel_ref: str,
         *,
         seed_with_latest: bool = True,
+        auto_transcribe: bool | None = None,
     ) -> dict[str, object]:
         self.init()
         listing = self.list_channel_videos(channel_ref, limit=1)
@@ -346,6 +377,7 @@ class IngesterService:
             feed_url=feed_url,
             channel_title=channel_title,
             active=True,
+            auto_transcribe=auto_transcribe,
             last_seen_video_id=last_seen,
         )
         return {
@@ -364,6 +396,23 @@ class IngesterService:
         self.init()
         return self.db.remove_channel_subscription(channel_key=channel_key)
 
+    def update_channel_subscription(
+        self,
+        channel_key: str,
+        *,
+        active: bool | None = None,
+        auto_transcribe: bool | None = None,
+        clear_auto_transcribe: bool = False,
+    ) -> int:
+        self.init()
+        if clear_auto_transcribe:
+            return self.db.clear_channel_subscription_auto_transcribe(channel_key=channel_key)
+        return self.db.update_channel_subscription(
+            channel_key=channel_key,
+            active=active,
+            auto_transcribe=auto_transcribe,
+        )
+
     def poll_subscriptions_once(self) -> dict[str, object]:
         self.init()
         subs = self.db.list_channel_subscriptions(active_only=True)
@@ -375,6 +424,12 @@ class IngesterService:
             channel_key = str(sub.get("channel_key") or "")
             feed_url = str(sub.get("feed_url") or "")
             last_seen = str(sub.get("last_seen_video_id") or "").strip()
+            sub_auto_raw = sub.get("auto_transcribe")
+            sub_auto = (
+                self.auto_transcribe_default
+                if sub_auto_raw is None
+                else bool(int(sub_auto_raw))
+            )
             try:
                 entries = fetch_youtube_rss_feed(feed_url)
             except Exception as exc:
@@ -394,8 +449,23 @@ class IngesterService:
                     continue
                 new_urls.append(str(row.get("url") or f"https://www.youtube.com/watch?v={video_id}"))
             if new_urls:
-                result = self.enqueue_with_dedupe(new_urls, allow_overwrite=False)
-                queued += len(list(result.get("queued_ids") or []))
+                if self.subscription_db_max_videos > 0 and self.db.count_videos() >= self.subscription_db_max_videos:
+                    errors.append(
+                        {
+                            "channel_key": channel_key,
+                            "error": (
+                                "subscription capacity reached "
+                                f"({self.db.count_videos()}/{self.subscription_db_max_videos})"
+                            ),
+                        }
+                    )
+                else:
+                    result = self.enqueue_with_dedupe(
+                        new_urls,
+                        allow_overwrite=False,
+                        auto_transcribe=sub_auto,
+                    )
+                    queued += len(list(result.get("queued_ids") or []))
             self.db.update_subscription_poll_state(
                 channel_key=channel_key,
                 last_seen_video_id=newest_seen,

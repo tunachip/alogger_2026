@@ -33,6 +33,30 @@ FONT = {
 THEME = {
 }
 
+DEFAULT_KEYBINDS: dict[str, str] = {
+    "open_command": "Ctrl+P",
+    "open_ingest": "Ctrl+N",
+    "open_workers": "Ctrl+I",
+    "open_video": "Ctrl+O",
+    "open_finder": "Ctrl+F",
+    "open_ai": "Ctrl+A",
+    "toggle_skim": "Ctrl+S",
+    "open_settings": "Ctrl+M",
+    "quit": "Ctrl+Q",
+    "play_pause": "Ctrl+Space",
+    "seek_back": "Ctrl+Left",
+    "seek_forward": "Ctrl+Right",
+    "prev_match": "Ctrl+Up",
+    "next_match": "Ctrl+Down",
+    "vim_left": "Ctrl+H",
+    "vim_down": "Ctrl+J",
+    "vim_up": "Ctrl+K",
+    "vim_right": "Ctrl+L",
+    "clear_input": "Ctrl+C",
+    "toggle_transcript": "Ctrl+T",
+    "toggle_details": "Ctrl+D",
+}
+
 def _fmt_hms(seconds: float) -> str:
     total = max(0, int(seconds))
     h = total // 3600
@@ -151,6 +175,7 @@ class TranscriptPlayer:
         self._workers_eta_next_recalc_at: float = 0.0
         self._workers_eta_last_tick_at: float = time.monotonic()
         self._workers_eta_recalc_interval_sec: float = 60.0
+        self._bound_shortcut_sequences: list[str] = []
         self._ollama_proc:          subprocess.Popen[str] | None = None
         self._ollama_started_by_app = False
         self._ollama_bootstrap_thread: threading.Thread | None = None
@@ -163,10 +188,17 @@ class TranscriptPlayer:
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
         self.ingester.init()
-        if self.workers > 0:
-            self.ingester.start_background_workers(self.workers)
         self._gui_settings_path = self.ingester_config.db_path.parent / "gui_settings.json"
         self._ai_settings = self._load_gui_settings()
+        if self.workers <= 0:
+            self.workers = max(0, int(self._ai_settings.get("default_worker_count") or 0))
+            self._worker_target_count = self.workers
+        self.ingester.set_runtime_options(
+            auto_transcribe_default=bool(self._ai_settings.get("auto_transcribe_default", True)),
+            subscription_db_max_videos=max(0, int(self._ai_settings.get("subscription_db_max_videos") or 0)),
+        )
+        if self.workers > 0:
+            self.ingester.start_background_workers(self.workers)
         if str(self._ai_settings.get("ai_provider") or "ollama").lower() == "ollama":
             self._start_ollama_bootstrap(background=True)
 
@@ -188,6 +220,7 @@ class TranscriptPlayer:
 
         self._setup_styles()
         self._build_layout()
+        self._apply_theme()
         self._bind_keys()
         self._build_vlc()
 
@@ -205,6 +238,38 @@ class TranscriptPlayer:
             foreground="#f0f0f0"
         )
 
+    def _apply_theme(self) -> None:
+        bg = str(self._ai_settings.get("theme_bg") or "#111111")
+        panel_bg = str(self._ai_settings.get("theme_panel_bg") or "#000000")
+        fg = str(self._ai_settings.get("theme_fg") or "#ffffff")
+        muted = str(self._ai_settings.get("theme_muted_fg") or "#8f8f8f")
+        accent = str(self._ai_settings.get("theme_accent_fg") or "#f7d154")
+        try:
+            family = str(self._ai_settings.get("font_family") or FONT["STYLE"])
+            size = max(8, int(self._ai_settings.get("font_size") or FONT["SIZE"]))
+        except Exception:
+            family = FONT["STYLE"]
+            size = FONT["SIZE"]
+        self._text_font.configure(family=family, size=size)
+        self._text_font_bold.configure(family=family, size=size)
+
+        self.root.configure(bg=bg)
+        self.left_panel.configure(bg=panel_bg)
+        self.right_panel.configure(bg=bg)
+        self.video_panel.configure(bg=panel_bg)
+        self.clock_box.configure(bg="#0d0d0d", fg=fg, font=(family, size - 2, "bold"))
+        self.caption_now_box.configure(bg="#0d0d0d", fg=fg, font=(family, size - 2))
+        self.root_status_box.configure(bg="#0d0d0d", fg=fg, font=(family, size))
+        self.caption_view.configure(bg=panel_bg, fg=fg, insertbackground=fg, font=self._text_font)
+        self.caption_view.tag_configure("ts", foreground=muted)
+        self.caption_view.tag_configure("txt", foreground=fg)
+        self.caption_view.tag_configure("match", foreground=accent)
+        self.caption_view.tag_configure("selected", background="#282828")
+        self.caption_view.tag_configure("selected_txt", font=self._text_font_bold)
+
+        style = ttk.Style(self.root)
+        style.configure("Filter.TEntry", fieldbackground="#151515", foreground=fg)
+
     def _load_gui_settings(self) -> dict[str, Any]:
         defaults: dict[str, Any] = {
             "ai_provider": "ollama",
@@ -213,6 +278,17 @@ class TranscriptPlayer:
             "api_base_url": "https://api.openai.com",
             "api_key_env": "OPENAI_API_KEY",
             "api_model": "gpt-4o-mini",
+            "default_worker_count": 0,
+            "auto_transcribe_default": True,
+            "subscription_db_max_videos": 0,
+            "theme_bg": "#111111",
+            "theme_panel_bg": "#000000",
+            "theme_fg": "#ffffff",
+            "theme_muted_fg": "#8f8f8f",
+            "theme_accent_fg": "#f7d154",
+            "font_family": FONT["STYLE"],
+            "font_size": FONT["SIZE"],
+            "keybinds": dict(DEFAULT_KEYBINDS),
         }
         path = getattr(self, "_gui_settings_path", None)
         if not path:
@@ -222,6 +298,13 @@ class TranscriptPlayer:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(payload, dict):
                     defaults.update(payload)
+                    keybinds = payload.get("keybinds")
+                    if isinstance(keybinds, dict):
+                        merged = dict(DEFAULT_KEYBINDS)
+                        for k, v in keybinds.items():
+                            if isinstance(k, str) and isinstance(v, str):
+                                merged[k] = v
+                        defaults["keybinds"] = merged
         except Exception:
             pass
         return defaults
@@ -241,6 +324,9 @@ class TranscriptPlayer:
 
     def _ollama_model(self) -> str:
         return str(self._ai_settings.get("ollama_model") or "llama3.2:3b").strip() or "llama3.2:3b"
+
+    def _auto_transcribe_default(self) -> bool:
+        return bool(self._ai_settings.get("auto_transcribe_default", True))
 
     def _ollama_server_healthy(self) -> bool:
         try:
@@ -575,24 +661,88 @@ class TranscriptPlayer:
         self._row_ranges: list[tuple[str, str]] = []
         self._row_text_ranges: list[tuple[str, str]] = []
 
-        self.hint_var = tk.StringVar(value=(
-            "Terminal GUI mode | Ctrl-P command menu | Ctrl-N ingest | Ctrl-I workers | "
-            "Ctrl-O open video | Ctrl-F finder | Ctrl-A ai | Ctrl-S skim | Ctrl-M settings | Ctrl-Q quit | "
-            "Ctrl-Space play/pause | Ctrl-Left/Right seek | Ctrl-Up/Down next/prev match | "
-            "Ctrl-T transcript log | Ctrl-D details"
-        ))
-        hint = tk.Label(
-            right,
-            textvariable=self.hint_var,
-            anchor="w",
-            justify="left",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT['STYLE'], FONT['SIZE']-2),
-            padx=8,
-            pady=6,
-        )
-        hint.grid(row=2, column=0, sticky="ew")
+    def _display_to_tk_sequence(self, value: str) -> str | None:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        if token.startswith("<") and token.endswith(">"):
+            return token
+        parts = [p for p in token.replace("+", "-").split("-") if p]
+        if not parts:
+            return None
+        mods: list[str] = []
+        key = parts[-1].lower()
+        for raw in parts[:-1]:
+            piece = raw.strip().lower()
+            if piece in {"ctrl", "control"}:
+                mods.append("Control")
+            elif piece in {"alt", "meta"}:
+                mods.append("Alt")
+            elif piece == "shift":
+                mods.append("Shift")
+        key_map = {
+            "space": "space",
+            "left": "Left",
+            "right": "Right",
+            "up": "Up",
+            "down": "Down",
+            "pgup": "Prior",
+            "pageup": "Prior",
+            "pgdn": "Next",
+            "pagedown": "Next",
+            "enter": "Return",
+            "return": "Return",
+            "esc": "Escape",
+            "escape": "Escape",
+        }
+        tk_key = key_map.get(key, key if len(key) == 1 else key)
+        prefix = "-".join(mods)
+        return f"<{prefix + '-' if prefix else ''}KeyPress-{tk_key}>"
+
+    def _apply_shortcut_bindings(self) -> None:
+        handlers: dict[str, Callable[[tk.Event[tk.Misc]], str]] = {
+            "open_command": self._on_open_command_popup,
+            "open_ingest": self._on_open_ingest_popup,
+            "open_workers": self._on_toggle_jobs_popup,
+            "open_video": self._on_open_video_picker_popup,
+            "open_finder": self._on_open_search_popup,
+            "open_ai": self._on_open_ai_popup,
+            "toggle_skim": self._on_ctrl_s,
+            "open_settings": self._on_open_settings_popup,
+            "quit": self._on_quit,
+            "play_pause": self._on_toggle_play,
+            "seek_back": self._on_ctrl_left,
+            "seek_forward": self._on_ctrl_right,
+            "prev_match": self._on_ctrl_up,
+            "next_match": self._on_ctrl_down,
+            "vim_left": self._on_ctrl_left,
+            "vim_down": self._on_ctrl_down,
+            "vim_up": self._on_ctrl_up,
+            "vim_right": self._on_ctrl_right,
+            "clear_input": self._on_clear_filter,
+            "toggle_transcript": self._on_toggle_transcript_log,
+            "toggle_details": self._on_toggle_details,
+        }
+        for seq in self._bound_shortcut_sequences:
+            try:
+                self.root.unbind(seq)
+            except Exception:
+                pass
+        self._bound_shortcut_sequences = []
+        keybinds = self._ai_settings.get("keybinds")
+        if not isinstance(keybinds, dict):
+            keybinds = dict(DEFAULT_KEYBINDS)
+            self._ai_settings["keybinds"] = keybinds
+        for action, handler in handlers.items():
+            raw = str(keybinds.get(action, DEFAULT_KEYBINDS.get(action, "")))
+            seq = self._display_to_tk_sequence(raw)
+            if not seq:
+                continue
+            try:
+                self.root.bind(seq, handler)
+                self._bound_shortcut_sequences.append(seq)
+            except Exception:
+                continue
 
     def _bind_keys(self) -> None:
         self.filter_var.trace_add("write", self._on_filter_change)
@@ -600,38 +750,18 @@ class TranscriptPlayer:
         self.root.bind("<Up>", self._on_up)
         self.root.bind("<Down>", self._on_down)
         self.root.bind("<Return>", self._on_return)
-        self.root.bind("<Control-space>", self._on_toggle_play)
         self.root.bind("<Left>", self._on_left)
         self.root.bind("<Right>", self._on_right)
-        self.root.bind("<Control-Left>", self._on_ctrl_left)
-        self.root.bind("<Control-Right>", self._on_ctrl_right)
-        self.root.bind("<Control-Up>", self._on_ctrl_up)
-        self.root.bind("<Control-Down>", self._on_ctrl_down)
-        self.root.bind("<Control-KeyPress-h>", self._on_ctrl_left)
-        self.root.bind("<Control-KeyPress-l>", self._on_ctrl_right)
-        self.root.bind("<Control-KeyPress-k>", self._on_ctrl_up)
-        self.root.bind("<Control-KeyPress-j>", self._on_ctrl_down)
         self.root.bind("<Prior>", self._on_page_up)
         self.root.bind("<Next>", self._on_page_down)
         self.root.bind("<Home>", self._on_home)
         self.root.bind("<End>", self._on_end)
-        self.root.bind("<Control-KeyPress-p>", self._on_open_command_popup)
-        self.root.bind("<Control-KeyPress-q>", self._on_quit)
-        self.root.bind("<Control-c>", self._on_clear_filter)
         self.root.bind("<Control-minus>", self._on_font_smaller)
         self.root.bind("<Control-equal>", self._on_font_larger)
         self.root.bind("<Control-plus>", self._on_font_larger)
-        self.root.bind("<Control-KeyPress-t>", self._on_toggle_transcript_log)
-        self.root.bind("<Control-KeyPress-d>", self._on_toggle_details)
-        self.root.bind("<Control-KeyPress-f>", self._on_open_search_popup)
-        self.root.bind("<Control-KeyPress-o>", self._on_open_video_picker_popup)
-        self.root.bind("<Control-KeyPress-n>", self._on_open_ingest_popup)
-        self.root.bind("<Control-KeyPress-a>", self._on_open_ai_popup)
-        self.root.bind("<Control-KeyPress-s>", self._on_ctrl_s)
-        self.root.bind("<Control-KeyPress-m>", self._on_open_settings_popup)
-        self.root.bind("<Control-KeyPress-i>", self._on_toggle_jobs_popup)
         self.root.bind("<Escape>", self._on_escape, add="+")
         self.root.bind("<KeyPress>", self._on_type_to_filter, add="+")
+        self._apply_shortcut_bindings()
 
         self.caption_view.bind("<Double-Button-1>", self._on_double_click)
         self.caption_view.bind("<Button-1>", self._on_click_seek_transcript)
@@ -1744,42 +1874,260 @@ class TranscriptPlayer:
 
     def _open_settings_popup(self) -> None:
         popup = OverlayPanel(self.root)
-        self._apply_popup_style(popup, "Settings", "860x520")
+        self._apply_popup_style(popup, "Settings", "980x700")
         self._settings_popup = popup
         self._register_popup("settings", popup)
-        popup.columnconfigure(1, weight=1)
+        popup.rowconfigure(0, weight=1)
+        popup.columnconfigure(0, weight=1)
 
-        fields = [
-            ("AI Provider (ollama/api)", "ai_provider"),
-            ("Ollama Model", "ollama_model"),
-            ("Ollama Base URL", "ollama_base_url"),
-            ("API Base URL", "api_base_url"),
-            ("API Key Env Var", "api_key_env"),
-            ("API Model", "api_model"),
-            ("Skim Pre Buffer ms", "_skim_pre_ms"),
-            ("Skim Post Buffer ms", "_skim_post_ms"),
+        tabs = ttk.Notebook(popup)
+        tabs.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+
+        ingest_tab = tk.Frame(tabs, bg="#111111")
+        theme_tab = tk.Frame(tabs, bg="#111111")
+        subs_tab = tk.Frame(tabs, bg="#111111")
+        ai_tab = tk.Frame(tabs, bg="#111111")
+        keybind_tab = tk.Frame(tabs, bg="#111111")
+        tabs.add(ingest_tab, text="Ingest")
+        tabs.add(theme_tab, text="Theme")
+        tabs.add(subs_tab, text="Subscription")
+        tabs.add(ai_tab, text="AI")
+        tabs.add(keybind_tab, text="Keybinds")
+
+        # Ingest tab
+        ingest_workers_var = tk.StringVar(value=str(self._ai_settings.get("default_worker_count", self._worker_target_count)))
+        ingest_auto_var = tk.BooleanVar(value=bool(self._ai_settings.get("auto_transcribe_default", True)))
+        skim_pre_var = tk.StringVar(value=str(self._skim_pre_ms))
+        skim_post_var = tk.StringVar(value=str(self._skim_post_ms))
+        for i, (label, var) in enumerate(
+            [
+                ("Default worker count", ingest_workers_var),
+                ("Skim pre-buffer ms", skim_pre_var),
+                ("Skim post-buffer ms", skim_post_var),
+            ]
+        ):
+            tk.Label(ingest_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
+                row=i, column=0, sticky="w", padx=(10, 6), pady=(10 if i == 0 else 6, 0)
+            )
+            ttk.Entry(ingest_tab, textvariable=var, style="Filter.TEntry").grid(
+                row=i, column=1, sticky="ew", padx=(0, 10), pady=(10 if i == 0 else 6, 0)
+            )
+        ttk.Checkbutton(ingest_tab, text="Auto-transcribe downloaded videos", variable=ingest_auto_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 0)
+        )
+        ingest_tab.columnconfigure(1, weight=1)
+
+        # Theme tab
+        theme_vars = {
+            "theme_bg": tk.StringVar(value=str(self._ai_settings.get("theme_bg") or "#111111")),
+            "theme_panel_bg": tk.StringVar(value=str(self._ai_settings.get("theme_panel_bg") or "#000000")),
+            "theme_fg": tk.StringVar(value=str(self._ai_settings.get("theme_fg") or "#ffffff")),
+            "theme_muted_fg": tk.StringVar(value=str(self._ai_settings.get("theme_muted_fg") or "#8f8f8f")),
+            "theme_accent_fg": tk.StringVar(value=str(self._ai_settings.get("theme_accent_fg") or "#f7d154")),
+            "font_family": tk.StringVar(value=str(self._ai_settings.get("font_family") or FONT["STYLE"])),
+            "font_size": tk.StringVar(value=str(self._ai_settings.get("font_size") or FONT["SIZE"])),
+        }
+        theme_labels = [
+            ("App background", "theme_bg"),
+            ("Panel background", "theme_panel_bg"),
+            ("Primary text", "theme_fg"),
+            ("Muted text", "theme_muted_fg"),
+            ("Accent text", "theme_accent_fg"),
+            ("Font family", "font_family"),
+            ("Font size", "font_size"),
         ]
-        vars_map: dict[str, tk.StringVar] = {}
-        for i, (label, key) in enumerate(fields):
-            tk.Label(
-                popup,
-                text=label,
-                anchor="w",
-                bg="#111111",
-                fg="#d2d2d2",
-                font=(FONT["STYLE"], FONT["SIZE"] - 2),
-            ).grid(row=i, column=0, sticky="w", padx=(8, 6), pady=(8 if i == 0 else 4, 0))
-            if key.startswith("_"):
-                val = str(getattr(self, key))
-            else:
-                val = str(self._ai_settings.get(key, ""))
-            var = tk.StringVar(value=val)
-            vars_map[key] = var
-            ttk.Entry(popup, textvariable=var, style="Filter.TEntry").grid(
-                row=i, column=1, sticky="ew", padx=(0, 8), pady=(8 if i == 0 else 4, 0)
+        for i, (label, key) in enumerate(theme_labels):
+            tk.Label(theme_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
+                row=i, column=0, sticky="w", padx=(10, 6), pady=(10 if i == 0 else 6, 0)
+            )
+            ttk.Entry(theme_tab, textvariable=theme_vars[key], style="Filter.TEntry").grid(
+                row=i, column=1, sticky="ew", padx=(0, 10), pady=(10 if i == 0 else 6, 0)
+            )
+        theme_tab.columnconfigure(1, weight=1)
+
+        # Subscription tab
+        sub_cap_var = tk.StringVar(value=str(self._ai_settings.get("subscription_db_max_videos") or 0))
+        tk.Label(
+            subs_tab,
+            text="DB max videos for auto-download (0 = unlimited)",
+            anchor="w",
+            bg="#111111",
+            fg="#d2d2d2",
+        ).grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(10, 0))
+        ttk.Entry(subs_tab, textvariable=sub_cap_var, style="Filter.TEntry").grid(
+            row=0, column=1, sticky="ew", padx=(0, 10), pady=(10, 0)
+        )
+        sub_list = tk.Listbox(
+            subs_tab,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            exportselection=False,
+            font=(FONT["STYLE"], max(8, FONT["SIZE"] - 2)),
+        )
+        sub_list.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(8, 6))
+        subs_tab.rowconfigure(1, weight=1)
+        subs_tab.columnconfigure(1, weight=1)
+        sub_rows: list[dict[str, Any]] = []
+
+        def _sub_mode_text(row: dict[str, Any]) -> str:
+            mode = row.get("auto_transcribe")
+            if mode is None:
+                return "default"
+            return "on" if int(mode) == 1 else "off"
+
+        def refresh_sub_list(_event: tk.Event[tk.Misc] | None = None) -> str:
+            nonlocal sub_rows
+            try:
+                sub_rows = [dict(r) for r in self.ingester.list_channel_subscriptions(active_only=False)]
+                sub_list.delete(0, tk.END)
+                for row in sub_rows:
+                    title = str(row.get("channel_title") or row.get("channel_key") or "")
+                    key = str(row.get("channel_key") or "")
+                    active = "on" if int(row.get("active") or 0) == 1 else "off"
+                    mode = _sub_mode_text(row)
+                    sub_list.insert(tk.END, f"{title} | {key} | active={active} | transcribe={mode}")
+                if sub_rows:
+                    sub_list.selection_set(0)
+                status_var.set(f"Subscriptions: {len(sub_rows)} loaded")
+            except Exception as exc:
+                status_var.set(f"Subscriptions load failed: {exc}")
+            return "break"
+
+        def _selected_sub() -> tuple[int, dict[str, Any]] | tuple[None, None]:
+            sel = sub_list.curselection()
+            if not sel:
+                return None, None
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(sub_rows):
+                return None, None
+            return idx, sub_rows[idx]
+
+        def remove_sub(_event: tk.Event[tk.Misc] | None = None) -> str:
+            _idx, row = _selected_sub()
+            if not row:
+                return "break"
+            key = str(row.get("channel_key") or "")
+            try:
+                self.ingester.remove_channel_subscription(key)
+                return refresh_sub_list()
+            except Exception as exc:
+                status_var.set(f"Remove failed: {exc}")
+            return "break"
+
+        def toggle_sub_active(_event: tk.Event[tk.Misc] | None = None) -> str:
+            _idx, row = _selected_sub()
+            if not row:
+                return "break"
+            key = str(row.get("channel_key") or "")
+            active_now = int(row.get("active") or 0) == 1
+            try:
+                self.ingester.update_channel_subscription(key, active=not active_now)
+                return refresh_sub_list()
+            except Exception as exc:
+                status_var.set(f"Update failed: {exc}")
+            return "break"
+
+        def cycle_sub_mode(_event: tk.Event[tk.Misc] | None = None) -> str:
+            _idx, row = _selected_sub()
+            if not row:
+                return "break"
+            key = str(row.get("channel_key") or "")
+            cur = row.get("auto_transcribe")
+            try:
+                if cur is None:
+                    self.ingester.update_channel_subscription(key, auto_transcribe=True)
+                elif int(cur) == 1:
+                    self.ingester.update_channel_subscription(key, auto_transcribe=False)
+                else:
+                    self.ingester.update_channel_subscription(key, clear_auto_transcribe=True)
+                return refresh_sub_list()
+            except Exception as exc:
+                status_var.set(f"Mode update failed: {exc}")
+            return "break"
+
+        sub_help = tk.Label(
+            subs_tab,
+            text="R refresh | A toggle active | T cycle transcribe(default/on/off) | Delete remove",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            padx=8,
+            pady=6,
+        )
+        sub_help.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        sub_list.bind("<Delete>", remove_sub)
+        sub_list.bind("<KeyPress-a>", toggle_sub_active)
+        sub_list.bind("<KeyPress-t>", cycle_sub_mode)
+        sub_list.bind("<KeyPress-r>", refresh_sub_list)
+
+        # AI tab
+        ai_vars = {
+            "ai_provider": tk.StringVar(value=str(self._ai_settings.get("ai_provider") or "ollama")),
+            "ollama_model": tk.StringVar(value=str(self._ai_settings.get("ollama_model") or "llama3.2:3b")),
+            "ollama_base_url": tk.StringVar(value=str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")),
+            "api_base_url": tk.StringVar(value=str(self._ai_settings.get("api_base_url") or "https://api.openai.com")),
+            "api_key_env": tk.StringVar(value=str(self._ai_settings.get("api_key_env") or "OPENAI_API_KEY")),
+            "api_model": tk.StringVar(value=str(self._ai_settings.get("api_model") or "gpt-4o-mini")),
+        }
+        ai_labels = [
+            ("AI provider (ollama/api)", "ai_provider"),
+            ("Ollama model", "ollama_model"),
+            ("Ollama base URL", "ollama_base_url"),
+            ("API base URL", "api_base_url"),
+            ("API key env var", "api_key_env"),
+            ("API model", "api_model"),
+        ]
+        for i, (label, key) in enumerate(ai_labels):
+            tk.Label(ai_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
+                row=i, column=0, sticky="w", padx=(10, 6), pady=(10 if i == 0 else 6, 0)
+            )
+            ttk.Entry(ai_tab, textvariable=ai_vars[key], style="Filter.TEntry").grid(
+                row=i, column=1, sticky="ew", padx=(0, 10), pady=(10 if i == 0 else 6, 0)
+            )
+        ai_tab.columnconfigure(1, weight=1)
+
+        # Keybind tab
+        keybind_defs = [
+            ("Command menu", "open_command"),
+            ("Ingest menu", "open_ingest"),
+            ("Workers", "open_workers"),
+            ("Open video", "open_video"),
+            ("Finder", "open_finder"),
+            ("AI", "open_ai"),
+            ("Skim toggle", "toggle_skim"),
+            ("Settings", "open_settings"),
+            ("Quit", "quit"),
+            ("Play/Pause", "play_pause"),
+            ("Seek back", "seek_back"),
+            ("Seek forward", "seek_forward"),
+            ("Prev match", "prev_match"),
+            ("Next match", "next_match"),
+            ("Vim left", "vim_left"),
+            ("Vim down", "vim_down"),
+            ("Vim up", "vim_up"),
+            ("Vim right", "vim_right"),
+            ("Clear input", "clear_input"),
+            ("Toggle transcript", "toggle_transcript"),
+            ("Toggle details", "toggle_details"),
+        ]
+        keybind_vars: dict[str, tk.StringVar] = {}
+        keybind_tab.columnconfigure(1, weight=1)
+        for i, (label, key) in enumerate(keybind_defs):
+            tk.Label(keybind_tab, text=label, anchor="w", bg="#111111", fg="#d2d2d2").grid(
+                row=i, column=0, sticky="w", padx=(10, 6), pady=(8 if i == 0 else 4, 0)
+            )
+            var = tk.StringVar(value=str((self._ai_settings.get("keybinds") or {}).get(key, DEFAULT_KEYBINDS.get(key, ""))))
+            keybind_vars[key] = var
+            ttk.Entry(keybind_tab, textvariable=var, style="Filter.TEntry").grid(
+                row=i, column=1, sticky="ew", padx=(0, 10), pady=(8 if i == 0 else 4, 0)
             )
 
-        status_var = tk.StringVar(value="Enter saves settings")
+        status_var = tk.StringVar(value="Enter saves all tabs")
         tk.Label(
             popup,
             textvariable=status_var,
@@ -1789,22 +2137,54 @@ class TranscriptPlayer:
             font=(FONT["STYLE"], FONT["SIZE"] - 3),
             padx=8,
             pady=6,
-        ).grid(row=len(fields), column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 8))
+        ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+        actions = tk.Frame(popup, bg="#111111")
+        actions.grid(row=2, column=0, sticky="e", padx=8, pady=(0, 8))
 
         def save_now(_event: tk.Event[tk.Misc] | None = None) -> str:
             try:
                 prev_provider = str(self._ai_settings.get("ai_provider") or "ollama")
                 prev_model = str(self._ai_settings.get("ollama_model") or "llama3.2:3b")
                 prev_base = str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")
-                self._ai_settings["ai_provider"] = vars_map["ai_provider"].get().strip() or "ollama"
-                self._ai_settings["ollama_model"] = vars_map["ollama_model"].get().strip() or "llama3.2:3b"
-                self._ai_settings["ollama_base_url"] = vars_map["ollama_base_url"].get().strip() or "http://127.0.0.1:11434"
-                self._ai_settings["api_base_url"] = vars_map["api_base_url"].get().strip() or "https://api.openai.com"
-                self._ai_settings["api_key_env"] = vars_map["api_key_env"].get().strip() or "OPENAI_API_KEY"
-                self._ai_settings["api_model"] = vars_map["api_model"].get().strip() or "gpt-4o-mini"
-                self._skim_pre_ms = max(0, int(vars_map["_skim_pre_ms"].get().strip() or "0"))
-                self._skim_post_ms = max(0, int(vars_map["_skim_post_ms"].get().strip() or "0"))
+
+                target_workers = max(0, int(ingest_workers_var.get().strip() or "0"))
+                self._ai_settings["default_worker_count"] = target_workers
+                self._ai_settings["auto_transcribe_default"] = bool(ingest_auto_var.get())
+                self._skim_pre_ms = max(0, int(skim_pre_var.get().strip() or "0"))
+                self._skim_post_ms = max(0, int(skim_post_var.get().strip() or "0"))
+
+                for key, var in theme_vars.items():
+                    value = var.get().strip()
+                    if key == "font_size":
+                        self._ai_settings[key] = max(8, int(value or "12"))
+                    else:
+                        self._ai_settings[key] = value
+
+                self._ai_settings["subscription_db_max_videos"] = max(0, int(sub_cap_var.get().strip() or "0"))
+
+                for key, var in ai_vars.items():
+                    self._ai_settings[key] = var.get().strip()
+                if not str(self._ai_settings.get("ai_provider") or "").strip():
+                    self._ai_settings["ai_provider"] = "ollama"
+
+                kb: dict[str, str] = {}
+                for _label, key in keybind_defs:
+                    val = keybind_vars[key].get().strip()
+                    kb[key] = val or DEFAULT_KEYBINDS.get(key, "")
+                self._ai_settings["keybinds"] = kb
+
+                self.ingester.set_runtime_options(
+                    auto_transcribe_default=bool(self._ai_settings.get("auto_transcribe_default", True)),
+                    subscription_db_max_videos=int(self._ai_settings.get("subscription_db_max_videos") or 0),
+                )
+                if self._worker_target_count != target_workers:
+                    self._restart_workers(target_workers)
+
+                self._apply_theme()
+                self._refresh_caption_view()
+                self._apply_shortcut_bindings()
                 self._save_gui_settings()
+
                 new_provider = str(self._ai_settings.get("ai_provider") or "ollama")
                 if new_provider.lower() == "ollama":
                     if (
@@ -1819,8 +2199,28 @@ class TranscriptPlayer:
                 status_var.set(f"Save failed: {exc}")
             return "break"
 
+        tk.Button(
+            actions,
+            text="Save",
+            command=lambda: save_now(None),
+            bg="#151515",
+            fg="#ffffff",
+            activebackground="#202020",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+        ).grid(row=0, column=0, sticky="e")
+
         popup.bind("<Escape>", lambda _e: popup.destroy())
         popup.bind("<Return>", save_now)
+        def _bind_return_recursive(parent: tk.Misc) -> None:
+            for child in parent.winfo_children():
+                if isinstance(child, (tk.Entry, ttk.Entry, ttk.Checkbutton, tk.Button)):
+                    child.bind("<Return>", save_now, add="+")
+                _bind_return_recursive(child)
+        _bind_return_recursive(popup)
+        refresh_sub_list()
 
     def _open_search_popup(self) -> None:
         if self._search_popup and self._search_popup.winfo_exists():
@@ -2279,7 +2679,11 @@ class TranscriptPlayer:
                     status.set("No URLs parsed")
                     return "break"
                 try:
-                    result = self.ingester.enqueue_with_dedupe(urls, allow_overwrite=False)
+                    result = self.ingester.enqueue_with_dedupe(
+                        urls,
+                        allow_overwrite=False,
+                        auto_transcribe=self._auto_transcribe_default(),
+                    )
                     ids = list(result.get("queued_ids") or [])
                     status.set(f"Queued {len(ids)} jobs")
                     if ids:
@@ -2514,7 +2918,11 @@ class TranscriptPlayer:
                 status_var.set("Selected row has no URL")
                 return "break"
             try:
-                result = self.ingester.enqueue_with_dedupe([url], allow_overwrite=False)
+                result = self.ingester.enqueue_with_dedupe(
+                    [url],
+                    allow_overwrite=False,
+                    auto_transcribe=self._auto_transcribe_default(),
+                )
                 ids = list(result.get("queued_ids") or [])
                 if not ids:
                     status_var.set("Not queued (already exists)")
@@ -2618,7 +3026,9 @@ class TranscriptPlayer:
                     title = str(row.get("channel_title") or row.get("channel_key") or "")
                     key = str(row.get("channel_key") or "")
                     last_seen = str(row.get("last_seen_video_id") or "-")
-                    listbox.insert(tk.END, f"{title} | {key} | last_seen={last_seen}")
+                    mode_raw = row.get("auto_transcribe")
+                    mode = "default" if mode_raw is None else ("on" if int(mode_raw) == 1 else "off")
+                    listbox.insert(tk.END, f"{title} | {key} | last_seen={last_seen} | transcribe={mode}")
                 status_var.set(f"{len(rows_cache)} subscriptions loaded")
                 if rows_cache:
                     listbox.selection_set(0)
