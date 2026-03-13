@@ -72,6 +72,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._channel_default_ref = ""
         self._browse_preview_cache: dict[str, dict[str, Any]] = {}
         self._browse_thumb_dir: Path | None = None
+        self._browse_temp_files: set[Path] = set()
         self._split_initialized = False
         self._transcript_hidden = False
         self._details_hidden = False

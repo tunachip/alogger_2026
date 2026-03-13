@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import io
 import json
 import os
@@ -17,9 +18,10 @@ from typing import Any, Callable
 import vlc
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageOps, ImageTk
 except Exception:
     Image = None  # type: ignore[assignment]
+    ImageOps = None  # type: ignore[assignment]
     ImageTk = None  # type: ignore[assignment]
 
 from alog.pipeline import resolve_playback_media_path
@@ -768,6 +770,19 @@ class PopupMixin:
                 out.append(token)
             return out
 
+    def _youtube_thumbnail_candidates(self, video_id: str) -> list[str]:
+            token = str(video_id or "").strip()
+            if not token:
+                return []
+            base = f"https://i.ytimg.com/vi/{token}"
+            return [
+                f"{base}/maxresdefault.jpg",
+                f"{base}/sddefault.jpg",
+                f"{base}/hqdefault.jpg",
+                f"{base}/mqdefault.jpg",
+                f"{base}/default.jpg",
+            ]
+
     def _download_browse_thumbnail(self, video_id: str, thumbnail_url: str) -> Path | None:
             if not video_id or not thumbnail_url:
                 return None
@@ -776,42 +791,48 @@ class PopupMixin:
             out_path = self._browse_thumb_dir / f"{video_id}.png"
             if out_path.exists():
                 return out_path
-            try:
-                req = urllib.request.Request(
-                    thumbnail_url,
-                    headers={"User-Agent": "alogger/1.0 (+https://localhost)"},
-                )
-                with urllib.request.urlopen(req, timeout=12.0) as resp:
-                    raw = resp.read()
-                if Image is not None:
-                    with Image.open(io.BytesIO(raw)) as img:
-                        img = img.convert("RGB")
-                        img.thumbnail((420, 236))
-                        img.save(out_path, format="PNG")
-                    return out_path
-                # Fallback when Pillow is unavailable: keep raw image bytes on disk.
-                ext = ".jpg"
-                lower = thumbnail_url.lower()
-                if lower.endswith(".webp"):
-                    ext = ".webp"
-                elif lower.endswith(".png"):
-                    ext = ".png"
-                raw_path = self._browse_thumb_dir / f"{video_id}{ext}"
-                raw_path.write_bytes(raw)
-                return raw_path
-            except Exception:
-                return None
+            candidate_urls: list[str] = []
+            seen: set[str] = set()
+            for candidate in [*self._youtube_thumbnail_candidates(video_id), thumbnail_url]:
+                token = str(candidate or "").strip()
+                if not token or token in seen:
+                    continue
+                seen.add(token)
+                candidate_urls.append(token)
+            for candidate_url in candidate_urls:
+                try:
+                    req = urllib.request.Request(
+                        candidate_url,
+                        headers={"User-Agent": "alogger/1.0 (+https://localhost)"},
+                    )
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        raw = resp.read()
+                    if Image is not None:
+                        with Image.open(io.BytesIO(raw)) as img:
+                            img = img.convert("RGB")
+                            img.save(out_path, format="PNG")
+                        self._browse_temp_files.add(out_path)
+                        return out_path
+                    raw_path = self._browse_thumb_dir / f"{video_id}.img"
+                    raw_path.write_bytes(raw)
+                    self._browse_temp_files.add(raw_path)
+                    return raw_path
+                except Exception:
+                    continue
+            return None
 
-    def _get_browse_preview(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _get_browse_preview(
+            self,
+            row: dict[str, Any],
+            *,
+            fetch_metadata: bool = True,
+        ) -> dict[str, Any]:
             video_id = str(row.get("video_id") or "").strip()
             cache_key = video_id or str(row.get("url") or "").strip()
             if cache_key and cache_key in self._browse_preview_cache:
                 cached = dict(self._browse_preview_cache[cache_key])
                 has_image = bool(str(cached.get("image_path") or "").strip())
-                has_tags = bool(list(cached.get("hashtags") or []))
-                meta_ok = bool(cached.get("meta_ok"))
-                # Retry incomplete cached rows so transient failures can recover.
-                if has_image and (has_tags or meta_ok):
+                if has_image:
                     return cached
 
             title = str(row.get("title") or row.get("video_id") or "untitled").strip()
@@ -821,7 +842,7 @@ class PopupMixin:
             url = str(row.get("url") or "").strip()
             meta_ok = False
 
-            if url:
+            if fetch_metadata and url:
                 try:
                     meta = dict(self.ingester.fetch_url_metadata(url))
                     meta_ok = True
@@ -847,7 +868,7 @@ class PopupMixin:
                     pass
 
             if not thumbnail_url and video_id:
-                thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/0.jpg"
+                thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/default.jpg"
 
             image_path = self._download_browse_thumbnail(video_id, thumbnail_url) if video_id else None
             preview = {
@@ -859,7 +880,7 @@ class PopupMixin:
                 "image_path": str(image_path) if image_path else "",
                 "meta_ok": meta_ok,
             }
-            if cache_key and (preview["image_path"] or preview["hashtags"] or preview["meta_ok"]):
+            if cache_key and (preview["image_path"] or preview["hashtags"] or preview["title"] or preview["creator"]):
                 self._browse_preview_cache[cache_key] = dict(preview)
             return preview
 
@@ -2372,8 +2393,26 @@ class PopupMixin:
             body = tk.Frame(popup, bg="#111111")
             body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
             body.rowconfigure(0, weight=1)
-            body.columnconfigure(0, weight=3)
-            body.columnconfigure(1, weight=2)
+            body.columnconfigure(0, weight=2, minsize=360)
+            body.columnconfigure(1, weight=3)
+            body.grid_propagate(False)
+
+            preview_frame = tk.Frame(
+                body,
+                bg="#000000",
+                highlightthickness=1,
+                highlightbackground="#2b2b2b",
+                bd=0,
+                width=360,
+                height=520,
+            )
+            preview_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            preview_frame.grid_propagate(False)
+            preview_frame.rowconfigure(0, weight=3)
+            preview_frame.rowconfigure(1, weight=0)
+            preview_frame.rowconfigure(2, weight=0)
+            preview_frame.rowconfigure(3, weight=1)
+            preview_frame.columnconfigure(0, weight=1)
 
             listbox = tk.Listbox(
                 body,
@@ -2387,24 +2426,25 @@ class PopupMixin:
                 font=(FONT["STYLE"], FONT["SIZE"] - 2),
                 exportselection=False,
             )
-            listbox.grid(row=0, column=0, sticky="nsew")
+            listbox.grid(row=0, column=1, sticky="nsew")
 
-            preview_frame = tk.Frame(
-                body,
+            preview_image_width = 344
+            preview_image_height = 194
+            preview_image_box = tk.Frame(
+                preview_frame,
                 bg="#000000",
-                highlightthickness=1,
-                highlightbackground="#2b2b2b",
+                width=preview_image_width,
+                height=preview_image_height,
+                highlightthickness=0,
                 bd=0,
             )
-            preview_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-            preview_frame.rowconfigure(0, weight=3)
-            preview_frame.rowconfigure(1, weight=0)
-            preview_frame.rowconfigure(2, weight=0)
-            preview_frame.rowconfigure(3, weight=1)
-            preview_frame.columnconfigure(0, weight=1)
+            preview_image_box.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+            preview_image_box.grid_propagate(False)
+            preview_image_box.rowconfigure(0, weight=1)
+            preview_image_box.columnconfigure(0, weight=1)
 
             preview_image_lbl = tk.Label(
-                preview_frame,
+                preview_image_box,
                 bg="#000000",
                 fg="#8f8f8f",
                 text="Preview loading...",
@@ -2412,7 +2452,7 @@ class PopupMixin:
                 justify="center",
                 font=(FONT["STYLE"], FONT["SIZE"] - 2),
             )
-            preview_image_lbl.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+            preview_image_lbl.grid(row=0, column=0, sticky="nsew")
             preview_title_var = tk.StringVar(value="")
             preview_creator_var = tk.StringVar(value="")
             preview_tags_var = tk.StringVar(value="")
@@ -2472,6 +2512,7 @@ class PopupMixin:
             all_rows: list[dict[str, Any]] = []
             filtered_positions: list[int] = []
             preview_seq: dict[str, int] = {"value": 0}
+            prefetch_seq: dict[str, int] = {"value": 0}
 
             def _set_preview_placeholders(title: str = "", creator: str = "", tags: str = "") -> None:
                 preview_title_var.set(title)
@@ -2494,7 +2535,12 @@ class PopupMixin:
                     try:
                         with Image.open(image_path) as img:
                             img = img.convert("RGB")
-                            img.thumbnail((420, 236))
+                            target_w = preview_image_width
+                            target_h = preview_image_height
+                            if ImageOps is not None:
+                                img = ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS)
+                            else:
+                                img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
                             photo = ImageTk.PhotoImage(img)
                         preview_photo["image"] = photo
                         preview_image_lbl.configure(image=photo, text="")
@@ -2526,14 +2572,19 @@ class PopupMixin:
                 video_id = str(row.get("video_id") or "").strip()
                 preview_title_var.set(str(row.get("title") or video_id or "untitled"))
                 preview_creator_var.set(f"creator: {row.get('uploader') or row.get('channel') or 'unknown'}")
-                preview_tags_var.set("loading metadata...")
-                preview_image_lbl.configure(image="", text="Loading preview...")
                 preview_seq["value"] += 1
                 seq = int(preview_seq["value"])
+                cache_key = video_id or str(row.get("url") or "").strip()
+                cached_preview = self._browse_preview_cache.get(cache_key) if cache_key else None
+                if isinstance(cached_preview, dict) and str(cached_preview.get("image_path") or "").strip():
+                    _render_preview_row(row, dict(cached_preview), seq)
+                    return
+                preview_tags_var.set("loading metadata...")
+                preview_image_lbl.configure(image="", text="Loading preview...")
 
                 def _work() -> None:
                     try:
-                        preview = self._get_browse_preview(row)
+                        preview = self._get_browse_preview(row, fetch_metadata=True)
                     except Exception as exc:
                         preview = {
                             "title": str(row.get("title") or video_id or "untitled"),
@@ -2582,22 +2633,54 @@ class PopupMixin:
                     all_rows.clear()
                     all_rows.extend(dict(row) for row in (data.get("entries") or []))
                     self._channel_results = list(all_rows)
+                    prefetch_seq["value"] += 1
+                    current_prefetch = int(prefetch_seq["value"])
+                    rows_to_prefetch = [dict(row) for row in all_rows[:30]]
+                    status_var.set(
+                        f"Channel: {channel_ref} | preloading {len(rows_to_prefetch)} previews..."
+                    )
                     _apply_filter()
-                    def _prefetch_all(rows_snapshot: list[dict[str, Any]]) -> None:
-                        for r in rows_snapshot:
-                            if not popup.winfo_exists():
-                                return
-                            try:
-                                self._get_browse_preview(dict(r))
-                            except Exception:
-                                continue
-                    threading.Thread(
-                        target=lambda rows_snapshot=list(all_rows): _prefetch_all(rows_snapshot),
-                        daemon=True,
-                        name="alog-browse-prefetch",
-                    ).start()
                     if all_rows:
                         listbox.focus_set()
+                    if rows_to_prefetch:
+                        def _prefetch_worker(rows_snapshot: list[dict[str, Any]], token: int) -> None:
+                            done = 0
+
+                            def _one(row_data: dict[str, Any]) -> None:
+                                nonlocal done
+                                try:
+                                    self._get_browse_preview(row_data, fetch_metadata=False)
+                                except Exception:
+                                    pass
+                                done += 1
+                                if not popup.winfo_exists() or token != prefetch_seq["value"]:
+                                    return
+                                if done == 1 or done % 5 == 0 or done == len(rows_snapshot):
+                                    self.root.after(
+                                        0,
+                                        lambda done_count=done: (
+                                            status_var.set(
+                                                f"Channel: {channel_ref} | "
+                                                f"preloaded {done_count}/{len(rows_snapshot)} previews"
+                                            ),
+                                            _refresh_preview_async(),
+                                        ),
+                                    )
+
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                                futures = [executor.submit(_one, row_data) for row_data in rows_snapshot]
+                                for future in concurrent.futures.as_completed(futures):
+                                    try:
+                                        future.result()
+                                    except Exception:
+                                        continue
+
+                        threading.Thread(
+                            target=_prefetch_worker,
+                            args=(rows_to_prefetch, current_prefetch),
+                            daemon=True,
+                            name="alog-browse-prefetch",
+                        ).start()
                 except Exception as exc:
                     status_var.set(f"Failed to list channel videos: {exc}")
                 return "break"
@@ -3206,4 +3289,3 @@ class PopupMixin:
                     self._jobs_agent_text.insert("1.0", f"Agent pane refresh failed: {exc}")
                     self._jobs_agent_text.configure(state="disabled")
             self._jobs_after_id = self.root.after(1000, self._refresh_jobs_popup)
-

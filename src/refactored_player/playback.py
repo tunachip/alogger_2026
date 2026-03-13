@@ -236,6 +236,16 @@ class PlaybackMixin:
             popup = getattr(self, attr, None)
             if popup and popup.winfo_exists():
                 popup.destroy()
+        for preview_path in list(getattr(self, "_browse_temp_files", set())):
+            try:
+                preview_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if getattr(self, "_browse_thumb_dir", None) is not None:
+            try:
+                self._browse_thumb_dir.rmdir()
+            except Exception:
+                pass
         try:
             self.ingester.stop_background_workers()
             self.player.stop()
