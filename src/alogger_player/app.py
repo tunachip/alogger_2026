@@ -1,7 +1,10 @@
 from __future__ import annotations
 import vlc
+import ast
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -15,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import ttk
 from typing import Any, Callable
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None  # type: ignore[assignment]
+    ImageTk = None  # type: ignore[assignment]
 
 from alog.config import IngesterConfig
 from alog.service import IngesterService
@@ -154,11 +162,15 @@ class TranscriptPlayer:
         self._jobs_done_list:       tk.Listbox | None = None
         self._jobs_dl_text:         tk.Text | None = None
         self._jobs_tr_text:         tk.Text | None = None
+        self._jobs_agent_text:      tk.Text | None = None
         self._jobs_after_id:        str | None = None
+        self._agent_activity:       list[dict[str, str]] = []
         self._search_results:       list[dict[str, Any]] = []
         self._video_picker_results: list[dict[str, Any]] = []
         self._channel_results:      list[dict[str, Any]] = []
         self._channel_default_ref = ""
+        self._browse_preview_cache: dict[str, dict[str, Any]] = {}
+        self._browse_thumb_dir: Path | None = None
         self._split_initialized =   False
         self._transcript_hidden =   False
         self._details_hidden =      False
@@ -197,6 +209,11 @@ class TranscriptPlayer:
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
         self.ingester.init()
+        self._browse_thumb_dir = self.ingester_config.db_path.parent / "browse_previews"
+        try:
+            self._browse_thumb_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self._gui_settings_path = self.ingester_config.db_path.parent / "gui_settings.json"
         self._ai_settings = self._load_gui_settings()
         if self.workers <= 0:
@@ -1888,6 +1905,12 @@ class TranscriptPlayer:
         refresh()
 
     def _ask_ai(self, prompt: str) -> str:
+        api_context = self._agent_api_context()
+        if api_context:
+            prompt = (
+                f"{api_context}\n\nUser request:\n{prompt}\n\n"
+                "Return ONLY JSON with top-level key `actions` (array)."
+            )
         provider = str(self._ai_settings.get("ai_provider") or "ollama").lower()
         if provider == "ollama":
             self._ensure_ollama_ready(block=True)
@@ -1938,6 +1961,628 @@ class TranscriptPlayer:
         if isinstance(msg, dict):
             return str(msg.get("content") or "").strip() or "(empty response)"
         return "(invalid response)"
+
+    def _agent_api_context(self) -> str:
+        return (
+            "You are the in-app ALogger agent. Use this API surface:\n"
+            "- list_channel_videos(channel_ref, limit:int<=100) -> channel metadata + entries[{title, video_id, url}]\n"
+            "- enqueue_with_dedupe(urls:list[str], allow_overwrite:bool=False, auto_transcribe:bool|None)\n"
+            "- add_channel_subscription(channel_ref, seed_with_latest:bool=True, auto_transcribe:bool|None)\n"
+            "- list_channel_subscriptions(active_only:bool=False)\n"
+            "- update_channel_subscription(channel_key, active:bool|None, auto_transcribe:bool|None, clear_auto_transcribe:bool=False)\n"
+            "- poll_subscriptions_once()\n"
+            "- search_video_titles(query, limit)\n"
+            "- search_video_metadata(query, limit)  # matches title/channel/uploader/video_id/url with fuzzy fallback\n"
+            "- search_videos(query, limit) and search_segments(query, limit)\n"
+            "- jobs_summary(limit), dashboard_snapshot()\n"
+            "- delete_video_and_assets(video_id)\n"
+            "Preferred action schema (JSON only):\n"
+            "{ \"actions\": [ {\"action\": \"<name>\", ...args } ] }\n"
+            "Supported actions you can emit:\n"
+            "- ingest_recent_matching_channel(channel_ref, query, count, fetch_limit=50, auto_transcribe=true)\n"
+            "- enqueue_urls(urls, auto_transcribe=true)\n"
+            "- list_channel_videos(channel_ref, limit=30)\n"
+            "- subscribe_channel(channel_ref, auto_transcribe=null)\n"
+            "- poll_subscriptions()\n"
+            "- clear_queue()\n"
+            "- kill_jobs()\n"
+            "- open_video(video_id=<id>) OR open_video(query=<title query>)\n"
+            "Rules:\n"
+            "1) Prefer deterministic, minimal API calls.\n"
+            "2) When asked to ingest N recent channel videos matching a title phrase:\n"
+            "   call list_channel_videos(channel, limit=30-100), filter title case-insensitively, sort by listing order as newest-first, take N, enqueue URLs.\n"
+            "3) Return concise action steps and the exact API calls/arguments."
+        )
+
+    def _parse_agent_actions(self, text: str) -> list[dict[str, Any]]:
+        src = text.strip()
+        if not src:
+            return []
+        candidates: list[str] = []
+        fenced = re.findall(r"```(?:json)?\s*(.*?)```", src, flags=re.IGNORECASE | re.DOTALL)
+        candidates.extend([c.strip() for c in fenced if c.strip()])
+        # Pull potential inline JSON object/array if model added prose around it.
+        m_obj = re.search(r"(\{[\s\S]*\})", src)
+        if m_obj:
+            candidates.append(m_obj.group(1).strip())
+        m_arr = re.search(r"(\[[\s\S]*\])", src)
+        if m_arr:
+            candidates.append(m_arr.group(1).strip())
+        candidates.append(src)
+        for payload in candidates:
+            data: Any
+            try:
+                data = json.loads(payload)
+            except Exception:
+                # Accept Python-literal style payloads as a fallback.
+                try:
+                    data = ast.literal_eval(payload)
+                except Exception:
+                    continue
+            # Common failure mode: model returns a JSON string containing JSON.
+            if isinstance(data, str):
+                inner = data.strip()
+                if inner.startswith("{") or inner.startswith("["):
+                    try:
+                        data = json.loads(inner)
+                    except Exception:
+                        try:
+                            data = ast.literal_eval(inner)
+                        except Exception:
+                            continue
+            if isinstance(data, dict):
+                acts = data.get("actions")
+                if isinstance(acts, list):
+                    return [a for a in acts if isinstance(a, dict)]
+            if isinstance(data, list):
+                return [a for a in data if isinstance(a, dict)]
+        return []
+
+    def _normalize_agent_action_name(self, name: str) -> str:
+        key = str(name or "").strip().lower()
+        alias_map = {
+            "download_most_recent_video": "ingest_recent_matching_channel",
+            "download_recent_video": "ingest_recent_matching_channel",
+            "ingest_recent_video": "ingest_recent_matching_channel",
+            "enqueue_video_urls": "enqueue_urls",
+            "play_video": "open_video",
+            "launch_video": "open_video",
+        }
+        return alias_map.get(key, key)
+
+    def _prompt_intent_ast(self, prompt: str) -> dict[str, Any]:
+        raw = prompt.strip()
+        low = raw.lower()
+        wants_download = any(k in low for k in ("download", "ingest", "queue", "enqueue"))
+        wants_play = any(k in low for k in ("play", "open", "watch"))
+        wants_recent = any(k in low for k in ("most recent", "latest", "newest", "recent"))
+        m_from = re.search(r"(?:from|by)\s+([a-z0-9_@.\-]+)", low)
+        channel_ref = m_from.group(1).strip() if m_from else ""
+        count = 1
+        m_count = re.search(r"\b(\d+)\b", low)
+        if m_count:
+            count = max(1, int(m_count.group(1)))
+        else:
+            word_to_num = {
+                "one": 1,
+                "two": 2,
+                "three": 3,
+                "four": 4,
+                "five": 5,
+                "six": 6,
+                "seven": 7,
+                "eight": 8,
+                "nine": 9,
+                "ten": 10,
+            }
+            for w, n in word_to_num.items():
+                if re.search(rf"\b{w}\b", low):
+                    count = n
+                    break
+        query = ""
+        m_title_phrase = re.search(
+            r"(?:with|containing)\s+['\"]?(.+?)['\"]?\s+in\s+(?:the\s+)?title\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m_title_phrase:
+            query = m_title_phrase.group(1).strip()
+        m_contains = re.search(r"(?:containing|contains|with)\s+['\"]?([^'\"]+)['\"]?", raw, flags=re.IGNORECASE)
+        if m_contains and not query:
+            query = m_contains.group(1).strip()
+        if not channel_ref and wants_download:
+            # Common phrasing: "download the most recent <channel> video"
+            m_recent_channel = re.search(
+                r"(?:most\s+recent|latest|newest|recent)\s+([a-z0-9_@.\-]+)\s+video[s]?\b",
+                low,
+            )
+            if m_recent_channel:
+                channel_ref = m_recent_channel.group(1).strip()
+        if not channel_ref and wants_download:
+            # Also support: "download <channel> video(s)"
+            m_download_channel = re.search(
+                r"\bdownload\s+(?:the\s+)?(?:most\s+recent|latest|newest|recent\s+)?([a-z0-9_@.\-]+)\s+video[s]?\b",
+                low,
+            )
+            if m_download_channel:
+                channel_ref = m_download_channel.group(1).strip()
+        # If channel wasn't captured via from/by, infer a likely channel token.
+        if not channel_ref and wants_download:
+            scrub = re.sub(r"[^a-z0-9_@.\-\s]", " ", low)
+            tokens = [t for t in scrub.split() if t]
+            stop = {
+                "download", "ingest", "queue", "enqueue", "the", "a", "an",
+                "most", "recent", "latest", "newest", "video", "videos",
+                "from", "by", "please", "and", "of", "to", "for", "me",
+                "with", "containing", "contains",
+            }
+            candidates = [t for t in tokens if t not in stop and not t.isdigit()]
+            if candidates:
+                # Prefer handle-like tokens (longer, includes _-.@).
+                candidates.sort(key=lambda t: (any(ch in t for ch in "_-.@"), len(t)), reverse=True)
+                channel_ref = candidates[0]
+        return {
+            "wants_download": wants_download,
+            "wants_play": wants_play,
+            "wants_recent": wants_recent,
+            "channel_ref": channel_ref,
+            "query": query,
+            "count": count,
+            "raw_prompt": raw,
+        }
+
+    def _coerce_actions_with_prompt_ast(
+        self,
+        prompt_ast: dict[str, Any],
+        actions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not actions:
+            return actions
+        wants_download = bool(prompt_ast.get("wants_download"))
+        wants_play = bool(prompt_ast.get("wants_play"))
+        wants_recent = bool(prompt_ast.get("wants_recent"))
+        channel_ref = str(prompt_ast.get("channel_ref") or "").strip()
+        query = str(prompt_ast.get("query") or "").strip()
+        count = max(1, int(prompt_ast.get("count") or 1))
+
+        normalized: list[dict[str, Any]] = []
+        for act in actions:
+            item = dict(act)
+            item["action"] = self._normalize_agent_action_name(str(item.get("action") or ""))
+            normalized.append(item)
+
+        # Download intent ALWAYS means browse/ingest workflow, never open playback.
+        if wants_download:
+            # If parser missed the channel, salvage one from model args.
+            if not channel_ref:
+                for a in normalized:
+                    maybe = str(
+                        a.get("channel_ref")
+                        or a.get("channel")
+                        or a.get("creator")
+                        or a.get("uploader")
+                        or ""
+                    ).strip()
+                    if maybe:
+                        channel_ref = maybe
+                        break
+                if not channel_ref:
+                    for a in normalized:
+                        if str(a.get("action")) == "open_video":
+                            maybe = str(a.get("query") or "").strip()
+                            if maybe and " " not in maybe:
+                                channel_ref = maybe
+                                break
+            if channel_ref:
+                return [
+                    {
+                        "action": "ingest_recent_matching_channel",
+                        "channel_ref": channel_ref,
+                        "query": query,
+                        "count": count,
+                        "fetch_limit": max(30, min(100, count * 10)),
+                        "auto_transcribe": True,
+                    }
+                ]
+            # Last fallback: keep only ingest-safe actions, never playback actions.
+            return [
+                a
+                for a in normalized
+                if str(a.get("action")) in {"ingest_recent_matching_channel", "enqueue_urls", "list_channel_videos"}
+            ]
+
+        # Play-centric prompts should always produce open_video if missing.
+        if wants_play:
+            has_open = any(str(a.get("action")) == "open_video" for a in normalized)
+            if not has_open:
+                q = query or channel_ref or ""
+                if q:
+                    normalized.insert(0, {"action": "open_video", "query": q})
+        return normalized
+
+    def _infer_actions_from_prompt(self, prompt: str) -> list[dict[str, Any]]:
+        text = prompt.strip()
+        low = text.lower()
+        ast = self._prompt_intent_ast(text)
+        actions: list[dict[str, Any]] = []
+
+        ref = str(ast.get("channel_ref") or "").strip(" .,!?:;\"'")
+        count = max(1, int(ast.get("count") or 1))
+        query = str(ast.get("query") or "")
+
+        # Download/ingest intent with a resolved channel can run directly.
+        if bool(ast.get("wants_download")) and ref:
+            actions.append(
+                {
+                    "action": "ingest_recent_matching_channel",
+                    "channel_ref": ref,
+                    "query": query,
+                    "count": count,
+                    "fetch_limit": max(30, min(100, count * 10)),
+                    "auto_transcribe": True,
+                }
+            )
+            return actions
+
+        # Implicit ingest intent:
+        # e.g. "most recent northernlion video with 'slay the spire' in the title"
+        is_phrase_request = bool(re.search(r"\b(most\s+recent|latest|newest|recent)\b", low)) and "video" in low
+        has_explicit_non_ingest_intent = any(k in low for k in ("play", "open", "watch", "subscribe"))
+        if ref and is_phrase_request and not has_explicit_non_ingest_intent:
+            actions.append(
+                {
+                    "action": "ingest_recent_matching_channel",
+                    "channel_ref": ref,
+                    "query": query,
+                    "count": count,
+                    "fetch_limit": max(30, min(100, count * 10)),
+                    "auto_transcribe": True,
+                }
+            )
+            return actions
+
+        # "play/open/watch ... video" -> open by metadata query.
+        if bool(ast.get("wants_play")):
+            q = re.sub(r"^(play|open|watch)\s+", "", text, flags=re.IGNORECASE).strip()
+            q = re.sub(r"\s+video[s]?\s*$", "", q, flags=re.IGNORECASE).strip()
+            if q:
+                actions.append({"action": "open_video", "query": q})
+                return actions
+        return actions
+
+    def _hashtags_from_text(self, text: str) -> list[str]:
+        tags = re.findall(r"#([a-z0-9_]+)", str(text or ""), flags=re.IGNORECASE)
+        out: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            token = f"#{tag.lower()}"
+            if token in seen:
+                continue
+            seen.add(token)
+            out.append(token)
+        return out
+
+    def _download_browse_thumbnail(self, video_id: str, thumbnail_url: str) -> Path | None:
+        if not video_id or not thumbnail_url:
+            return None
+        if self._browse_thumb_dir is None:
+            return None
+        out_path = self._browse_thumb_dir / f"{video_id}.png"
+        if out_path.exists():
+            return out_path
+        try:
+            req = urllib.request.Request(
+                thumbnail_url,
+                headers={"User-Agent": "alogger/1.0 (+https://localhost)"},
+            )
+            with urllib.request.urlopen(req, timeout=12.0) as resp:
+                raw = resp.read()
+            if Image is not None:
+                with Image.open(io.BytesIO(raw)) as img:
+                    img = img.convert("RGB")
+                    img.thumbnail((420, 236))
+                    img.save(out_path, format="PNG")
+                return out_path
+            # Fallback when Pillow is unavailable: keep raw image bytes on disk.
+            ext = ".jpg"
+            lower = thumbnail_url.lower()
+            if lower.endswith(".webp"):
+                ext = ".webp"
+            elif lower.endswith(".png"):
+                ext = ".png"
+            raw_path = self._browse_thumb_dir / f"{video_id}{ext}"
+            raw_path.write_bytes(raw)
+            return raw_path
+        except Exception:
+            return None
+
+    def _get_browse_preview(self, row: dict[str, Any]) -> dict[str, Any]:
+        video_id = str(row.get("video_id") or "").strip()
+        cache_key = video_id or str(row.get("url") or "").strip()
+        if cache_key and cache_key in self._browse_preview_cache:
+            cached = dict(self._browse_preview_cache[cache_key])
+            has_image = bool(str(cached.get("image_path") or "").strip())
+            has_tags = bool(list(cached.get("hashtags") or []))
+            meta_ok = bool(cached.get("meta_ok"))
+            # Retry incomplete cached rows so transient failures can recover.
+            if has_image and (has_tags or meta_ok):
+                return cached
+
+        title = str(row.get("title") or row.get("video_id") or "untitled").strip()
+        creator = str(row.get("uploader") or row.get("channel") or "").strip()
+        hashtags = self._hashtags_from_text(title)
+        thumbnail_url = str(row.get("thumbnail") or "").strip()
+        url = str(row.get("url") or "").strip()
+        meta_ok = False
+
+        if url:
+            try:
+                meta = dict(self.ingester.fetch_url_metadata(url))
+                meta_ok = True
+                title = str(meta.get("title") or title).strip()
+                creator = str(meta.get("uploader") or meta.get("channel") or creator).strip()
+                thumbnail_url = str(meta.get("thumbnail") or thumbnail_url).strip()
+                if not hashtags:
+                    hashtags = self._hashtags_from_text(str(meta.get("description") or ""))
+                if not hashtags:
+                    raw_tags = meta.get("tags") or []
+                    if isinstance(raw_tags, list):
+                        for tag in raw_tags:
+                            token = str(tag or "").strip().replace(" ", "")
+                            if not token:
+                                continue
+                            if token.startswith("#"):
+                                hashtags.append(token.lower())
+                            elif len(hashtags) < 8:
+                                hashtags.append(f"#{token.lower()}")
+                            if len(hashtags) >= 8:
+                                break
+            except Exception:
+                pass
+
+        if not thumbnail_url and video_id:
+            thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/0.jpg"
+
+        image_path = self._download_browse_thumbnail(video_id, thumbnail_url) if video_id else None
+        preview = {
+            "video_id": video_id,
+            "title": title or "untitled",
+            "creator": creator or "unknown",
+            "hashtags": hashtags[:8],
+            "thumbnail_url": thumbnail_url,
+            "image_path": str(image_path) if image_path else "",
+            "meta_ok": meta_ok,
+        }
+        if cache_key and (preview["image_path"] or preview["hashtags"] or preview["meta_ok"]):
+            self._browse_preview_cache[cache_key] = dict(preview)
+        return preview
+
+    def _record_agent_activity(self, kind: str, message: str) -> None:
+        stamp = _fmt_hms(max(0, self.player.get_time()) / 1000.0) if hasattr(self, "player") else "00:00:00"
+        self._agent_activity.append(
+            {
+                "time": stamp,
+                "kind": str(kind).strip() or "info",
+                "message": str(message).strip(),
+            }
+        )
+        if len(self._agent_activity) > 300:
+            self._agent_activity = self._agent_activity[-300:]
+
+    def _open_video_from_row(self, row: dict[str, Any], *, filter_text: str = "") -> tuple[bool, str]:
+        video_id = str(row.get("video_id") or "").strip()
+        if not video_id:
+            return False, "row has no video_id"
+        transcript_raw = str(row.get("transcript_json_path") or "").strip()
+        transcript_path = Path(transcript_raw) if transcript_raw else None
+        preferred = Path(str(row.get("local_video_path") or "")) if row.get("local_video_path") else None
+        if transcript_path is not None and not transcript_path.exists():
+            transcript_path = None
+        try:
+            video_path = resolve_playback_media_path(
+                self.ingester_config,
+                video_id=video_id,
+                preferred_path=preferred,
+            )
+        except Exception as exc:
+            return False, f"playback path error: {exc}"
+        audio_path = self._find_audio_sidecar(video_id, video_path)
+        self._load_session(
+            video_id=video_id,
+            transcript_json=transcript_path,
+            video_path=video_path,
+            audio_path=audio_path,
+            start_sec=0.0,
+            filter_text=filter_text,
+        )
+        return True, f"opened video {video_id}"
+
+    def _execute_agent_actions(
+        self,
+        actions: list[dict[str, Any]],
+        *,
+        emit: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
+        should_close_ai = False
+        executed = 0
+        failed = 0
+        events: list[dict[str, str]] = []
+        if not actions:
+            return {"close_ai": False, "executed": 0, "failed": 0, "events": events}
+        for i, act in enumerate(actions, start=1):
+            name = str(act.get("action") or "").strip().lower()
+            if not name:
+                if emit:
+                    emit("err", f"action #{i}: missing `action`")
+                failed += 1
+                continue
+            name = self._normalize_agent_action_name(name)
+            try:
+                if name == "ingest_recent_matching_channel":
+                    channel_ref = str(
+                        act.get("channel_ref")
+                        or act.get("channel")
+                        or act.get("creator")
+                        or act.get("uploader")
+                        or ""
+                    ).strip()
+                    query = str(act.get("query") or "").strip().lower()
+                    count = max(1, int(act.get("count") or 1))
+                    fetch_limit = max(count, min(100, int(act.get("fetch_limit") or 50)))
+                    auto_transcribe = bool(act.get("auto_transcribe", True))
+                    data = self.ingester.list_channel_videos(channel_ref, limit=fetch_limit)
+                    entries = [dict(r) for r in (data.get("entries") or [])]
+                    matched: list[dict[str, Any]] = []
+                    for row in entries:
+                        title = str(row.get("title") or "").lower()
+                        if query and query not in title:
+                            continue
+                        matched.append(row)
+                        if len(matched) >= count:
+                            break
+                    urls = [str(r.get("url") or "").strip() for r in matched if str(r.get("url") or "").strip()]
+                    result = self.ingester.enqueue_with_dedupe(
+                        urls,
+                        allow_overwrite=False,
+                        auto_transcribe=auto_transcribe,
+                    )
+                    ids = list(result.get("queued_ids") or [])
+                    self.status_var.set(f"Agent queued {len(ids)} ingest jobs")
+                    if emit:
+                        emit("act", f"{name}: matched={len(matched)} queued={len(ids)}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: matched={len(matched)} queued={len(ids)}"})
+                    continue
+
+                if name == "enqueue_urls":
+                    raw_urls = act.get("urls") or []
+                    urls = [str(u).strip() for u in raw_urls if str(u).strip()]
+                    auto_transcribe = bool(act.get("auto_transcribe", True))
+                    result = self.ingester.enqueue_with_dedupe(
+                        urls,
+                        allow_overwrite=False,
+                        auto_transcribe=auto_transcribe,
+                    )
+                    ids = list(result.get("queued_ids") or [])
+                    self.status_var.set(f"Agent queued {len(ids)} ingest jobs")
+                    if emit:
+                        emit("act", f"{name}: queued={len(ids)}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: queued={len(ids)}"})
+                    continue
+
+                if name == "list_channel_videos":
+                    channel_ref = str(act.get("channel_ref") or "").strip()
+                    limit = max(1, min(100, int(act.get("limit") or 30)))
+                    data = self.ingester.list_channel_videos(channel_ref, limit=limit)
+                    entries = data.get("entries") or []
+                    if emit:
+                        emit("act", f"{name}: channel={data.get('channel')} entries={len(entries)}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: channel={data.get('channel')} entries={len(entries)}"})
+                    continue
+
+                if name == "search_video_metadata":
+                    query = str(act.get("query") or "").strip()
+                    limit = max(1, min(200, int(act.get("limit") or 30)))
+                    rows = self.ingester.search_video_metadata(query, limit=limit)
+                    if emit:
+                        emit("act", f"{name}: query={query!r} matches={len(rows)}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: query={query!r} matches={len(rows)}"})
+                    continue
+
+                if name == "subscribe_channel":
+                    channel_ref = str(act.get("channel_ref") or "").strip()
+                    auto_mode = act.get("auto_transcribe", None)
+                    auto_transcribe = None if auto_mode is None else bool(auto_mode)
+                    sub = self.ingester.add_channel_subscription(
+                        channel_ref,
+                        seed_with_latest=True,
+                        auto_transcribe=auto_transcribe,
+                    )
+                    if emit:
+                        emit("act", f"{name}: {sub.get('channel_title')} ({sub.get('channel_key')})")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: {sub.get('channel_title')} ({sub.get('channel_key')})"})
+                    continue
+
+                if name == "poll_subscriptions":
+                    summary = self.ingester.poll_subscriptions_once()
+                    if emit:
+                        emit("act", f"{name}: scanned={summary.get('scanned', 0)} queued={summary.get('queued', 0)}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: scanned={summary.get('scanned', 0)} queued={summary.get('queued', 0)}"})
+                    continue
+
+                if name == "clear_queue":
+                    n = int(self.ingester.clear_queue())
+                    if emit:
+                        emit("act", f"{name}: cleared={n}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: cleared={n}"})
+                    continue
+
+                if name == "kill_jobs":
+                    n = int(self.ingester.kill_active_jobs())
+                    if emit:
+                        emit("act", f"{name}: killed={n}")
+                    executed += 1
+                    events.append({"kind": "act", "message": f"{name}: killed={n}"})
+                    continue
+
+                if name == "open_video":
+                    video_id = str(act.get("video_id") or "").strip()
+                    query = str(act.get("query") or "").strip()
+                    row: dict[str, Any] | None = None
+                    if video_id:
+                        done = self.ingester.db.get_latest_done_job_for_video(video_id)  # type: ignore[attr-defined]
+                        if done:
+                            row = dict(done)
+                    if row is None and query:
+                        rows = self.ingester.search_video_metadata(query, limit=50)
+                        if not rows:
+                            rows = self.ingester.search_video_titles(query, limit=50)
+                        if rows:
+                            row = dict(rows[0])
+                    if row is None:
+                        if emit:
+                            emit("err", f"{name}: no matching playable video")
+                        continue
+                    ok, msg = self._open_video_from_row(row, filter_text=query)
+                    if emit:
+                        emit("act" if ok else "err", f"{name}: {msg}")
+                    if ok:
+                        executed += 1
+                        events.append({"kind": "act", "message": f"{name}: {msg}"})
+                        should_close_ai = True
+                    else:
+                        failed += 1
+                        events.append({"kind": "err", "message": f"{name}: {msg}"})
+                    continue
+
+                if emit:
+                    emit("err", f"unsupported action: {name}")
+                failed += 1
+                events.append({"kind": "err", "message": f"unsupported action: {name}"})
+            except Exception as exc:
+                if emit:
+                    emit("err", f"{name} failed: {exc}")
+                failed += 1
+                events.append({"kind": "err", "message": f"{name} failed: {exc}"})
+        summary = {
+            "close_ai": should_close_ai,
+            "executed": executed,
+            "failed": failed,
+            "events": events,
+        }
+        self._record_agent_activity(
+            "summary",
+            f"actions={len(actions)} executed={executed} failed={failed}",
+        )
+        for ev in events:
+            self._record_agent_activity(str(ev.get("kind") or "act"), str(ev.get("message") or ""))
+        return summary
 
     def _open_ai_popup(self) -> None:
         popup = OverlayPanel(self.root)
@@ -1990,20 +2635,82 @@ class TranscriptPlayer:
             feed.see("end")
             feed.configure(state="disabled")
 
+        append_line(
+            "sys",
+            "Agent initialized with app API context. Ask for ingest/search/subscription actions directly.",
+        )
+
         def send_prompt(_event: tk.Event[tk.Misc] | None = None) -> str:
             prompt = input_var.get().strip()
             if not prompt:
                 return "break"
             input_var.set("")
             append_line("you", prompt)
+            prompt_ast = self._prompt_intent_ast(prompt)
+            direct_actions = self._infer_actions_from_prompt(prompt)
+            if direct_actions:
+                append_line("sys", f"AST resolved prompt directly ({len(direct_actions)} action(s)); skipping model.")
+                summary = self._execute_agent_actions(
+                    direct_actions,
+                    emit=lambda p, t: append_line(p, t),
+                )
+                append_line(
+                    "sys",
+                    f"Direct-action summary: executed={summary.get('executed', 0)} failed={summary.get('failed', 0)}",
+                )
+                status_var.set("Ready")
+                if bool(summary.get("close_ai")) and popup.winfo_exists():
+                    popup.destroy()
+                    self.filter_entry.focus_set()
+                return "break"
             if provider.lower() == "ollama" and not self._ollama_bootstrap_done.is_set():
                 status_var.set(f"Ollama startup: {self._ollama_bootstrap_state} ...")
             else:
-                status_var.set("Running model...")
+                status_var.set("Running model (AST fallback)...")
             self.root.update_idletasks()
             try:
-                reply = self._ask_ai(prompt)
-                append_line("ai", reply)
+                reply = self._ask_ai(
+                    f"User prompt: {prompt}\n"
+                    f"Prompt AST: {json.dumps(prompt_ast, ensure_ascii=False)}\n"
+                    "Use AST as source of truth when translating to actions."
+                )
+                actions = self._parse_agent_actions(reply)
+                actions = self._coerce_actions_with_prompt_ast(prompt_ast, actions)
+                if actions:
+                    append_line("ai", f"Action plan received ({len(actions)} action(s))")
+                    append_line("sys", f"Executing {len(actions)} action(s)")
+                    summary = self._execute_agent_actions(
+                        actions,
+                        emit=lambda p, t: append_line(p, t),
+                    )
+                    append_line(
+                        "sys",
+                        f"Action summary: executed={summary.get('executed', 0)} failed={summary.get('failed', 0)}",
+                    )
+                    if bool(summary.get("close_ai")) and popup.winfo_exists():
+                        popup.destroy()
+                        self.filter_entry.focus_set()
+                        return "break"
+                else:
+                    append_line("ai", reply)
+                    inferred = self._infer_actions_from_prompt(prompt)
+                    if inferred:
+                        append_line("sys", f"No valid action JSON found; inferred {len(inferred)} action(s) from prompt.")
+                        summary = self._execute_agent_actions(
+                            inferred,
+                            emit=lambda p, t: append_line(p, t),
+                        )
+                        append_line(
+                            "sys",
+                            f"Inferred-action summary: executed={summary.get('executed', 0)} failed={summary.get('failed', 0)}",
+                        )
+                        if bool(summary.get("close_ai")) and popup.winfo_exists():
+                            popup.destroy()
+                            self.filter_entry.focus_set()
+                            return "break"
+                    else:
+                        append_line("sys", "No structured actions found (expected JSON actions array).")
+                        self._record_agent_activity("info", "AI reply had no structured actions")
                 status_var.set("Ready")
             except urllib.error.URLError as exc:
                 append_line("err", str(exc))
@@ -2030,6 +2737,8 @@ class TranscriptPlayer:
 
         popup.bind("<Escape>", lambda _e: popup.destroy())
         popup.bind("<Return>", send_prompt)
+        entry.bind("<Return>", send_prompt)
+        entry.bind("<KP_Enter>", send_prompt)
         entry.focus_set()
         _tick_status()
 
@@ -2046,7 +2755,7 @@ class TranscriptPlayer:
         value_var = tk.StringVar(value="")
         entry = ttk.Entry(popup, textvariable=value_var, style="Filter.TEntry")
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
-        status_var = tk.StringVar(value="Enter time as seconds or HH:MM:SS")
+        status_var = tk.StringVar(value="Type digits only: 2=SS, 3-4=MMSS, 5+=HHMMSS")
         tk.Label(
             popup,
             textvariable=status_var,
@@ -2056,6 +2765,36 @@ class TranscriptPlayer:
             padx=8,
             pady=6,
         ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        fmt_guard = {"active": False}
+
+        def format_compact_time(raw: str) -> str:
+            digits = re.sub(r"\D", "", str(raw or ""))
+            if not digits:
+                return ""
+            if len(digits) <= 2:
+                sec = digits.zfill(2)
+                return f"00:00:{sec}"
+            if len(digits) <= 4:
+                mm = digits[:-2].zfill(2)
+                ss = digits[-2:]
+                return f"00:{mm}:{ss}"
+            hh_raw = digits[:-4]
+            hh = hh_raw if len(hh_raw) >= 2 else hh_raw.zfill(2)
+            mm = digits[-4:-2]
+            ss = digits[-2:]
+            return f"{hh}:{mm}:{ss}"
+
+        def on_time_change(*_args: object) -> None:
+            if fmt_guard["active"]:
+                return
+            formatted = format_compact_time(value_var.get())
+            if formatted == value_var.get():
+                return
+            fmt_guard["active"] = True
+            value_var.set(formatted)
+            entry.icursor(tk.END)
+            fmt_guard["active"] = False
 
         def parse_time(raw: str) -> float | None:
             token = raw.strip()
@@ -2089,6 +2828,8 @@ class TranscriptPlayer:
 
         popup.bind("<Return>", apply_goto)
         entry.bind("<Return>", apply_goto)
+        entry.bind("<KP_Enter>", apply_goto)
+        value_var.trace_add("write", on_time_change)
         popup.bind("<Escape>", lambda _e: popup.destroy())
         entry.focus_set()
 
@@ -3123,8 +3864,14 @@ class TranscriptPlayer:
         limit_entry = ttk.Entry(popup, textvariable=limit_var, style="Filter.TEntry")
         limit_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
+        body = tk.Frame(popup, bg="#111111")
+        body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+
         listbox = tk.Listbox(
-            popup,
+            body,
             bg="#000000",
             fg="#ffffff",
             selectbackground="#161616",
@@ -3135,7 +3882,69 @@ class TranscriptPlayer:
             font=(FONT["STYLE"], FONT["SIZE"] - 2),
             exportselection=False,
         )
-        listbox.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        listbox.grid(row=0, column=0, sticky="nsew")
+
+        preview_frame = tk.Frame(
+            body,
+            bg="#000000",
+            highlightthickness=1,
+            highlightbackground="#2b2b2b",
+            bd=0,
+        )
+        preview_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        preview_frame.rowconfigure(0, weight=3)
+        preview_frame.rowconfigure(1, weight=0)
+        preview_frame.rowconfigure(2, weight=0)
+        preview_frame.rowconfigure(3, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
+
+        preview_image_lbl = tk.Label(
+            preview_frame,
+            bg="#000000",
+            fg="#8f8f8f",
+            text="Preview loading...",
+            anchor="center",
+            justify="center",
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+        )
+        preview_image_lbl.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+        preview_title_var = tk.StringVar(value="")
+        preview_creator_var = tk.StringVar(value="")
+        preview_tags_var = tk.StringVar(value="")
+        preview_title_lbl = tk.Label(
+            preview_frame,
+            textvariable=preview_title_var,
+            anchor="w",
+            justify="left",
+            bg="#000000",
+            fg="#ffffff",
+            font=(FONT["STYLE"], FONT["SIZE"] - 2, "bold"),
+            wraplength=320,
+        )
+        preview_title_lbl.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        preview_creator_lbl = tk.Label(
+            preview_frame,
+            textvariable=preview_creator_var,
+            anchor="w",
+            justify="left",
+            bg="#000000",
+            fg="#b8b8b8",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            wraplength=320,
+        )
+        preview_creator_lbl.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
+        preview_tags_lbl = tk.Label(
+            preview_frame,
+            textvariable=preview_tags_var,
+            anchor="nw",
+            justify="left",
+            bg="#000000",
+            fg="#7cdfff",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            wraplength=320,
+        )
+        preview_tags_lbl.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        preview_photo: dict[str, Any] = {"image": None}
 
         status_var = tk.StringVar(
             value=(
@@ -3157,6 +3966,81 @@ class TranscriptPlayer:
 
         all_rows: list[dict[str, Any]] = []
         filtered_positions: list[int] = []
+        preview_seq: dict[str, int] = {"value": 0}
+
+        def _set_preview_placeholders(title: str = "", creator: str = "", tags: str = "") -> None:
+            preview_title_var.set(title)
+            preview_creator_var.set(creator)
+            preview_tags_var.set(tags)
+            preview_photo["image"] = None
+            preview_image_lbl.configure(image="", text="No preview")
+
+        def _render_preview_row(row: dict[str, Any], preview: dict[str, Any], expected_seq: int) -> None:
+            video_id = str(row.get("video_id") or "")
+            if not popup.winfo_exists() or expected_seq != preview_seq["value"]:
+                return
+            if expected_seq != preview_seq["value"] or not popup.winfo_exists():
+                return
+            preview_title_var.set(str(preview.get("title") or "untitled"))
+            preview_creator_var.set(f"creator: {preview.get('creator') or 'unknown'}")
+            tags = list(preview.get("hashtags") or [])
+            preview_tags_var.set(" ".join(str(t) for t in tags) if tags else "(no hashtags)")
+            image_path = str(preview.get("image_path") or "").strip()
+            if image_path and Image is not None and ImageTk is not None:
+                try:
+                    with Image.open(image_path) as img:
+                        img = img.convert("RGB")
+                        img.thumbnail((420, 236))
+                        photo = ImageTk.PhotoImage(img)
+                    preview_photo["image"] = photo
+                    preview_image_lbl.configure(image=photo, text="")
+                except Exception:
+                    preview_photo["image"] = None
+                    preview_image_lbl.configure(image="", text="Preview unavailable")
+            elif image_path:
+                try:
+                    photo = tk.PhotoImage(file=image_path)
+                    preview_photo["image"] = photo
+                    preview_image_lbl.configure(image=photo, text="")
+                except Exception:
+                    preview_photo["image"] = None
+                    preview_image_lbl.configure(image="", text="Preview unavailable")
+            else:
+                preview_photo["image"] = None
+                preview_image_lbl.configure(image="", text="Preview unavailable")
+
+        def _refresh_preview_async() -> None:
+            sel = listbox.curselection()
+            if not sel or not filtered_positions:
+                _set_preview_placeholders()
+                return
+            shown_idx = int(sel[0])
+            if shown_idx < 0 or shown_idx >= len(filtered_positions):
+                _set_preview_placeholders()
+                return
+            row = dict(all_rows[filtered_positions[shown_idx]])
+            video_id = str(row.get("video_id") or "").strip()
+            preview_title_var.set(str(row.get("title") or video_id or "untitled"))
+            preview_creator_var.set(f"creator: {row.get('uploader') or row.get('channel') or 'unknown'}")
+            preview_tags_var.set("loading metadata...")
+            preview_image_lbl.configure(image="", text="Loading preview...")
+            preview_seq["value"] += 1
+            seq = int(preview_seq["value"])
+
+            def _work() -> None:
+                try:
+                    preview = self._get_browse_preview(row)
+                except Exception as exc:
+                    preview = {
+                        "title": str(row.get("title") or video_id or "untitled"),
+                        "creator": str(row.get("uploader") or row.get("channel") or "unknown"),
+                        "hashtags": [],
+                        "image_path": "",
+                        "error": str(exc),
+                    }
+                self.root.after(0, lambda: _render_preview_row(row, preview, seq))
+
+            threading.Thread(target=_work, daemon=True, name="alog-browse-preview").start()
 
         def _apply_filter(*_args: object) -> str:
             query = filter_var.get().strip().lower()
@@ -3164,7 +4048,8 @@ class TranscriptPlayer:
             listbox.delete(0, tk.END)
             for idx, row in enumerate(all_rows):
                 title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
-                hay = f"{title} {row.get('video_id') or ''}".lower()
+                creator = str(row.get("uploader") or row.get("channel") or "")
+                hay = f"{title} {creator} {row.get('video_id') or ''}".lower()
                 if query and query not in hay:
                     continue
                 filtered_positions.append(idx)
@@ -3173,6 +4058,9 @@ class TranscriptPlayer:
                 listbox.selection_set(0)
                 listbox.activate(0)
                 listbox.see(0)
+                _refresh_preview_async()
+            else:
+                _set_preview_placeholders()
             status_var.set(
                 f"Channel: {channel_ref} | {len(filtered_positions)}/{len(all_rows)} videos shown | "
                 "Enter queues selected"
@@ -3191,6 +4079,19 @@ class TranscriptPlayer:
                 all_rows.extend(dict(row) for row in (data.get("entries") or []))
                 self._channel_results = list(all_rows)
                 _apply_filter()
+                def _prefetch_all(rows_snapshot: list[dict[str, Any]]) -> None:
+                    for r in rows_snapshot:
+                        if not popup.winfo_exists():
+                            return
+                        try:
+                            self._get_browse_preview(dict(r))
+                        except Exception:
+                            continue
+                threading.Thread(
+                    target=lambda rows_snapshot=list(all_rows): _prefetch_all(rows_snapshot),
+                    daemon=True,
+                    name="alog-browse-prefetch",
+                ).start()
                 if all_rows:
                     listbox.focus_set()
             except Exception as exc:
@@ -3251,6 +4152,7 @@ class TranscriptPlayer:
             listbox.selection_set(nxt)
             listbox.activate(nxt)
             listbox.see(nxt)
+            _refresh_preview_async()
             return "break"
 
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
@@ -3270,6 +4172,7 @@ class TranscriptPlayer:
         )
         listbox.bind("<Return>", enqueue_selected)
         listbox.bind("<Double-Button-1>", enqueue_selected)
+        listbox.bind("<<ListboxSelect>>", lambda _e: _refresh_preview_async())
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
         filter_var.trace_add("write", _apply_filter)
         refresh_channel_videos()
@@ -3608,6 +4511,33 @@ class TranscriptPlayer:
         )
         status_lbl.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
 
+        agent_head = tk.Label(
+            popup,
+            text="Agent Activity",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=4,
+        )
+        agent_head.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 2))
+        agent_text = tk.Text(
+            popup,
+            bg="#000000",
+            fg="#d2d2d2",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            wrap="word",
+            height=8,
+            padx=8,
+            pady=8,
+        )
+        agent_text.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        agent_text.configure(state="disabled")
+        self._jobs_agent_text = agent_text
+
         def run_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
             sel = cmd_list.curselection()
             if not sel:
@@ -3651,6 +4581,7 @@ class TranscriptPlayer:
         self._jobs_done_list = None
         self._jobs_dl_text = None
         self._jobs_tr_text = None
+        self._jobs_agent_text = None
         self.filter_entry.focus_set()
 
     def _refresh_jobs_popup(self) -> None:
@@ -3742,12 +4673,34 @@ class TranscriptPlayer:
                         tag = "hat"
                     self._jobs_tr_text.insert(tk.END, line + "\n", (() if tag is None else (tag,)))
                 self._jobs_tr_text.configure(state="disabled")
+            if self._jobs_agent_text and self._jobs_agent_text.winfo_exists():
+                self._jobs_agent_text.configure(state="normal")
+                self._jobs_agent_text.delete("1.0", tk.END)
+                self._jobs_agent_text.tag_configure("act", foreground="#7fd7ff")
+                self._jobs_agent_text.tag_configure("err", foreground="#ff8a8a")
+                self._jobs_agent_text.tag_configure("summary", foreground="#f7d154")
+                self._jobs_agent_text.tag_configure("info", foreground="#b0b0b0")
+                for row in self._agent_activity[-80:]:
+                    kind = str(row.get("kind") or "info")
+                    msg = str(row.get("message") or "")
+                    stamp = str(row.get("time") or "00:00:00")
+                    self._jobs_agent_text.insert(
+                        tk.END,
+                        f"[{stamp}] {kind}: {msg}\n",
+                        (kind if kind in {"act", "err", "summary", "info"} else "info",),
+                    )
+                self._jobs_agent_text.configure(state="disabled")
         except Exception as exc:
             if self._jobs_dl_text and self._jobs_dl_text.winfo_exists():
                 self._jobs_dl_text.configure(state="normal")
                 self._jobs_dl_text.delete("1.0", tk.END)
                 self._jobs_dl_text.insert("1.0", f"Failed to load ingest jobs: {exc}")
                 self._jobs_dl_text.configure(state="disabled")
+            if self._jobs_agent_text and self._jobs_agent_text.winfo_exists():
+                self._jobs_agent_text.configure(state="normal")
+                self._jobs_agent_text.delete("1.0", tk.END)
+                self._jobs_agent_text.insert("1.0", f"Agent pane refresh failed: {exc}")
+                self._jobs_agent_text.configure(state="disabled")
         self._jobs_after_id = self.root.after(1000, self._refresh_jobs_popup)
 
     def _find_audio_sidecar(self, video_id: str, video_path: Path) -> Path | None:

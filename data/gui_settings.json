@@ -15,7 +15,7 @@
   "theme_fg": "#ffffff",
   "theme_muted_fg": "#8f8f8f",
   "theme_accent_fg": "#ffff00",
-  "font_family": "DejaVu Sans Mono",
+  "font_family": "Blexmono Nerd Font",
   "font_size": 12,
   "keybinds": {
     "open_command": "Ctrl+P",

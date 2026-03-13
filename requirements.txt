@@ -1,3 +1,4 @@
 yt-dlp>=2025.1.15
 openai-whisper>=20240930
 python-vlc>=3.0.21203
+Pillow>=10.0.0

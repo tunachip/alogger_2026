@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -67,6 +69,9 @@ class IngesterService:
             "existing_video": existing_video,
             "existing_done_job": existing_done,
         }
+
+    def fetch_url_metadata(self, url: str) -> dict[str, object]:
+        return fetch_video_metadata(self.config, url)
 
     def enqueue_with_dedupe(
         self,
@@ -369,6 +374,65 @@ class IngesterService:
             payload["match_count"] = title.lower().count(needle) if needle else 1
             out.append(payload)
         return out
+
+    def search_video_metadata(self, query_text: str, *, limit: int = 200) -> list[dict[str, object]]:
+        needle = query_text.strip().lower()
+        rows = [dict(r) for r in self.db.search_videos_by_metadata(needle, limit=limit)]
+        if rows or not needle:
+            return rows
+
+        # Fuzzy fallback for misspellings (e.g., "syvlan" vs "sylvanfranklin").
+        candidates = [dict(r) for r in self.db.list_playable_videos(limit=max(300, limit * 3))]
+        stop = {
+            "play", "a", "an", "the", "video", "videos", "open", "show", "watch",
+            "by", "from", "please", "for", "me", "latest", "recent",
+        }
+        query_terms = [t for t in re.split(r"[^a-z0-9]+", needle) if t and t not in stop]
+        if not query_terms:
+            query_terms = [needle]
+
+        def score_row(row: dict[str, object]) -> float:
+            fields = [
+                str(row.get("title") or ""),
+                str(row.get("channel") or ""),
+                str(row.get("uploader_id") or ""),
+                str(row.get("video_id") or ""),
+                str(row.get("source_url") or ""),
+                str(row.get("webpage_url") or ""),
+            ]
+            if not fields:
+                return 0.0
+            term_scores: list[float] = []
+            for field in fields:
+                f = field.lower().strip()
+                if not f:
+                    continue
+                field_tokens = [tok for tok in re.split(r"[^a-z0-9]+", f) if tok]
+                for q in query_terms:
+                    best_q = 0.0
+                    if q in f:
+                        best_q = 1.0
+                    else:
+                        best_q = max(best_q, difflib.SequenceMatcher(None, q, f).ratio())
+                        for tok in field_tokens:
+                            # Prefix/suffix containment catches single missing-char names well.
+                            if q in tok or tok in q:
+                                best_q = max(best_q, 0.92)
+                            best_q = max(best_q, difflib.SequenceMatcher(None, q, tok).ratio())
+                    term_scores.append(best_q)
+            if not term_scores:
+                return 0.0
+            # Use mean of top query-term matches so one strong creator match can win.
+            term_scores.sort(reverse=True)
+            return sum(term_scores[: max(1, min(len(query_terms), 3))]) / float(max(1, min(len(query_terms), 3)))
+
+        scored: list[tuple[float, dict[str, object]]] = []
+        for row in candidates:
+            s = score_row(row)
+            if s >= 0.36:
+                scored.append((s, row))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [row for _s, row in scored[:limit]]
 
     def jobs_summary(self, limit: int = 25) -> dict[str, object]:
         return self.db.list_jobs_summary(limit=limit)

@@ -690,6 +690,92 @@ class DB:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def search_videos_by_metadata(self, query_text: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        needle = query_text.strip().lower()
+        where_clause = ""
+        params: list[Any] = []
+        if needle:
+            where_clause = """
+            WHERE
+                LOWER(COALESCE(v.title, '')) LIKE ?
+                OR LOWER(COALESCE(v.channel, '')) LIKE ?
+                OR LOWER(COALESCE(v.uploader_id, '')) LIKE ?
+                OR LOWER(COALESCE(v.video_id, '')) LIKE ?
+                OR LOWER(COALESCE(v.source_url, '')) LIKE ?
+                OR LOWER(COALESCE(v.webpage_url, '')) LIKE ?
+                OR LOWER(COALESCE(v.metadata_json, '')) LIKE ?
+            """
+            like = f"%{needle}%"
+            params.extend([like, like, like, like, like, like, like])
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH latest_playable AS (
+                    SELECT video_id, MAX(id) AS max_id
+                    FROM ingest_jobs
+                    WHERE
+                      video_id IS NOT NULL
+                      AND local_video_path IS NOT NULL
+                      AND status IN ('transcribing', 'done')
+                    GROUP BY video_id
+                )
+                SELECT
+                    v.video_id,
+                    COALESCE(v.title, v.video_id) AS title,
+                    v.channel,
+                    v.uploader_id,
+                    v.source_url,
+                    v.webpage_url,
+                    j.local_video_path,
+                    j.transcript_json_path
+                FROM videos v
+                JOIN latest_playable ld
+                  ON ld.video_id = v.video_id
+                JOIN ingest_jobs j
+                  ON j.id = ld.max_id
+                {where_clause}
+                ORDER BY LOWER(COALESCE(v.title, v.video_id)) ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_playable_videos(self, *, limit: int = 300) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                WITH latest_playable AS (
+                    SELECT video_id, MAX(id) AS max_id
+                    FROM ingest_jobs
+                    WHERE
+                      video_id IS NOT NULL
+                      AND local_video_path IS NOT NULL
+                      AND status IN ('transcribing', 'done')
+                    GROUP BY video_id
+                )
+                SELECT
+                    v.video_id,
+                    COALESCE(v.title, v.video_id) AS title,
+                    v.channel,
+                    v.uploader_id,
+                    v.source_url,
+                    v.webpage_url,
+                    j.local_video_path,
+                    j.transcript_json_path
+                FROM videos v
+                JOIN latest_playable ld
+                  ON ld.video_id = v.video_id
+                JOIN ingest_jobs j
+                  ON j.id = ld.max_id
+                ORDER BY j.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_jobs_summary(self, limit: int = 25) -> dict[str, Any]:
         return {
             "counts": self.get_dashboard_snapshot()["counts"],
