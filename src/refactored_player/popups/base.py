@@ -6,7 +6,7 @@ from typing import Callable
 
 import vlc
 
-from ..constants import FONT, POPUP_ATTRS
+from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_ATTRS, THEME
 from ..models import OverlayPanel
 
 
@@ -289,7 +289,7 @@ class PopupBaseMixin:
     def _apply_popup_style(self, popup: tk.Toplevel, title: str, size: str) -> None:
         popup.title(title)
         popup.geometry(size)
-        popup.configure(bg="#111111")
+        popup.configure(bg=THEME["APP_BG"])
         popup.lift()
         popup.focus_set()
         self._apply_font_scale_tree(popup)
@@ -359,9 +359,9 @@ class PopupBaseMixin:
         self,
         parent: tk.Misc,
         *,
-        fg: str = "#ffffff",
+        fg: str = THEME["FG"],
         select_fg: str | None = None,
-        font_delta: int = -2,
+        font_delta: int = FONT_SIZE_OFFSETS["BODY"],
         bold: bool = False,
         width: int | None = None,
         takefocus: int = 1,
@@ -373,9 +373,9 @@ class PopupBaseMixin:
             font_spec = (FONT["STYLE"], FONT["SIZE"] + font_delta)
         return tk.Listbox(
             parent,
-            bg="#000000",
+            bg=THEME["PANEL_BG"],
             fg=fg,
-            selectbackground="#161616",
+            selectbackground=THEME["SELECT_BG"],
             selectforeground=select_fg or fg,
             activestyle="none",
             borderwidth=0,
@@ -391,22 +391,21 @@ class PopupBaseMixin:
         parent: tk.Misc,
         status_var: tk.StringVar,
         *,
-        fg: str = "#8f8f8f",
-        font_delta: int = -2,
+        fg: str = THEME["FG_MUTED"],
+        font_delta: int = FONT_SIZE_OFFSETS["BODY"],
         padx: int = 8,
         pady: int = 6,
     ) -> tk.Label:
-        label = tk.Label(
+        return tk.Label(
             parent,
             textvariable=status_var,
             anchor="w",
-            bg="#0d0d0d",
+            bg=THEME["SURFACE_BG"],
             fg=fg,
             font=(FONT["STYLE"], FONT["SIZE"] + font_delta),
             padx=padx,
             pady=pady,
         )
-        return label
 
     def _set_listbox_selection(
         self,

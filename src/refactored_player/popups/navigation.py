@@ -4,7 +4,7 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
-from ..constants import FONT
+from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
 from ..utils import format_hms as _fmt_hms
 
 
@@ -13,7 +13,7 @@ class NavigationPopupMixin:
         popup = self._create_popup_window(
             name="goto",
             title="Goto Timestamp",
-            size="420x160",
+            size=POPUP_SIZES["GOTO"],
             attr_name="_goto_popup",
             reuse_existing=True,
             column_weights={0: 1},
@@ -105,7 +105,7 @@ class NavigationPopupMixin:
         popup = self._create_popup_window(
             name="skim",
             title="Skim Settings",
-            size="520x190",
+            size=POPUP_SIZES["SKIM"],
             column_weights={0: 1},
         )
         if popup is None:
@@ -129,9 +129,9 @@ class NavigationPopupMixin:
             popup,
             text="Line1=pre-buffer ms | Line2=post-buffer ms | Enter apply | Ctrl-J toggle skim",
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
             padx=8,
             pady=6,
         )

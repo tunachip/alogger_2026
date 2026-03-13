@@ -4,6 +4,8 @@ import tkinter as tk
 from dataclasses import dataclass
 from typing import Callable
 
+from .constants import LAYOUT, POPUP_SIZES, THEME
+
 
 @dataclass(slots=True)
 class SegmentRow:
@@ -18,9 +20,9 @@ class OverlayPanel(tk.Frame):
     def __init__(self, root: tk.Tk) -> None:
         super().__init__(
             root,
-            bg="#111111",
+            bg=THEME["APP_BG"],
             highlightthickness=1,
-            highlightbackground="#2b2b2b",
+            highlightbackground=THEME["BORDER"],
             bd=0,
         )
         self._wm_delete_cb: Callable[[], None] | None = None
@@ -29,13 +31,13 @@ class OverlayPanel(tk.Frame):
         return
 
     def geometry(self, size: str) -> None:
-        width = 900
-        height = 620
+        width = int(POPUP_SIZES["DEFAULT"].split("x", 1)[0])
+        height = int(POPUP_SIZES["DEFAULT"].split("x", 1)[1])
         try:
             token = size.lower().split("+", 1)[0]
             width_token, height_token = token.split("x", 1)
-            width = max(320, int(width_token))
-            height = max(180, int(height_token))
+            width = max(LAYOUT["POPUP_MIN_WIDTH"], int(width_token))
+            height = max(LAYOUT["POPUP_MIN_HEIGHT"], int(height_token))
         except Exception:
             pass
         self.place(relx=0.5, rely=0.5, anchor="center", width=width, height=height)

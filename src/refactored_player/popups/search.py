@@ -7,15 +7,15 @@ from typing import Any
 
 from alog.pipeline import resolve_playback_media_path
 
-from ..constants import FONT
+from ..constants import FONT, FONT_SIZE_OFFSETS, LISTBOX, POPUP_SIZES, THEME
 
 
 class SearchPopupMixin:
     def _open_search_popup(self) -> None:
         popup = self._create_popup_window(
-            name="finder",
-            title="Search DB",
-            size="900x620",
+                    name="finder",
+                    title="Search DB",
+                    size=POPUP_SIZES["DEFAULT"],
             attr_name="_search_popup",
             reuse_existing=True,
             row_weights={2: 1},
@@ -33,24 +33,24 @@ class SearchPopupMixin:
             popup,
             text="Matches  Title (matches = number of matching caption segments)",
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=4,
         )
         header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
 
-        body = tk.Frame(popup, bg="#111111")
+        body = tk.Frame(popup, bg=THEME["APP_BG"])
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
         count_list = self._create_listbox(
             body,
-            fg="#f7d154",
-            select_fg="#f7d154",
-            width=8,
+            fg=THEME["FG_ACCENT"],
+            select_fg=THEME["FG_ACCENT"],
+            width=LISTBOX["COUNT_WIDTH"],
             bold=True,
             takefocus=0,
         )
@@ -62,9 +62,9 @@ class SearchPopupMixin:
             popup,
             text="Type query, Up/Down select, Enter open video, Esc close",
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )
@@ -168,9 +168,9 @@ class SearchPopupMixin:
 
     def _open_video_picker_popup(self) -> None:
         popup = self._create_popup_window(
-            name="open_video",
-            title="Open Video",
-            size="900x620",
+                    name="open_video",
+                    title="Open Video",
+                    size=POPUP_SIZES["DEFAULT"],
             attr_name="_video_picker_popup",
             reuse_existing=True,
             row_weights={2: 1},
@@ -188,24 +188,24 @@ class SearchPopupMixin:
             popup,
             text="Matches  Title (matches = number of title matches)",
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=4,
         )
         header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
 
-        body = tk.Frame(popup, bg="#111111")
+        body = tk.Frame(popup, bg=THEME["APP_BG"])
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
         count_list = self._create_listbox(
             body,
-            fg="#f7d154",
-            select_fg="#f7d154",
-            width=8,
+            fg=THEME["FG_ACCENT"],
+            select_fg=THEME["FG_ACCENT"],
+            width=LISTBOX["COUNT_WIDTH"],
             bold=True,
             takefocus=0,
         )
@@ -217,9 +217,9 @@ class SearchPopupMixin:
             popup,
             text="Type title filter, Up/Down select, Enter open, Delete remove video+transcript, Esc close",
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )
@@ -228,7 +228,7 @@ class SearchPopupMixin:
         status_lbl = self._create_status_label(
             popup,
             status_var,
-            fg="#d2d2d2",
+            fg=THEME["FG_SOFT"],
             font_delta=-3,
         )
         status_lbl.grid(row=4, column=0, sticky="ew")

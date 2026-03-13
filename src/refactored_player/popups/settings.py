@@ -4,20 +4,19 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any
 
-from ..constants import DEFAULT_KEYBINDS, FONT
-from ..models import OverlayPanel
-
-
+from ..constants import DEFAULT_KEYBINDS, FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
 class SettingsPopupMixin:
     def _open_settings_popup(self) -> None:
-        popup = OverlayPanel(self.root)
-        self._apply_popup_style(popup, "Settings", "980x700")
-        self._settings_popup = popup
-        self._register_popup("settings", popup)
-        popup.rowconfigure(0, weight=1)
-        popup.rowconfigure(1, weight=0)
-        popup.rowconfigure(2, weight=0)
-        popup.columnconfigure(0, weight=1)
+        popup = self._create_popup_window(
+            name="settings",
+            title="Settings",
+            size=POPUP_SIZES["SETTINGS"],
+            attr_name="_settings_popup",
+            row_weights={0: 1, 1: 0, 2: 0},
+            column_weights={0: 1},
+        )
+        if popup is None:
+            return
 
         tabs = ttk.Notebook(popup, style="Terminal.TNotebook")
         tabs.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
@@ -27,7 +26,7 @@ class SettingsPopupMixin:
         key_lists: list[tk.Listbox] = []
         val_lists: list[tk.Listbox] = []
         for name in tab_names:
-            frame = tk.Frame(tabs, bg="#111111")
+            frame = tk.Frame(tabs, bg=THEME["APP_BG"])
             frame.rowconfigure(1, weight=1)
             frame.columnconfigure(0, weight=1)
             frame.columnconfigure(1, weight=1)
@@ -38,9 +37,9 @@ class SettingsPopupMixin:
                 frame,
                 text="Key",
                 anchor="w",
-                bg="#0d0d0d",
-                fg="#8f8f8f",
-                font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                bg=THEME["SURFACE_BG"],
+                fg=THEME["FG_MUTED"],
+                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
                 padx=8,
                 pady=4,
             ).grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(8, 4))
@@ -48,36 +47,36 @@ class SettingsPopupMixin:
                 frame,
                 text="Value",
                 anchor="w",
-                bg="#0d0d0d",
-                fg="#8f8f8f",
-                font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                bg=THEME["SURFACE_BG"],
+                fg=THEME["FG_MUTED"],
+                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
                 padx=8,
                 pady=4,
             ).grid(row=0, column=1, sticky="ew", padx=(4, 8), pady=(8, 4))
 
             k_list = tk.Listbox(
                 frame,
-                bg="#000000",
-                fg="#d2d2d2",
-                selectbackground="#161616",
-                selectforeground="#ffffff",
+                bg=THEME["PANEL_BG"],
+                fg=THEME["FG_SOFT"],
+                selectbackground=THEME["SELECT_BG"],
+                selectforeground=THEME["FG"],
                 activestyle="none",
                 borderwidth=0,
                 highlightthickness=0,
                 exportselection=False,
-                font=(FONT["STYLE"], FONT["SIZE"] - 2),
+                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
             )
             v_list = tk.Listbox(
                 frame,
-                bg="#000000",
-                fg="#ffffff",
-                selectbackground="#161616",
-                selectforeground="#ffffff",
+                bg=THEME["PANEL_BG"],
+                fg=THEME["FG"],
+                selectbackground=THEME["SELECT_BG"],
+                selectforeground=THEME["FG"],
                 activestyle="none",
                 borderwidth=0,
                 highlightthickness=0,
                 exportselection=False,
-                font=(FONT["STYLE"], FONT["SIZE"] - 2),
+                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
             )
             k_list.grid(row=1, column=0, sticky="nsew",
                         padx=(8, 4), pady=(0, 8))
@@ -98,9 +97,9 @@ class SettingsPopupMixin:
             popup,
             textvariable=status_var,
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         ).grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
@@ -190,7 +189,7 @@ class SettingsPopupMixin:
                         "key": "App Background",
                         "value": str(
                             self._ai_settings.get("theme_bg")
-                            or "#111111"
+                            or THEME["APP_BG"]
                         )
                     },
                     {
@@ -198,7 +197,7 @@ class SettingsPopupMixin:
                         "key": "Panel Background",
                         "value": str(
                             self._ai_settings.get("theme_panel_bg")
-                            or "#000000"
+                            or THEME["PANEL_BG"]
                         )
                     },
                     {
@@ -206,7 +205,7 @@ class SettingsPopupMixin:
                         "key": "Primary Text",
                         "value": str(
                             self._ai_settings.get("theme_fg")
-                            or "#ffffff"
+                            or THEME["FG"]
                         )
                     },
                     {
@@ -214,7 +213,7 @@ class SettingsPopupMixin:
                         "key": "Muted Text",
                         "value": str(
                             self._ai_settings.get("theme_muted_fg")
-                            or "#8f8f8f"
+                            or THEME["FG_MUTED"]
                         )
                     },
                     {
@@ -222,7 +221,7 @@ class SettingsPopupMixin:
                         "key": "Accent Text",
                         "value": str(
                             self._ai_settings.get("theme_accent_fg")
-                            or "#f7d154"
+                            or THEME["FG_ACCENT"]
                         )
                     },
                     {

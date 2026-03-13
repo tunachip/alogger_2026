@@ -4,8 +4,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from ..constants import FONT
-from ..models import OverlayPanel
+from ..constants import FONT, FONT_SIZE_OFFSETS, LISTBOX, POPUP_SIZES, THEME
 from ..utils import format_hms as _fmt_hms
 
 
@@ -82,7 +81,7 @@ class JobsPopupMixin:
         if label == "poll subscriptions":
             try:
                 summary = self.ingester.poll_subscriptions_once()
-                scanned = summary.get('snanned', 0)
+                scanned = summary.get("scanned", 0)
                 queued = summary.get('queued', 0)
                 return f"Poll: scanned={scanned} queued={queued}"
             except Exception as exc:
@@ -150,15 +149,18 @@ class JobsPopupMixin:
         )
 
     def _open_jobs_popup(self) -> None:
-        popup = OverlayPanel(self.root)
-        self._apply_popup_style(popup, "Workers", "1320x620")
-        self._jobs_popup = popup
-        self._register_popup("workers", popup)
-        popup.rowconfigure(0, weight=1)
-        popup.rowconfigure(1, weight=0)
-        popup.columnconfigure(0, weight=1)
+        popup = self._create_popup_window(
+            name="workers",
+            title="Workers",
+            size=POPUP_SIZES["WORKERS"],
+            attr_name="_jobs_popup",
+            row_weights={0: 1, 1: 0},
+            column_weights={0: 1},
+        )
+        if popup is None:
+            return
 
-        visual = tk.Frame(popup, bg="#111111")
+        visual = tk.Frame(popup, bg=THEME["APP_BG"])
         visual.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
         # Prioritize queue/finished readability over worker stack columns.
         for col, wt in enumerate((5, 2, 2, 5)):
@@ -172,9 +174,9 @@ class JobsPopupMixin:
                 visual,
                 text=text,
                 anchor="w",
-                bg="#0d0d0d",
-                fg="#8f8f8f",
-                font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                bg=THEME["SURFACE_BG"],
+                fg=THEME["FG_MUTED"],
+                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
                 padx=8,
                 pady=4,
             ).grid(
@@ -190,17 +192,9 @@ class JobsPopupMixin:
         head(2, "Transcribers")
         head(3, "Finished")
 
-        queue_list = tk.Listbox(
+        queue_list = self._create_listbox(
             visual,
-            bg="#000000",
-            fg="#ffffff",
-            selectbackground="#161616",
-            selectforeground="#ffffff",
-            activestyle="none",
-            borderwidth=0,
-            highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
-            exportselection=False,
+            font_delta=FONT_SIZE_OFFSETS["SMALL"],
         )
         queue_list.grid(
             row=1,
@@ -213,11 +207,11 @@ class JobsPopupMixin:
 
         dl_text = tk.Text(
             visual,
-            bg="#000000",
-            fg="#ffffff",
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG"],
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             wrap="none",
             padx=8,
             pady=8,
@@ -234,11 +228,11 @@ class JobsPopupMixin:
 
         tr_text = tk.Text(
             visual,
-            bg="#000000",
-            fg="#ffffff",
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG"],
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             wrap="none",
             padx=8,
             pady=8,
@@ -253,17 +247,11 @@ class JobsPopupMixin:
         tr_text.configure(state="disabled")
         self._jobs_tr_text = tr_text
 
-        done_list = tk.Listbox(
+        done_list = self._create_listbox(
             visual,
-            bg="#000000",
-            fg="#d2d2d2",
-            selectbackground="#161616",
-            selectforeground="#ffffff",
-            activestyle="none",
-            borderwidth=0,
-            highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
-            exportselection=False,
+            fg=THEME["FG_SOFT"],
+            select_fg=THEME["FG"],
+            font_delta=FONT_SIZE_OFFSETS["SMALL"],
         )
         done_list.grid(
             row=1,
@@ -273,19 +261,11 @@ class JobsPopupMixin:
         )
         self._jobs_done_list = done_list
 
-        cmd_list = tk.Listbox(
+        cmd_list = self._create_listbox(
             popup,
-            bg="#000000",
-            fg="#ffffff",
-            selectbackground="#161616",
-            selectforeground="#ffffff",
-            activestyle="none",
-            borderwidth=0,
-            highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 2),
-            exportselection=False,
-            height=6,
+            font_delta=FONT_SIZE_OFFSETS["BODY"],
         )
+        cmd_list.configure(height=LISTBOX["COMMAND_HEIGHT"])
         cmd_list.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
         self._workers_cmd_list = cmd_list
         commands = [
@@ -303,15 +283,10 @@ class JobsPopupMixin:
 
         status_var = tk.StringVar(
             value="Enter executes command | Up/Down move command cursor")
-        status_lbl = tk.Label(
+        status_lbl = self._create_status_label(
             popup,
-            textvariable=status_var,
-            anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
-            padx=8,
-            pady=6,
+            status_var,
+            font_delta=FONT_SIZE_OFFSETS["SMALL"],
         )
         status_lbl.grid(
             row=2,
@@ -325,22 +300,22 @@ class JobsPopupMixin:
             popup,
             text="Agent Activity",
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=4,
         )
         agent_head.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 2))
         agent_text = tk.Text(
             popup,
-            bg="#000000",
-            fg="#d2d2d2",
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG_SOFT"],
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             wrap="word",
-            height=8,
+            height=LISTBOX["AGENT_HEIGHT"],
             padx=8,
             pady=8,
         )
@@ -373,12 +348,15 @@ class JobsPopupMixin:
             cmd_list.see(nxt)
             return "break"
 
-        popup.bind("<Escape>", lambda _e: self._close_jobs_popup())
+        self._bind_popup_close(
+            popup,
+            after_close=self._close_jobs_popup,
+            focus_filter=False,
+        )
         popup.bind("<Up>", lambda _e: move(-1))
         popup.bind("<Down>", lambda _e: move(1))
         popup.bind("<Return>", run_selected)
         cmd_list.bind("<Double-Button-1>", run_selected)
-        popup.protocol("WM_DELETE_WINDOW", self._close_jobs_popup)
         self._refresh_jobs_popup()
 
     def _close_jobs_popup(self) -> None:

@@ -4,13 +4,15 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
+from ..constants import POPUP_SIZES
+
 
 class CommandPopupMixin:
     def _open_command_popup(self) -> None:
         popup = self._create_popup_window(
             name="command",
             title="Command Menu",
-            size="720x520",
+            size=POPUP_SIZES["COMMAND"],
             attr_name="_command_popup",
             row_weights={1: 1},
             column_weights={0: 1},

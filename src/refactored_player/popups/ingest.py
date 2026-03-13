@@ -3,15 +3,15 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
-from ..constants import FONT
+from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
 
 
 class IngestPopupMixin:
     def _open_ingest_popup(self) -> None:
         popup = self._create_popup_window(
-            name="ingest",
-            title="Ingest",
-            size="900x460",
+                    name="ingest",
+                    title="Ingest",
+                    size=POPUP_SIZES["INGEST"],
             attr_name="_ingest_popup",
             row_weights={2: 1},
             column_weights={0: 1},
@@ -24,12 +24,12 @@ class IngestPopupMixin:
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
         hint = tk.Label(
-            popup,
-            text="Input + Enter on command: Ingest (URL[s]) | Browse (channel) | Subscribe (channel)",
-            anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+                    popup,
+                    text="Input + Enter on command: Ingest (URL[s]) | Browse (channel) | Subscribe (channel)",
+                    anchor="w",
+                    bg=THEME["SURFACE_BG"],
+                    fg=THEME["FG_MUTED"],
+                    font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )

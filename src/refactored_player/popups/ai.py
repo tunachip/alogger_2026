@@ -6,9 +6,10 @@ import os
 import re
 import tkinter as tk
 import urllib.request
+from tkinter import ttk
 from typing import Any
 
-from ..models import OverlayPanel
+from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
 from ..utils import format_hms as _fmt_hms
 
 
@@ -667,24 +668,28 @@ class AIPopupMixin:
         return summary
 
     def _open_ai_popup(self) -> None:
-        popup = OverlayPanel(self.root)
-        self._apply_popup_style(popup, "Agent", "980x680")
-        self._ai_popup = popup
-        self._register_popup("ai", popup)
-        popup.rowconfigure(0, weight=1)
-        popup.columnconfigure(0, weight=1)
+        popup = self._create_popup_window(
+            name="ai",
+            title="Agent",
+            size=POPUP_SIZES["AI"],
+            attr_name="_ai_popup",
+            row_weights={0: 1},
+            column_weights={0: 1},
+        )
+        if popup is None:
+            return
 
         feed = tk.Text(
             popup,
-            bg="#000000",
-            fg="#ffffff",
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG"],
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
             wrap="word",
             padx=8,
             pady=8,
-            insertbackground="#ffffff",
+            insertbackground=THEME["FG"],
         )
         feed.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
         feed.configure(state="disabled")
@@ -703,9 +708,9 @@ class AIPopupMixin:
             popup,
             textvariable=status_var,
             anchor="w",
-            bg="#0d0d0d",
-            fg="#8f8f8f",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )

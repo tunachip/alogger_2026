@@ -19,7 +19,7 @@ except Exception:
 
 from alog.pipeline import resolve_playback_media_path
 
-from ..constants import FONT
+from ..constants import FONT, FONT_SIZE_OFFSETS, LAYOUT, POPUP_SIZES, THEME
 
 
 class ChannelPopupMixin:
@@ -88,8 +88,7 @@ class ChannelPopupMixin:
             if has_image:
                 return cached
 
-        title = str(row.get("title") or row.get(
-            "video_id") or "untitled").strip()
+        title = str(row.get("title") or row.get("video_id") or "untitled").strip()
         creator = str(row.get("uploader") or row.get("channel") or "").strip()
         hashtags = self._hashtags_from_text(title)
         thumbnail_url = str(row.get("thumbnail") or "").strip()
@@ -101,13 +100,10 @@ class ChannelPopupMixin:
                 meta = dict(self.ingester.fetch_url_metadata(url))
                 meta_ok = True
                 title = str(meta.get("title") or title).strip()
-                creator = str(meta.get("uploader") or meta.get(
-                    "channel") or creator).strip()
-                thumbnail_url = str(meta.get("thumbnail")
-                                    or thumbnail_url).strip()
+                creator = str(meta.get("uploader") or meta.get("channel") or creator).strip()
+                thumbnail_url = str(meta.get("thumbnail") or thumbnail_url).strip()
                 if not hashtags:
-                    hashtags = self._hashtags_from_text(
-                        str(meta.get("description") or ""))
+                    hashtags = self._hashtags_from_text(str(meta.get("description") or ""))
                 if not hashtags:
                     raw_tags = meta.get("tags") or []
                     if isinstance(raw_tags, list):
@@ -127,8 +123,7 @@ class ChannelPopupMixin:
         if not thumbnail_url and video_id:
             thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/default.jpg"
 
-        image_path = self._download_browse_thumbnail(
-            video_id, thumbnail_url) if video_id else None
+        image_path = self._download_browse_thumbnail(video_id, thumbnail_url) if video_id else None
         preview = {
             "video_id": video_id,
             "title": title or "untitled",
@@ -173,9 +168,9 @@ class ChannelPopupMixin:
 
     def _open_channel_popup(self) -> None:
         popup = self._create_popup_window(
-            name="channel",
-            title="Channel Browser",
-            size="980x680",
+                    name="channel",
+                    title="Channel Browser",
+                    size=POPUP_SIZES["CHANNEL"],
             attr_name="_channel_popup",
             reuse_existing=True,
             row_weights={2: 1},
@@ -201,7 +196,7 @@ class ChannelPopupMixin:
             popup, textvariable=limit_var, style="Filter.TEntry")
         limit_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
-        body = tk.Frame(popup, bg="#111111")
+        body = tk.Frame(popup, bg=THEME["APP_BG"])
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=2, minsize=360)
@@ -210,12 +205,12 @@ class ChannelPopupMixin:
 
         preview_frame = tk.Frame(
             body,
-            bg="#000000",
+            bg=THEME["PANEL_BG"],
             highlightthickness=1,
-            highlightbackground="#2b2b2b",
+            highlightbackground=THEME["BORDER"],
             bd=0,
-            width=360,
-            height=520,
+            width=LAYOUT["PREVIEW_WIDTH"],
+            height=LAYOUT["PREVIEW_HEIGHT"],
         )
         preview_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         preview_frame.grid_propagate(False)
@@ -228,11 +223,11 @@ class ChannelPopupMixin:
         listbox = self._create_listbox(body)
         listbox.grid(row=0, column=1, sticky="nsew")
 
-        preview_image_width = 344
-        preview_image_height = 194
+        preview_image_width = LAYOUT["PREVIEW_IMAGE_WIDTH"]
+        preview_image_height = LAYOUT["PREVIEW_IMAGE_HEIGHT"]
         preview_image_box = tk.Frame(
             preview_frame,
-            bg="#000000",
+            bg=THEME["PANEL_BG"],
             width=preview_image_width,
             height=preview_image_height,
             highlightthickness=0,
@@ -246,12 +241,12 @@ class ChannelPopupMixin:
 
         preview_image_lbl = tk.Label(
             preview_image_box,
-            bg="#000000",
-            fg="#8f8f8f",
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG_MUTED"],
             text="Preview loading...",
             anchor="center",
             justify="center",
-            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
         )
         preview_image_lbl.grid(row=0, column=0, sticky="nsew")
         preview_title_var = tk.StringVar(value="")
@@ -262,9 +257,9 @@ class ChannelPopupMixin:
             textvariable=preview_title_var,
             anchor="w",
             justify="left",
-            bg="#000000",
-            fg="#ffffff",
-            font=(FONT["STYLE"], FONT["SIZE"] - 2, "bold"),
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
             wraplength=320,
         )
         preview_title_lbl.grid(
@@ -274,9 +269,9 @@ class ChannelPopupMixin:
             textvariable=preview_creator_var,
             anchor="w",
             justify="left",
-            bg="#000000",
-            fg="#b8b8b8",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG_SOFT"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             wraplength=320,
         )
         preview_creator_lbl.grid(
@@ -286,9 +281,9 @@ class ChannelPopupMixin:
             textvariable=preview_tags_var,
             anchor="nw",
             justify="left",
-            bg="#000000",
-            fg="#7cdfff",
-            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG_INFO"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
             wraplength=320,
         )
         preview_tags_lbl.grid(
@@ -297,8 +292,7 @@ class ChannelPopupMixin:
 
         status_var = tk.StringVar(
             value=(
-                f"Channel: {
-                    channel_ref} | Type to filter videos | Enter queues selected | "
+                f"Channel: {channel_ref} | Type to filter videos | Enter queues selected | "
                 "Ctrl-R reload | Ctrl-S subscribe"
             )
         )
@@ -384,8 +378,7 @@ class ChannelPopupMixin:
             preview_seq["value"] += 1
             seq = int(preview_seq["value"])
             cache_key = video_id or str(row.get("url") or "").strip()
-            cached_preview = self._browse_preview_cache.get(
-                cache_key) if cache_key else None
+            cached_preview = self._browse_preview_cache.get(cache_key) if cache_key else None
             if isinstance(cached_preview, dict) and str(cached_preview.get("image_path") or "").strip():
                 _render_preview_row(row, dict(cached_preview), seq)
                 return
@@ -411,9 +404,18 @@ class ChannelPopupMixin:
                              name="alog-browse-preview").start()
 
         def _apply_filter(*_args: object) -> str:
+            selected_video_id = ""
+            sel = listbox.curselection()
+            if sel and filtered_positions:
+                shown_idx = int(sel[0])
+                if 0 <= shown_idx < len(filtered_positions):
+                    selected_video_id = str(
+                        all_rows[filtered_positions[shown_idx]].get("video_id") or ""
+                    ).strip()
             query = filter_var.get().strip().lower()
             filtered_positions.clear()
             listbox.delete(0, tk.END)
+            selected_pos = -1
             for idx, row in enumerate(all_rows):
                 title = str(row.get("title") or row.get("video_id")
                             or "untitled").replace("\n", " ").strip()
@@ -423,9 +425,15 @@ class ChannelPopupMixin:
                     continue
                 filtered_positions.append(idx)
                 listbox.insert(tk.END, title)
+                row_video_id = str(row.get("video_id") or "").strip()
+                if selected_video_id and row_video_id == selected_video_id:
+                    selected_pos = len(filtered_positions) - 1
             if filtered_positions:
                 self._set_listbox_selection(
-                    [listbox], 0, len(filtered_positions))
+                    [listbox],
+                    selected_pos if selected_pos >= 0 else 0,
+                    len(filtered_positions),
+                )
                 _refresh_preview_async()
             else:
                 _set_preview_placeholders()
@@ -453,8 +461,7 @@ class ChannelPopupMixin:
                 current_prefetch = int(prefetch_seq["value"])
                 rows_to_prefetch = [dict(row) for row in all_rows[:30]]
                 status_var.set(
-                    f"Channel: {channel_ref} | preloading {
-                        len(rows_to_prefetch)} previews..."
+                    f"Channel: {channel_ref} | preloading {len(rows_to_prefetch)} previews..."
                 )
                 _apply_filter()
                 if all_rows:
@@ -466,8 +473,7 @@ class ChannelPopupMixin:
                         def _one(row_data: dict[str, Any]) -> None:
                             nonlocal done
                             try:
-                                self._get_browse_preview(
-                                    row_data, fetch_metadata=False)
+                                self._get_browse_preview(row_data, fetch_metadata=False)
                             except Exception:
                                 pass
                             done += 1
@@ -479,13 +485,11 @@ class ChannelPopupMixin:
                                     lambda done_count=done: (
                                         status_var.set(
                                             f"Channel: {channel_ref} | "
-                                            f"preloaded {
-                                                done_count}/{len(rows_snapshot)} previews"
+                                            f"preloaded {done_count}/{len(rows_snapshot)} previews"
                                         ),
                                         _refresh_preview_async(),
                                     ),
                                 )
-
                         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                             futures = [executor.submit(
                                 _one, row_data) for row_data in rows_snapshot]

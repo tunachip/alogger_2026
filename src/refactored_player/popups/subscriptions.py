@@ -3,13 +3,15 @@ from __future__ import annotations
 import tkinter as tk
 from typing import Any
 
+from ..constants import POPUP_SIZES
+
 
 class SubscriptionsPopupMixin:
     def _open_subscriptions_popup(self) -> None:
         popup = self._create_popup_window(
             name="subscriptions",
             title="Subscriptions",
-            size="920x620",
+            size=POPUP_SIZES["SUBSCRIPTIONS"],
             attr_name="_subscriptions_popup",
             reuse_existing=True,
             row_weights={0: 1},

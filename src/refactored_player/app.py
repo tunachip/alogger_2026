@@ -15,7 +15,15 @@ from typing import Any, Callable
 from alog.config import IngesterConfig
 from alog.service import IngesterService
 
-from .constants import DEFAULT_KEYBINDS, FONT, build_default_gui_settings
+from .constants import (
+    DEFAULT_KEYBINDS,
+    FONT,
+    FONT_SIZE_OFFSETS,
+    LAYOUT,
+    POPUP_SIZES,
+    THEME,
+    build_default_gui_settings,
+)
 from .playback import PlaybackMixin
 from .popups import PopupMixin
 from .transcript import TranscriptMixin
@@ -168,8 +176,8 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
 
         self.root = tk.Tk()
         self.root.title("Alogger Player")
-        self.root.geometry("1640x880")
-        self.root.configure(bg="#111111")
+        self.root.geometry(POPUP_SIZES["ROOT"])
+        self.root.configure(bg=THEME["APP_BG"])
         self.root.option_add("*insertOffTime", 0)
         self.root.option_add("*Entry.insertOffTime", 0)
         self.root.option_add("*Text.insertOffTime", 0)
@@ -184,7 +192,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             weight="bold")
         self._timestamp_prefix = "[00:00:00] "
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
-        self._progress_bar_width = 28
+        self._progress_bar_width = LAYOUT["PROGRESS_BAR_WIDTH"]
         self._clock_prefix_len = len("[00:00:00] ")
         self._clock_last_length_sec = 0.0
         self._font_size_delta = 0
@@ -208,40 +216,40 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         style.theme_use("clam")
         style.configure(
             "Filter.TEntry",
-            fieldbackground="#151515",
+            fieldbackground=THEME["SURFACE_ALT_BG"],
             foreground="#f0f0f0"
         )
         style.configure(
             "Terminal.TNotebook",
-            background="#111111",
+            background=THEME["APP_BG"],
             borderwidth=0,
             tabmargins=(0, 0, 0, 0)
         )
         style.configure(
             "Terminal.TNotebook.Tab",
-            background="#0d0d0d",
-            foreground="#8f8f8f",
+            background=THEME["SURFACE_BG"],
+            foreground=THEME["FG_MUTED"],
             borderwidth=0,
             padding=(8, 4),
         )
         style.map(
             "Terminal.TNotebook.Tab",
             background=[
-                ("selected", "#000000"),
-                ("active", "#161616")
+                ("selected", THEME["PANEL_BG"]),
+                ("active", THEME["SELECT_BG"])
             ],
             foreground=[
-                ("selected", "#ffffff"),
-                ("active", "#d2d2d2")
+                ("selected", THEME["FG"]),
+                ("active", THEME["FG_SOFT"])
             ],
         )
 
     def _apply_theme(self) -> None:
-        bg = str(self._ai_settings.get("theme_bg") or "#111111")
-        panel_bg = str(self._ai_settings.get("theme_panel_bg") or "#000000")
-        fg = str(self._ai_settings.get("theme_fg") or "#ffffff")
-        muted = str(self._ai_settings.get("theme_muted_fg") or "#8f8f8f")
-        accent = str(self._ai_settings.get("theme_accent_fg") or "#f7d154")
+        bg = str(self._ai_settings.get("theme_bg") or THEME["APP_BG"])
+        panel_bg = str(self._ai_settings.get("theme_panel_bg") or THEME["PANEL_BG"])
+        fg = str(self._ai_settings.get("theme_fg") or THEME["FG"])
+        muted = str(self._ai_settings.get("theme_muted_fg") or THEME["FG_MUTED"])
+        accent = str(self._ai_settings.get("theme_accent_fg") or THEME["FG_ACCENT"])
         try:
             family = str(self._ai_settings.get("font_family") or FONT["STYLE"])
             base_size = max(8, int(
@@ -257,18 +265,18 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self.right_panel.configure(bg=bg)
         self.video_panel.configure(bg=panel_bg)
         self.clock_view.configure(
-            bg="#0d0d0d",
+            bg=THEME["SURFACE_BG"],
             fg=fg,
             insertbackground=fg,
-            font=(family, max(8, size - 2), "bold")
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold")
         )
         self.caption_now_box.configure(
-            bg="#0d0d0d",
+            bg=THEME["SURFACE_BG"],
             fg=fg,
-            font=(family, size - 2)
+            font=(family, size + FONT_SIZE_OFFSETS["BODY"])
         )
         self.root_status_box.configure(
-            bg="#0d0d0d",
+            bg=THEME["SURFACE_BG"],
             fg=fg,
             font=(family, size)
         )
@@ -301,13 +309,13 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         style = ttk.Style(self.root)
         style.configure(
             "Filter.TEntry",
-            fieldbackground="#151515",
+            fieldbackground=THEME["SURFACE_ALT_BG"],
             foreground=fg,
             font=(family, max(8, size - 1))
         )
         style.configure(
             "Terminal.TNotebook.Tab",
-            font=(family, max(8, size - 3))
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["SMALL"]))
         )
         self._refresh_clock_now()
 
@@ -568,32 +576,32 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             self.root,
             orient=tk.HORIZONTAL,
             sashrelief=tk.FLAT,
-            sashwidth=4
+            sashwidth=LAYOUT["SASH_WIDTH"]
         )
         self.shell.grid(row=0, column=0, sticky="nsew")
-        self.left_panel = tk.Frame(self.shell, bg="#000000")
-        self.right_panel = tk.Frame(self.shell, bg="#111111")
+        self.left_panel = tk.Frame(self.shell, bg=THEME["PANEL_BG"])
+        self.right_panel = tk.Frame(self.shell, bg=THEME["APP_BG"])
         self.shell.add(self.left_panel, minsize=1000)
         self.shell.add(self.right_panel, minsize=200)
         self.shell.bind("<Configure>", self._on_shell_configure)
         self.root.after(0, self._set_initial_split_ratio)
         self.left_panel.rowconfigure(0, weight=1)
         self.left_panel.columnconfigure(0, weight=1)
-        self.video_panel = tk.Frame(self.left_panel, bg="#000000", highlightthickness=0, bd=0)
+        self.video_panel = tk.Frame(self.left_panel, bg=THEME["PANEL_BG"], highlightthickness=0, bd=0)
         self.video_panel.grid(row=0, column=0, sticky="nsew")
         self.clock_view = tk.Text(
             self.left_panel,
-            bg="#0d0d0d",
-            fg="#f7d154",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_ACCENT"],
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] - 2, "bold"),
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
             wrap="none",
             height=1,
             padx=10,
             pady=6,
             cursor="hand2",
-            insertbackground="#f7d154",
+            insertbackground=THEME["FG_ACCENT"],
         )
         self.clock_view.grid(row=2, column=0, sticky="ew")
         self.clock_view.configure(state="disabled")
@@ -604,9 +612,9 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             textvariable=self.caption_now_var,
             anchor="w",
             justify="left",
-            bg="#000000",
-            fg="#ffffff",
-            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
             padx=10,
             pady=8,
             wraplength=400,
@@ -618,8 +626,8 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             self.root,
             textvariable=self.status_var,
             anchor="w",
-            bg="#0d0d0d",
-            fg="#d2d2d2",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_SOFT"],
             font=(FONT["STYLE"], FONT["SIZE"]),
             padx=10,
             pady=6,
@@ -632,22 +640,22 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self.filter_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
         self.caption_view = tk.Text(
             self.right_panel,
-            bg="#000000",
-            fg="#ffffff",
+            bg=THEME["PANEL_BG"],
+            fg=THEME["FG"],
             borderwidth=0,
             highlightthickness=0,
             font=self._text_font,
             wrap="word",
             padx=8,
             pady=8,
-            insertbackground="#ffffff",
+            insertbackground=THEME["FG"],
         )
         self.caption_view.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         self.caption_view.configure(state="disabled")
         self.caption_view.tag_configure("row", lmargin1=0, lmargin2=self._wrap_indent_px)
-        self.caption_view.tag_configure("ts", foreground="#8f8f8f")
-        self.caption_view.tag_configure("txt", foreground="#ffffff")
-        self.caption_view.tag_configure("match", foreground="#f7d154")
+        self.caption_view.tag_configure("ts", foreground=THEME["FG_MUTED"])
+        self.caption_view.tag_configure("txt", foreground=THEME["FG"])
+        self.caption_view.tag_configure("match", foreground=THEME["FG_ACCENT"])
         self.caption_view.tag_configure("selected", background="#282828")
         self.caption_view.tag_configure("selected_txt", font=self._text_font_bold)
         self._row_ranges: list[tuple[str, str]] = []
