@@ -48,6 +48,49 @@ class SegmentRow:
     text:      str
     text_lc:   str
 
+
+class OverlayPanel(tk.Frame):
+    def __init__(self, root: tk.Tk) -> None:
+        super().__init__(
+            root,
+            bg="#111111",
+            highlightthickness=1,
+            highlightbackground="#2b2b2b",
+            bd=0,
+        )
+        self._wm_delete_cb: Callable[[], None] | None = None
+
+    def title(self, _title: str) -> None:
+        # Compatibility with Toplevel API.
+        return
+
+    def geometry(self, size: str) -> None:
+        width = 900
+        height = 620
+        try:
+            token = size.lower().split("+", 1)[0]
+            w_s, h_s = token.split("x", 1)
+            width = max(320, int(w_s))
+            height = max(180, int(h_s))
+        except Exception:
+            pass
+        self.place(relx=0.5, rely=0.5, anchor="center", width=width, height=height)
+        self.lift()
+
+    def transient(self, _root: tk.Tk) -> None:
+        # Compatibility with Toplevel API.
+        return
+
+    def protocol(self, name: str, callback: Callable[[], None]) -> None:
+        if name == "WM_DELETE_WINDOW":
+            self._wm_delete_cb = callback
+
+    def request_close(self) -> None:
+        if self._wm_delete_cb:
+            self._wm_delete_cb()
+            return
+        self.destroy()
+
 class TranscriptPlayer:
     def __init__(
         self,
@@ -102,6 +145,12 @@ class TranscriptPlayer:
         self._skim_last_seek_at =   0.0
         self._worker_target_count = self.workers
         self._workers_paused =      False
+        self._popup_paused_player = False
+        self._popup_video_hidden =  False
+        self._workers_eta_remaining_sec: float | None = None
+        self._workers_eta_next_recalc_at: float = 0.0
+        self._workers_eta_last_tick_at: float = time.monotonic()
+        self._workers_eta_recalc_interval_sec: float = 60.0
         self._ollama_proc:          subprocess.Popen[str] | None = None
         self._ollama_started_by_app = False
         self._ollama_bootstrap_thread: threading.Thread | None = None
@@ -125,6 +174,11 @@ class TranscriptPlayer:
         self.root.title("Alogger Player")
         self.root.geometry("1640x880")
         self.root.configure(bg="#111111")
+        # Avoid insertion-caret blink pulses that can look like popup flicker on some WMs.
+        self.root.option_add("*insertOffTime", 0)
+        self.root.option_add("*Entry.insertOffTime", 0)
+        self.root.option_add("*Text.insertOffTime", 0)
+        self.root.option_add("*TEntry.insertOffTime", 0)
 
         self._text_font = tkfont.Font(family=FONT['STYLE'], size=FONT['SIZE'])
         self._text_font_bold = tkfont.Font(family=FONT['STYLE'], size=FONT['SIZE'], weight="bold")
@@ -341,15 +395,46 @@ class TranscriptPlayer:
             self._active_popup_name = None
 
     def _register_popup(self, name: str, popup: tk.Toplevel) -> None:
+        # Embedded libVLC can intermittently overdraw Tk popups on some WMs.
+        # Pause video rendering while any popup is open to stabilize stacking.
+        if not self._active_popup_name:
+            try:
+                if self.player.get_state() == vlc.State.Playing:
+                    self.player.set_pause(1)
+                    self._popup_paused_player = True
+                else:
+                    self._popup_paused_player = False
+            except Exception:
+                self._popup_paused_player = False
+            try:
+                self.video_panel.grid_remove()
+                self._popup_video_hidden = True
+            except Exception:
+                self._popup_video_hidden = False
         self._active_popup_name = name
 
         def _on_destroy(_event: tk.Event[tk.Misc]) -> None:
+            if _event.widget is not popup:
+                return
             attr = self._popup_attr_name(name)
             if attr:
                 setattr(self, attr, None)
             if self._active_popup_name == name:
                 self._active_popup_name = None
-            self.filter_entry.focus_set()
+            if self._active_popup_name is None and self._popup_paused_player:
+                try:
+                    self.player.set_pause(0)
+                except Exception:
+                    pass
+                self._popup_paused_player = False
+            if self._active_popup_name is None and self._popup_video_hidden:
+                try:
+                    self.video_panel.grid(row=0, column=0, sticky="nsew")
+                    self.root.update_idletasks()
+                    self._bind_video_output(self.video_panel.winfo_id())
+                except Exception:
+                    pass
+                self._popup_video_hidden = False
 
         popup.bind("<Destroy>", _on_destroy, add="+")
 
@@ -364,6 +449,7 @@ class TranscriptPlayer:
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=0)
 
         shell = tk.PanedWindow(
             self.root,
@@ -428,8 +514,8 @@ class TranscriptPlayer:
         self.left_panel.bind("<Configure>", self._on_left_resize)
 
         self.status_var = tk.StringVar(value="Idle")
-        left_status = tk.Label(
-            left,
+        root_status = tk.Label(
+            self.root,
             textvariable=self.status_var,
             anchor="w",
             bg="#0d0d0d",
@@ -438,8 +524,8 @@ class TranscriptPlayer:
             padx=10,
             pady=6,
         )
-        left_status.grid(row=3, column=0, sticky="ew")
-        self.left_status_box = left_status
+        root_status.grid(row=1, column=0, sticky="ew")
+        self.root_status_box = root_status
 
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
@@ -521,6 +607,10 @@ class TranscriptPlayer:
         self.root.bind("<Control-Right>", self._on_ctrl_right)
         self.root.bind("<Control-Up>", self._on_ctrl_up)
         self.root.bind("<Control-Down>", self._on_ctrl_down)
+        self.root.bind("<Control-KeyPress-h>", self._on_ctrl_left)
+        self.root.bind("<Control-KeyPress-l>", self._on_ctrl_right)
+        self.root.bind("<Control-KeyPress-k>", self._on_ctrl_up)
+        self.root.bind("<Control-KeyPress-j>", self._on_ctrl_down)
         self.root.bind("<Prior>", self._on_page_up)
         self.root.bind("<Next>", self._on_page_down)
         self.root.bind("<Home>", self._on_home)
@@ -540,9 +630,12 @@ class TranscriptPlayer:
         self.root.bind("<Control-KeyPress-s>", self._on_ctrl_s)
         self.root.bind("<Control-KeyPress-m>", self._on_open_settings_popup)
         self.root.bind("<Control-KeyPress-i>", self._on_toggle_jobs_popup)
+        self.root.bind("<Escape>", self._on_escape, add="+")
         self.root.bind("<KeyPress>", self._on_type_to_filter, add="+")
 
         self.caption_view.bind("<Double-Button-1>", self._on_double_click)
+        self.caption_view.bind("<Button-1>", self._on_click_seek_transcript)
+        self.video_panel.bind("<Button-1>", self._on_click_video_toggle)
 
         self.root.after(50, lambda: self.filter_entry.focus_set())
 
@@ -828,10 +921,47 @@ class TranscriptPlayer:
 
     def _on_double_click(self, event: tk.Event[tk.Misc]) -> str:
         click_index = self.caption_view.index(f"@{event.x},{event.y}")
-        line = int(click_index.split(".")[0]) - 1
-        if 0 <= line < len(self.filtered_indexes):
-            self._select_pos(line)
+        row = self._row_from_text_index(click_index)
+        if row is not None:
+            self._select_pos(row)
         return self._on_return(event)
+
+    def _on_click_seek_transcript(self, event: tk.Event[tk.Misc]) -> str:
+        click_index = self.caption_view.index(f"@{event.x},{event.y}")
+        row = self._row_from_text_index(click_index)
+        if row is None:
+            return "break"
+        line = row
+        self._select_pos(line)
+
+        seg = self.segments[self.filtered_indexes[line]]
+        text_start, text_end = self._row_text_ranges[line]
+        try:
+            click_abs = int(self.caption_view.count("1.0", click_index, "chars")[0])
+            start_abs = int(self.caption_view.count("1.0", text_start, "chars")[0])
+            end_abs = int(self.caption_view.count("1.0", text_end, "chars")[0])
+        except Exception:
+            self._seek_to_absolute(seg.start_sec)
+            return "break"
+
+        width = max(1, end_abs - start_abs)
+        ratio = (click_abs - start_abs) / float(width)
+        ratio = max(0.0, min(1.0, ratio))
+        target = seg.start_sec + (seg.end_sec - seg.start_sec) * ratio
+        self._seek_to_absolute(target)
+        self.status_var.set(f"Seek ~{int(ratio * 100)}% of segment @ {_fmt_hms(target)}")
+        return "break"
+
+    def _row_from_text_index(self, index: str) -> int | None:
+        # Text widgets wrap visual lines, so numeric "line.column" is not a stable row id.
+        # Resolve clicked index by comparing against stored row start/end index ranges.
+        for i, (start, end) in enumerate(self._row_ranges):
+            if self.caption_view.compare(index, ">=", start) and self.caption_view.compare(index, "<=", end):
+                return i
+        return None
+
+    def _on_click_video_toggle(self, _event: tk.Event[tk.Misc]) -> str:
+        return self._on_toggle_play(_event)
 
     def _on_toggle_play(self, _event: tk.Event[tk.Misc]) -> str:
         state = self.player.get_state()
@@ -926,6 +1056,21 @@ class TranscriptPlayer:
         return "break"
 
     def _on_clear_filter(self, _event: tk.Event[tk.Misc]) -> str:
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, ttk.Entry)):
+            try:
+                focused.delete(0, tk.END)
+                self.status_var.set("Input cleared")
+                return "break"
+            except Exception:
+                pass
+        if isinstance(focused, tk.Text):
+            try:
+                focused.delete("1.0", tk.END)
+                self.status_var.set("Input cleared")
+                return "break"
+            except Exception:
+                pass
         self.filter_var.set("")
         self.filter_entry.focus_set()
         self.status_var.set("Filter cleared")
@@ -977,6 +1122,9 @@ class TranscriptPlayer:
             self._sync_skim_cursor_with_pos(target_ms / 1000.0)
 
     def _tick_ui(self) -> None:
+        if self._active_popup_name is not None:
+            self.root.after(250, self._tick_ui)
+            return
         state = self.player.get_state()
         pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
@@ -986,7 +1134,9 @@ class TranscriptPlayer:
         self.clock_var.set(self._render_time_progress(pos_sec, length_sec))
         self.caption_now_var.set(self._caption_text_at(pos_sec))
         if state == vlc.State.Playing:
-            self.status_var.set(f"Playing @ {_fmt_hms(pos_sec)}")
+            next_status = f"Playing @ {_fmt_hms(pos_sec)}"
+            if self.status_var.get() != next_status:
+                self.status_var.set(next_status)
         self.root.after(250, self._tick_ui)
 
     def _filtered_clip_ranges(self) -> list[tuple[float, float, int]]:
@@ -1164,6 +1314,16 @@ class TranscriptPlayer:
         self._toggle_popup("settings", self._open_settings_popup)
         return "break"
 
+    def _on_escape(self, _event: tk.Event[tk.Misc]) -> str | None:
+        if not self._active_popup_name:
+            return None
+        self._close_popup_by_name(self._active_popup_name)
+        try:
+            self.filter_entry.focus_set()
+        except Exception:
+            pass
+        return "break"
+
     def _on_ctrl_s(self, _event: tk.Event[tk.Misc]) -> str:
         self._toggle_skim_mode()
         return "break"
@@ -1184,18 +1344,18 @@ class TranscriptPlayer:
         if self._details_hidden:
             self.caption_now_box.grid(row=1, column=0, sticky="ew")
             self.clock_box.grid(row=2, column=0, sticky="ew")
-            self.left_status_box.grid(row=3, column=0, sticky="ew")
             self._details_hidden = False
             self._refresh_clock_now()
             self.status_var.set("Details shown")
             return "break"
         self.caption_now_box.grid_remove()
         self.clock_box.grid_remove()
-        self.left_status_box.grid_remove()
         self._details_hidden = True
         return "break"
 
     def _on_type_to_filter(self, event: tk.Event[tk.Misc]) -> str | None:
+        if self._active_popup_name is not None:
+            return None
         if self._transcript_hidden:
             return None
         char = getattr(event, "char", "")
@@ -1216,6 +1376,88 @@ class TranscriptPlayer:
             return "break"
         except Exception:
             return None
+
+    def _bind_fzf_like_keys(
+        self,
+        popup: tk.Misc,
+        *,
+        entry: ttk.Entry,
+        capture_widgets: list[tk.Misc] | None = None,
+        on_enter: Callable[[], str],
+        on_up: Callable[[], str],
+        on_down: Callable[[], str],
+        on_home: Callable[[], str] | None = None,
+        on_end: Callable[[], str] | None = None,
+        on_page_up: Callable[[], str] | None = None,
+        on_page_down: Callable[[], str] | None = None,
+    ) -> None:
+        def handler(event: tk.Event[tk.Misc]) -> str | None:
+            keysym = str(getattr(event, "keysym", ""))
+            state = int(getattr(event, "state", 0))
+            ctrl = bool(state & 0x4)
+
+            if keysym == "Return":
+                return on_enter()
+            if keysym == "Up":
+                return on_up()
+            if keysym == "Down":
+                return on_down()
+            if keysym == "Home" and on_home:
+                return on_home()
+            if keysym == "End" and on_end:
+                return on_end()
+            if keysym == "Prior" and on_page_up:
+                return on_page_up()
+            if keysym == "Next" and on_page_down:
+                return on_page_down()
+
+            if ctrl and keysym.lower() == "c":
+                try:
+                    entry.delete(0, tk.END)
+                    entry.focus_set()
+                except Exception:
+                    return "break"
+                return "break"
+
+            if ctrl:
+                return None
+
+            char = str(getattr(event, "char", ""))
+            try:
+                pos = int(entry.index(tk.INSERT))
+                value = entry.get()
+            except Exception:
+                return None
+
+            if keysym == "Left":
+                entry.focus_set()
+                entry.icursor(max(0, pos - 1))
+                return "break"
+            if keysym == "Right":
+                entry.focus_set()
+                entry.icursor(min(len(value), pos + 1))
+                return "break"
+            if keysym == "BackSpace":
+                if pos > 0:
+                    entry.delete(pos - 1, pos)
+                entry.focus_set()
+                return "break"
+            if keysym == "Delete":
+                if pos < len(value):
+                    entry.delete(pos, pos + 1)
+                entry.focus_set()
+                return "break"
+
+            if char and len(char) == 1 and char.isprintable():
+                entry.insert(pos, char)
+                entry.icursor(pos + 1)
+                entry.focus_set()
+                return "break"
+            return None
+
+        popup.bind("<KeyPress>", handler, add="+")
+        for w in (capture_widgets or []):
+            w.bind("<KeyPress>", handler, add="+")
 
     def _on_toggle_transcript_log(self, _event: tk.Event[tk.Misc]) -> str:
         if self._transcript_hidden:
@@ -1254,10 +1496,11 @@ class TranscriptPlayer:
         popup.title(title)
         popup.geometry(size)
         popup.configure(bg="#111111")
-        popup.transient(self.root)
+        popup.lift()
+        popup.focus_set()
 
     def _open_command_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Command Menu", "720x520")
         self._command_popup = popup
         self._register_popup("command", popup)
@@ -1337,9 +1580,18 @@ class TranscriptPlayer:
 
         query_var.trace_add("write", refresh)
         popup.bind("<Escape>", lambda _e: popup.destroy())
-        popup.bind("<Return>", run_selected)
-        popup.bind("<Up>", lambda _e: move(-1))
-        popup.bind("<Down>", lambda _e: move(1))
+        self._bind_fzf_like_keys(
+            popup,
+            entry=entry,
+            capture_widgets=[entry, listbox],
+            on_enter=lambda: run_selected(),
+            on_up=lambda: move(-1),
+            on_down=lambda: move(1),
+            on_home=lambda: move(-10_000),
+            on_end=lambda: move(10_000),
+            on_page_up=lambda: move(-10),
+            on_page_down=lambda: move(10),
+        )
         listbox.bind("<Double-Button-1>", run_selected)
         entry.focus_set()
         refresh()
@@ -1397,7 +1649,7 @@ class TranscriptPlayer:
         return "(invalid response)"
 
     def _open_ai_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Agent", "980x680")
         self._ai_popup = popup
         self._register_popup("ai", popup)
@@ -1491,7 +1743,7 @@ class TranscriptPlayer:
         _tick_status()
 
     def _open_settings_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Settings", "860x520")
         self._settings_popup = popup
         self._register_popup("settings", popup)
@@ -1575,7 +1827,7 @@ class TranscriptPlayer:
             self._search_popup.focus_force()
             return
 
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Search DB", "900x620")
         self._search_popup = popup
         self._register_popup("finder", popup)
@@ -1722,13 +1974,18 @@ class TranscriptPlayer:
 
         query_var.trace_add("write", refresh_results)
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
-        popup.bind("<Return>", open_selected)
-        popup.bind("<Up>", lambda _e: move_sel(-1))
-        popup.bind("<Down>", lambda _e: move_sel(1))
-        query_entry.bind("<Up>", lambda _e: move_sel(-1))
-        query_entry.bind("<Down>", lambda _e: move_sel(1))
-        title_list.bind("<Up>", lambda _e: move_sel(-1))
-        title_list.bind("<Down>", lambda _e: move_sel(1))
+        self._bind_fzf_like_keys(
+            popup,
+            entry=query_entry,
+            capture_widgets=[query_entry, title_list, count_list],
+            on_enter=lambda: open_selected(),
+            on_up=lambda: move_sel(-1),
+            on_down=lambda: move_sel(1),
+            on_home=lambda: move_sel(-10_000),
+            on_end=lambda: move_sel(10_000),
+            on_page_up=lambda: move_sel(-10),
+            on_page_down=lambda: move_sel(10),
+        )
         title_list.bind("<Double-Button-1>", open_selected)
         count_list.bind("<Button-1>", lambda _e: "break")
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
@@ -1741,7 +1998,7 @@ class TranscriptPlayer:
             self._video_picker_popup.focus_force()
             return
 
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Open Video", "900x620")
         self._video_picker_popup = popup
         self._register_popup("open_video", popup)
@@ -1930,13 +2187,18 @@ class TranscriptPlayer:
 
         query_var.trace_add("write", refresh_results)
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
-        popup.bind("<Return>", open_selected)
-        popup.bind("<Up>", lambda _e: move_sel(-1))
-        popup.bind("<Down>", lambda _e: move_sel(1))
-        query_entry.bind("<Up>", lambda _e: move_sel(-1))
-        query_entry.bind("<Down>", lambda _e: move_sel(1))
-        title_list.bind("<Up>", lambda _e: move_sel(-1))
-        title_list.bind("<Down>", lambda _e: move_sel(1))
+        self._bind_fzf_like_keys(
+            popup,
+            entry=query_entry,
+            capture_widgets=[query_entry, title_list, count_list],
+            on_enter=lambda: open_selected(),
+            on_up=lambda: move_sel(-1),
+            on_down=lambda: move_sel(1),
+            on_home=lambda: move_sel(-10_000),
+            on_end=lambda: move_sel(10_000),
+            on_page_up=lambda: move_sel(-10),
+            on_page_down=lambda: move_sel(10),
+        )
         title_list.bind("<Double-Button-1>", open_selected)
         title_list.bind("<Delete>", delete_selected)
         count_list.bind("<Button-1>", lambda _e: "break")
@@ -1946,7 +2208,7 @@ class TranscriptPlayer:
         query_entry.focus_set()
 
     def _open_ingest_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Ingest", "900x460")
         self._ingest_popup = popup
         self._register_popup("ingest", popup)
@@ -2056,9 +2318,18 @@ class TranscriptPlayer:
             listbox.see(nxt)
             return "break"
 
-        popup.bind("<Return>", run_selected)
-        popup.bind("<Up>", lambda _e: move(-1))
-        popup.bind("<Down>", lambda _e: move(1))
+        self._bind_fzf_like_keys(
+            popup,
+            entry=entry,
+            capture_widgets=[entry, listbox],
+            on_enter=lambda: run_selected(),
+            on_up=lambda: move(-1),
+            on_down=lambda: move(1),
+            on_home=lambda: move(-10_000),
+            on_end=lambda: move(10_000),
+            on_page_up=lambda: move(-10),
+            on_page_down=lambda: move(10),
+        )
         listbox.bind("<Return>", run_selected)
         listbox.bind("<Double-Button-1>", run_selected)
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
@@ -2066,7 +2337,7 @@ class TranscriptPlayer:
         entry.focus_set()
 
     def _open_skim_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Skim Settings", "520x190")
         popup.columnconfigure(0, weight=1)
 
@@ -2129,16 +2400,22 @@ class TranscriptPlayer:
             self._channel_popup.focus_force()
             return
 
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Channel Browser", "980x680")
         self._channel_popup = popup
         self._register_popup("channel", popup)
         popup.rowconfigure(2, weight=1)
         popup.columnconfigure(0, weight=1)
 
-        channel_var = tk.StringVar(value=self._channel_default_ref)
-        channel_entry = ttk.Entry(popup, textvariable=channel_var, style="Filter.TEntry")
-        channel_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        channel_ref = str(self._channel_default_ref or "").strip()
+        if not channel_ref:
+            self.status_var.set("No channel selected. Open Ctrl-N and choose Browse first.")
+            popup.destroy()
+            return
+
+        filter_var = tk.StringVar(value="")
+        filter_entry = ttk.Entry(popup, textvariable=filter_var, style="Filter.TEntry")
+        filter_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
         limit_var = tk.StringVar(value="30")
         limit_entry = ttk.Entry(popup, textvariable=limit_var, style="Filter.TEntry")
@@ -2159,7 +2436,10 @@ class TranscriptPlayer:
         listbox.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
         status_var = tk.StringVar(
-            value="Enter channel URL/@handle/name then Enter to list videos. Enter on row queues download."
+            value=(
+                f"Channel: {channel_ref} | Type to filter videos | Enter queues selected | "
+                "Ctrl-R reload | Ctrl-S subscribe"
+            )
         )
         status_lbl = tk.Label(
             popup,
@@ -2173,29 +2453,44 @@ class TranscriptPlayer:
         )
         status_lbl.grid(row=3, column=0, sticky="ew")
 
+        all_rows: list[dict[str, Any]] = []
+        filtered_positions: list[int] = []
+
+        def _apply_filter(*_args: object) -> str:
+            query = filter_var.get().strip().lower()
+            filtered_positions.clear()
+            listbox.delete(0, tk.END)
+            for idx, row in enumerate(all_rows):
+                title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+                hay = f"{title} {row.get('video_id') or ''}".lower()
+                if query and query not in hay:
+                    continue
+                filtered_positions.append(idx)
+                listbox.insert(tk.END, title)
+            if filtered_positions:
+                listbox.selection_set(0)
+                listbox.activate(0)
+                listbox.see(0)
+            status_var.set(
+                f"Channel: {channel_ref} | {len(filtered_positions)}/{len(all_rows)} videos shown | "
+                "Enter queues selected"
+            )
+            return "break"
+
         def refresh_channel_videos(_event: tk.Event[tk.Misc] | None = None) -> str:
-            ref = channel_var.get().strip()
-            if not ref:
-                status_var.set("Channel reference required")
-                return "break"
             try:
                 limit = max(1, min(100, int(limit_var.get().strip() or "30")))
             except ValueError:
                 status_var.set("Limit must be an integer between 1 and 100")
                 return "break"
             try:
-                data = self.ingester.list_channel_videos(ref, limit=limit)
-                self._channel_results = [dict(row) for row in (data.get("entries") or [])]
-                listbox.delete(0, tk.END)
-                for row in self._channel_results:
-                    title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
-                    listbox.insert(tk.END, title)
-                channel_title = str(data.get("channel") or ref)
-                status_var.set(
-                    f"{channel_title}: {len(self._channel_results)} videos loaded. Ctrl-S to subscribe this channel."
-                )
-                if self._channel_results:
-                    listbox.selection_set(0)
+                data = self.ingester.list_channel_videos(channel_ref, limit=limit)
+                all_rows.clear()
+                all_rows.extend(dict(row) for row in (data.get("entries") or []))
+                self._channel_results = list(all_rows)
+                _apply_filter()
+                if all_rows:
+                    listbox.focus_set()
             except Exception as exc:
                 status_var.set(f"Failed to list channel videos: {exc}")
             return "break"
@@ -2205,11 +2500,15 @@ class TranscriptPlayer:
             if not sel:
                 status_var.set("No video selected")
                 return "break"
-            idx = int(sel[0])
-            if idx < 0 or idx >= len(self._channel_results):
+            shown_idx = int(sel[0])
+            if shown_idx < 0 or shown_idx >= len(filtered_positions):
                 status_var.set("Invalid selection")
                 return "break"
-            row = self._channel_results[idx]
+            idx = filtered_positions[shown_idx]
+            if idx < 0 or idx >= len(all_rows):
+                status_var.set("Invalid selection")
+                return "break"
+            row = all_rows[idx]
             url = str(row.get("url") or "").strip()
             if not url:
                 status_var.set("Selected row has no URL")
@@ -2227,12 +2526,8 @@ class TranscriptPlayer:
             return "break"
 
         def subscribe_channel(_event: tk.Event[tk.Misc] | None = None) -> str:
-            ref = channel_var.get().strip()
-            if not ref:
-                status_var.set("Channel reference required")
-                return "break"
             try:
-                sub = self.ingester.add_channel_subscription(ref, seed_with_latest=True)
+                sub = self.ingester.add_channel_subscription(channel_ref, seed_with_latest=True)
                 status_var.set(
                     f"Subscribed: {sub.get('channel_title')} ({sub.get('channel_key')})"
                 )
@@ -2240,20 +2535,45 @@ class TranscriptPlayer:
                 status_var.set(f"Subscribe failed: {exc}")
             return "break"
 
+        def move_sel(delta: int) -> str:
+            if not filtered_positions:
+                return "break"
+            sel = listbox.curselection()
+            cur = int(sel[0]) if sel else 0
+            nxt = max(0, min(cur + delta, len(filtered_positions) - 1))
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(nxt)
+            listbox.activate(nxt)
+            listbox.see(nxt)
+            return "break"
+
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
+        popup.bind("<Control-r>", refresh_channel_videos)
         popup.bind("<Control-s>", subscribe_channel)
-        channel_entry.bind("<Return>", refresh_channel_videos)
-        limit_entry.bind("<Return>", refresh_channel_videos)
+        self._bind_fzf_like_keys(
+            popup,
+            entry=filter_entry,
+            capture_widgets=[filter_entry, listbox],
+            on_enter=lambda: enqueue_selected(),
+            on_up=lambda: move_sel(-1),
+            on_down=lambda: move_sel(1),
+            on_home=lambda: move_sel(-10_000),
+            on_end=lambda: move_sel(10_000),
+            on_page_up=lambda: move_sel(-10),
+            on_page_down=lambda: move_sel(10),
+        )
         listbox.bind("<Return>", enqueue_selected)
         listbox.bind("<Double-Button-1>", enqueue_selected)
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
-        channel_entry.focus_set()
+        filter_var.trace_add("write", _apply_filter)
+        refresh_channel_videos()
+        filter_entry.focus_set()
 
     def _open_subscriptions_popup(self) -> None:
         if self._subscriptions_popup and self._subscriptions_popup.winfo_exists():
             self._subscriptions_popup.focus_force()
             return
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Subscriptions", "920x620")
         self._subscriptions_popup = popup
         self._register_popup("subscriptions", popup)
@@ -2351,6 +2671,7 @@ class TranscriptPlayer:
             self.ingester.start_background_workers(target)
         self._worker_target_count = target
         self._workers_paused = False
+        self._workers_eta_next_recalc_at = 0.0
 
     def _run_worker_command(self, command: str) -> str:
         label = command.strip().lower()
@@ -2363,11 +2684,13 @@ class TranscriptPlayer:
         if label == "pause":
             self.ingester.stop_background_workers()
             self._workers_paused = True
+            self._workers_eta_next_recalc_at = 0.0
             return "Workers paused"
         if label == "resume":
             if self._worker_target_count > 0:
                 self.ingester.start_background_workers(self._worker_target_count)
             self._workers_paused = False
+            self._workers_eta_next_recalc_at = 0.0
             return f"Workers resumed ({self._worker_target_count})"
         if label == "cancel":
             return "Cancel is not yet wired to per-job interruption"
@@ -2375,8 +2698,60 @@ class TranscriptPlayer:
             return "Assign task via Ctrl-N Ingest popup"
         return "Unknown command"
 
+    def _recalculate_workers_eta(self) -> None:
+        now = time.monotonic()
+        self._workers_eta_last_tick_at = now
+        self._workers_eta_next_recalc_at = now + self._workers_eta_recalc_interval_sec
+        if self._workers_paused:
+            self._workers_eta_remaining_sec = None
+            return
+        try:
+            snapshot = self.ingester.dashboard_snapshot()
+            counts = snapshot.get("counts", {})
+            queued = int(counts.get("queued", 0))
+            downloading = int(counts.get("downloading", 0))
+            transcribing = int(counts.get("transcribing", 0))
+            pending = queued + downloading + transcribing
+            if pending <= 0:
+                self._workers_eta_remaining_sec = 0.0
+                return
+            avg = snapshot.get("median_duration_sec")
+            if avg is None:
+                avg = snapshot.get("avg_duration_sec")
+            avg_sec = float(avg) if avg is not None else 300.0
+            avg_sec = max(30.0, avg_sec)
+            workers = max(1, int(self._worker_target_count or 1))
+            self._workers_eta_remaining_sec = float(pending) * avg_sec / float(workers)
+        except Exception:
+            # Keep prior countdown if snapshot fails.
+            if self._workers_eta_remaining_sec is None:
+                self._workers_eta_remaining_sec = 0.0
+
+    def _tick_workers_eta_countdown(self) -> None:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._workers_eta_last_tick_at)
+        self._workers_eta_last_tick_at = now
+        if self._workers_eta_remaining_sec is None:
+            return
+        self._workers_eta_remaining_sec = max(0.0, self._workers_eta_remaining_sec - elapsed)
+
+    def _workers_eta_line(self) -> str:
+        now = time.monotonic()
+        if now >= self._workers_eta_next_recalc_at:
+            self._recalculate_workers_eta()
+        self._tick_workers_eta_countdown()
+        recalc_in = max(0, int(self._workers_eta_next_recalc_at - time.monotonic()))
+        if self._workers_paused:
+            return f"eta_til_finish=paused  recalc_in={_fmt_hms(recalc_in)}"
+        if self._workers_eta_remaining_sec is None:
+            return f"eta_til_finish=unknown  recalc_in={_fmt_hms(recalc_in)}"
+        return (
+            f"eta_til_finish=~{_fmt_hms(self._workers_eta_remaining_sec)}  "
+            f"recalc_in={_fmt_hms(recalc_in)}"
+        )
+
     def _open_jobs_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
+        popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, "Workers", "980x560")
         self._jobs_popup = popup
         self._register_popup("workers", popup)
@@ -2483,6 +2858,7 @@ class TranscriptPlayer:
             jobs = snapshot.get("jobs", [])
             lines = [
                 f"workers_target={self._worker_target_count} paused={self._workers_paused}",
+                self._workers_eta_line(),
                 f"queued={counts.get('queued', 0)}  "
                 f"downloading={counts.get('downloading', 0)}  "
                 f"transcribing={counts.get('transcribing', 0)}  "

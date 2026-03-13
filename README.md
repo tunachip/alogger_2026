@@ -149,9 +149,12 @@ PYTHONPATH=src python -m alog tui \
 - `Ctrl-Space`: toggle play/pause
 - `Ctrl-Left/Right`: seek backward/forward by skim step
 - `Ctrl-Up/Down`: jump to previous/next filtered transcript
+- `Ctrl-H/J/K/L`: vim alternatives for `Ctrl-Left/Down/Up/Right`
 - `Ctrl-T`: toggle transcript log
 - `Ctrl-D`: toggle details panel
 - `Delete` in `Ctrl-O` video picker: delete selected video + transcript assets + DB records
+- Click transcript text: rough seek inside the segment by click position
+- Click video panel: toggle pause/resume
 
 ### Browser Extension (Chrome + Firefox)
 
