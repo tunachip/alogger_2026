@@ -96,6 +96,10 @@ PYTHONPATH=src python -m alog player-db
 PYTHONPATH=src python -m alog player-db \
     --workers 2
 
+# run local HTTP bridge for browser extension handoff
+PYTHONPATH=src python -m alog bridge \
+    --workers 2
+
 # run workers
 PYTHONPATH=src python -m alog run \
     --workers 4
@@ -103,6 +107,21 @@ PYTHONPATH=src python -m alog run \
 # inspect recent jobs
 PYTHONPATH=src python -m alog jobs \
     --limit 50
+
+# list recent videos from channel URL/@handle/name
+PYTHONPATH=src python -m alog channel-list \
+    --channel "@veritasium" \
+    --limit 20
+
+# subscribe channel RSS for auto-ingest of new uploads
+PYTHONPATH=src python -m alog subscribe-add \
+    --channel "@veritasium"
+
+# inspect subscriptions
+PYTHONPATH=src python -m alog subscribe-list
+
+# poll subscriptions immediately once
+PYTHONPATH=src python -m alog subscribe-poll
 
 # live TUI dashboard
 PYTHONPATH=src python -m alog tui \
@@ -114,12 +133,46 @@ PYTHONPATH=src python -m alog tui \
 
 - Left panel: embedded VLC video playback
 - Right panel: precise text filter over transcript segments
-- `Enter`: jump video to selected segment start time
-- `Up/Down`: move hovered transcript option
-- `Left/Right`: skim backward/forward
-- `Ctrl-P`: toggle play/pause
-- `Ctrl-O`: open video, search by title
-- `Ctrl-F`: open video, search by transcripts
-- `Ctrl-N`: open ingest popup and enqueue URL(s)
-- `Ctrl-I`: toggle ingest-jobs progress popup
+- Global popup routing uses one-window-at-a-time semantics.
+- `Ctrl-P`: command menu
+- `Ctrl-N`: ingest popup (`Ingest`, `Browse`, `Subscribe`)
+- `Ctrl-I`: workers popup (create/retire/pause/resume commands)
+- `Ctrl-O`: open video by title
+- `Ctrl-F`: finder (transcript search)
+- `Ctrl-A`: AI popup (defaults to Ollama; can target OpenAI-compatible API)
+- `Ctrl-S`: skim mode toggle
+- `Ctrl-M`: settings popup
 - `Ctrl-Q`: close player
+- `Enter`: jump video to selected segment start time
+- `Up/Down/Home/End/PgUp/PgDown`: navigate filtered transcript list
+- `Left/Right`: move filter query cursor
+- `Ctrl-Space`: toggle play/pause
+- `Ctrl-Left/Right`: seek backward/forward by skim step
+- `Ctrl-Up/Down`: jump to previous/next filtered transcript
+- `Ctrl-T`: toggle transcript log
+- `Ctrl-D`: toggle details panel
+- `Delete` in `Ctrl-O` video picker: delete selected video + transcript assets + DB records
+
+### Browser Extension (Chrome + Firefox)
+
+Extension source lives in `browser_extension/`.
+
+1. Start the local bridge:
+```bash
+PYTHONPATH=src python -m alog bridge --workers 2
+```
+2. Load the extension folder:
+- Chrome/Chromium: `chrome://extensions` -> Developer Mode -> Load unpacked -> `browser_extension/`
+- Firefox: `about:debugging` -> This Firefox -> Load Temporary Add-on -> select `browser_extension/manifest.json`
+3. Use either:
+- Toolbar button on a YouTube page.
+- Right-click YouTube link -> `Open Link In Alogger`.
+
+Bridge API:
+- `POST http://127.0.0.1:17373/api/open`
+- Body: `{ "url": "https://www.youtube.com/watch?v=...", "autoplay": true }`
+
+Flow:
+- URL is enqueued.
+- Ingest begins immediately.
+- Player auto-opens as soon as download finishes (transcription continues in background).

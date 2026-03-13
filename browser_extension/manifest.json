@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Open In Alogger",
+  "version": "0.1.0",
+  "description": "Send YouTube links to local alogger bridge for download + playback.",
+  "permissions": [
+    "activeTab",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:17373/*",
+    "http://localhost:17373/*",
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "https://m.youtube.com/*",
+    "https://youtu.be/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open In Alogger"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "open-in-alogger@local"
+    }
+  }
+}

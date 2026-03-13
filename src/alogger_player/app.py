@@ -1,15 +1,20 @@
 from __future__ import annotations
 import vlc
 import json
+import os
 import subprocess
 import sys
+import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.error
+import urllib.request
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import ttk
-from typing import Any
+from typing import Any, Callable
 
 from alog.config import IngesterConfig
 from alog.service import IngesterService
@@ -66,26 +71,55 @@ class TranscriptPlayer:
         self.selected_filtered_pos = 0
         
         self._search_popup:         tk.Toplevel | None = None
+        self._command_popup:        tk.Toplevel | None = None
         self._video_picker_popup:   tk.Toplevel | None = None
         self._ingest_popup:         tk.Toplevel | None = None
+        self._ai_popup:             tk.Toplevel | None = None
+        self._settings_popup:       tk.Toplevel | None = None
+        self._channel_popup:        tk.Toplevel | None = None
+        self._subscriptions_popup:  tk.Toplevel | None = None
         self._jobs_popup:           tk.Toplevel | None = None
         self._jobs_text:            tk.Text | None = None
+        self._workers_cmd_list:     tk.Listbox | None = None
         self._jobs_after_id:        str | None = None
         self._search_results:       list[dict[str, Any]] = []
         self._video_picker_results: list[dict[str, Any]] = []
+        self._channel_results:      list[dict[str, Any]] = []
+        self._channel_default_ref = ""
         self._split_initialized =   False
         self._transcript_hidden =   False
+        self._details_hidden =      False
         self._split_x_before_hide:  int | None = None
+        self._active_popup_name:    str | None = None
         self.current_video_id:      str | None = None
         self._load_fail_count =     0
         self._startup_poll_count =  0
         self._proxy_attempted =     False
+        self._skim_mode =           False
+        self._skim_pre_ms =         300
+        self._skim_post_ms =        500
+        self._skim_cursor =         0
+        self._skim_last_seek_at =   0.0
+        self._worker_target_count = self.workers
+        self._workers_paused =      False
+        self._ollama_proc:          subprocess.Popen[str] | None = None
+        self._ollama_started_by_app = False
+        self._ollama_bootstrap_thread: threading.Thread | None = None
+        self._ollama_bootstrap_lock = threading.Lock()
+        self._ollama_bootstrap_done = threading.Event()
+        self._ollama_bootstrap_success = False
+        self._ollama_bootstrap_error: str | None = None
+        self._ollama_bootstrap_state = "idle"
 
         self.ingester_config = IngesterConfig.from_env()
         self.ingester = IngesterService(self.ingester_config)
         self.ingester.init()
         if self.workers > 0:
             self.ingester.start_background_workers(self.workers)
+        self._gui_settings_path = self.ingester_config.db_path.parent / "gui_settings.json"
+        self._ai_settings = self._load_gui_settings()
+        if str(self._ai_settings.get("ai_provider") or "ollama").lower() == "ollama":
+            self._start_ollama_bootstrap(background=True)
 
         self.root = tk.Tk()
         self.root.title("Alogger Player")
@@ -116,6 +150,216 @@ class TranscriptPlayer:
             fieldbackground="#151515",
             foreground="#f0f0f0"
         )
+
+    def _load_gui_settings(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {
+            "ai_provider": "ollama",
+            "ollama_model": "llama3.2:3b",
+            "ollama_base_url": "http://127.0.0.1:11434",
+            "api_base_url": "https://api.openai.com",
+            "api_key_env": "OPENAI_API_KEY",
+            "api_model": "gpt-4o-mini",
+        }
+        path = getattr(self, "_gui_settings_path", None)
+        if not path:
+            return defaults
+        try:
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    defaults.update(payload)
+        except Exception:
+            pass
+        return defaults
+
+    def _save_gui_settings(self) -> None:
+        try:
+            self._gui_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._gui_settings_path.write_text(
+                json.dumps(self._ai_settings, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _ollama_base_url(self) -> str:
+        return str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434").rstrip("/")
+
+    def _ollama_model(self) -> str:
+        return str(self._ai_settings.get("ollama_model") or "llama3.2:3b").strip() or "llama3.2:3b"
+
+    def _ollama_server_healthy(self) -> bool:
+        try:
+            req = urllib.request.Request(f"{self._ollama_base_url()}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                _ = resp.read()
+            return True
+        except Exception:
+            return False
+
+    def _ollama_model_exists(self, model: str) -> bool:
+        try:
+            req = urllib.request.Request(f"{self._ollama_base_url()}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8"))
+            models = payload.get("models") or []
+            if not isinstance(models, list):
+                return False
+            aliases = {model, f"{model}:latest"} if ":" not in model else {model}
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if name in aliases:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _start_ollama_server(self) -> None:
+        if self._ollama_proc and self._ollama_proc.poll() is None:
+            return
+        kwargs: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        self._ollama_proc = subprocess.Popen(["ollama", "serve"], **kwargs)
+        self._ollama_started_by_app = True
+
+    def _reset_ollama_bootstrap(self) -> None:
+        self._ollama_bootstrap_done.clear()
+        self._ollama_bootstrap_success = False
+        self._ollama_bootstrap_error = None
+        self._ollama_bootstrap_state = "idle"
+
+    def _bootstrap_ollama(self) -> None:
+        with self._ollama_bootstrap_lock:
+            if self._ollama_bootstrap_done.is_set() and self._ollama_bootstrap_success:
+                return
+            model = self._ollama_model()
+            try:
+                self._ollama_bootstrap_state = "checking_server"
+                if not self._ollama_server_healthy():
+                    self._ollama_bootstrap_state = "starting_server"
+                    self._start_ollama_server()
+                    deadline = time.time() + 25.0
+                    while time.time() < deadline:
+                        if self._ollama_server_healthy():
+                            break
+                        time.sleep(0.5)
+                    if not self._ollama_server_healthy():
+                        raise RuntimeError("ollama server did not become healthy on 127.0.0.1:11434")
+
+                self._ollama_bootstrap_state = "checking_model"
+                if not self._ollama_model_exists(model):
+                    self._ollama_bootstrap_state = "pulling_model"
+                    proc = subprocess.run(
+                        ["ollama", "pull", model],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"failed to pull Ollama model '{model}': {proc.stderr.strip() or proc.stdout.strip()}"
+                        )
+                    if not self._ollama_model_exists(model):
+                        raise RuntimeError(f"model '{model}' still missing after pull")
+
+                self._ollama_bootstrap_success = True
+                self._ollama_bootstrap_error = None
+                self._ollama_bootstrap_state = "ready"
+            except FileNotFoundError:
+                self._ollama_bootstrap_success = False
+                self._ollama_bootstrap_error = "ollama binary not found in PATH"
+                self._ollama_bootstrap_state = "error"
+            except Exception as exc:
+                self._ollama_bootstrap_success = False
+                self._ollama_bootstrap_error = str(exc)
+                self._ollama_bootstrap_state = "error"
+            finally:
+                self._ollama_bootstrap_done.set()
+
+    def _start_ollama_bootstrap(self, *, background: bool, force_reset: bool = False) -> None:
+        if str(self._ai_settings.get("ai_provider") or "ollama").lower() != "ollama":
+            return
+        if force_reset:
+            self._reset_ollama_bootstrap()
+        if self._ollama_bootstrap_done.is_set() and self._ollama_bootstrap_success:
+            return
+        if background:
+            if self._ollama_bootstrap_thread and self._ollama_bootstrap_thread.is_alive():
+                return
+            self._ollama_bootstrap_thread = threading.Thread(
+                target=self._bootstrap_ollama,
+                daemon=True,
+                name="alog-ollama-bootstrap",
+            )
+            self._ollama_bootstrap_thread.start()
+            return
+        self._bootstrap_ollama()
+
+    def _ensure_ollama_ready(self, *, block: bool = True) -> None:
+        if str(self._ai_settings.get("ai_provider") or "ollama").lower() != "ollama":
+            return
+        self._start_ollama_bootstrap(background=not block)
+        if block:
+            self._ollama_bootstrap_done.wait(timeout=600.0)
+            if not self._ollama_bootstrap_done.is_set():
+                raise RuntimeError("Timed out preparing Ollama")
+            if not self._ollama_bootstrap_success:
+                raise RuntimeError(self._ollama_bootstrap_error or "Ollama initialization failed")
+
+    def _popup_attr_name(self, name: str) -> str | None:
+        return {
+            "command": "_command_popup",
+            "finder": "_search_popup",
+            "open_video": "_video_picker_popup",
+            "ingest": "_ingest_popup",
+            "workers": "_jobs_popup",
+            "ai": "_ai_popup",
+            "settings": "_settings_popup",
+            "channel": "_channel_popup",
+            "subscriptions": "_subscriptions_popup",
+        }.get(name)
+
+    def _close_popup_by_name(self, name: str) -> None:
+        if name == "workers":
+            self._close_jobs_popup()
+            return
+        attr = self._popup_attr_name(name)
+        if not attr:
+            return
+        popup = getattr(self, attr, None)
+        if popup and popup.winfo_exists():
+            popup.destroy()
+        setattr(self, attr, None)
+        if self._active_popup_name == name:
+            self._active_popup_name = None
+
+    def _register_popup(self, name: str, popup: tk.Toplevel) -> None:
+        self._active_popup_name = name
+
+        def _on_destroy(_event: tk.Event[tk.Misc]) -> None:
+            attr = self._popup_attr_name(name)
+            if attr:
+                setattr(self, attr, None)
+            if self._active_popup_name == name:
+                self._active_popup_name = None
+            self.filter_entry.focus_set()
+
+        popup.bind("<Destroy>", _on_destroy, add="+")
+
+    def _toggle_popup(self, name: str, opener: Callable[[], None]) -> None:
+        if self._active_popup_name == name:
+            self._close_popup_by_name(name)
+            return
+        if self._active_popup_name:
+            self._close_popup_by_name(self._active_popup_name)
+        opener()
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -165,6 +409,7 @@ class TranscriptPlayer:
             pady=6,
         )
         clock_box.grid(row=2, column=0, sticky="ew")
+        self.clock_box = clock_box
 
         self.caption_now_var = tk.StringVar(value="")
         self.caption_now_box = tk.Label(
@@ -194,6 +439,7 @@ class TranscriptPlayer:
             pady=6,
         )
         left_status.grid(row=3, column=0, sticky="ew")
+        self.left_status_box = left_status
 
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
@@ -244,10 +490,10 @@ class TranscriptPlayer:
         self._row_text_ranges: list[tuple[str, str]] = []
 
         self.hint_var = tk.StringVar(value=(
-            "Type=precise filter | Up/Down=hover | Enter=jump | Ctrl-Space/Ctrl-P play/pause | "
-            "Left/Right=skim | PgUp/PgDn/Home/End move | Ctrl-C clear filter | "
-            "Ctrl--/Ctrl-= text size | Ctrl-F transcript search | Ctrl-O title search | "
-            "Ctrl-N ingest | Ctrl-I jobs | Ctrl-L toggle log | Ctrl-Q quit"
+            "Terminal GUI mode | Ctrl-P command menu | Ctrl-N ingest | Ctrl-I workers | "
+            "Ctrl-O open video | Ctrl-F finder | Ctrl-A ai | Ctrl-S skim | Ctrl-M settings | Ctrl-Q quit | "
+            "Ctrl-Space play/pause | Ctrl-Left/Right seek | Ctrl-Up/Down next/prev match | "
+            "Ctrl-T transcript log | Ctrl-D details"
         ))
         hint = tk.Label(
             right,
@@ -269,23 +515,32 @@ class TranscriptPlayer:
         self.root.bind("<Down>", self._on_down)
         self.root.bind("<Return>", self._on_return)
         self.root.bind("<Control-space>", self._on_toggle_play)
-        self.root.bind("<Control-KeyPress-p>", self._on_toggle_play)
         self.root.bind("<Left>", self._on_left)
         self.root.bind("<Right>", self._on_right)
+        self.root.bind("<Control-Left>", self._on_ctrl_left)
+        self.root.bind("<Control-Right>", self._on_ctrl_right)
+        self.root.bind("<Control-Up>", self._on_ctrl_up)
+        self.root.bind("<Control-Down>", self._on_ctrl_down)
         self.root.bind("<Prior>", self._on_page_up)
         self.root.bind("<Next>", self._on_page_down)
         self.root.bind("<Home>", self._on_home)
         self.root.bind("<End>", self._on_end)
+        self.root.bind("<Control-KeyPress-p>", self._on_open_command_popup)
         self.root.bind("<Control-KeyPress-q>", self._on_quit)
         self.root.bind("<Control-c>", self._on_clear_filter)
         self.root.bind("<Control-minus>", self._on_font_smaller)
         self.root.bind("<Control-equal>", self._on_font_larger)
         self.root.bind("<Control-plus>", self._on_font_larger)
-        self.root.bind("<Control-KeyPress-l>", self._on_toggle_transcript_log)
+        self.root.bind("<Control-KeyPress-t>", self._on_toggle_transcript_log)
+        self.root.bind("<Control-KeyPress-d>", self._on_toggle_details)
         self.root.bind("<Control-KeyPress-f>", self._on_open_search_popup)
         self.root.bind("<Control-KeyPress-o>", self._on_open_video_picker_popup)
         self.root.bind("<Control-KeyPress-n>", self._on_open_ingest_popup)
+        self.root.bind("<Control-KeyPress-a>", self._on_open_ai_popup)
+        self.root.bind("<Control-KeyPress-s>", self._on_ctrl_s)
+        self.root.bind("<Control-KeyPress-m>", self._on_open_settings_popup)
         self.root.bind("<Control-KeyPress-i>", self._on_toggle_jobs_popup)
+        self.root.bind("<KeyPress>", self._on_type_to_filter, add="+")
 
         self.caption_view.bind("<Double-Button-1>", self._on_double_click)
 
@@ -485,6 +740,9 @@ class TranscriptPlayer:
             self.filtered_indexes = [idx for idx, seg in enumerate(self.segments) if query in seg.text_lc]
         self.selected_filtered_pos = 0
         self._refresh_caption_view()
+        if self._skim_mode:
+            self._skim_cursor = 0
+            self._start_skim_at_cursor(force_seek=True)
 
     def _refresh_caption_view(self) -> None:
         self.caption_view.configure(state="normal")
@@ -594,11 +852,53 @@ class TranscriptPlayer:
         return "break"
 
     def _on_left(self, _event: tk.Event[tk.Misc]) -> str:
-        self._seek_relative(-self.skim_seconds)
+        if self._transcript_hidden:
+            self._seek_relative(-self.skim_seconds)
+            return "break"
+        self.filter_entry.focus_set()
+        try:
+            pos = int(self.filter_entry.index(tk.INSERT))
+            self.filter_entry.icursor(max(0, pos - 1))
+        except Exception:
+            pass
         return "break"
 
     def _on_right(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._transcript_hidden:
+            self._seek_relative(self.skim_seconds)
+            return "break"
+        self.filter_entry.focus_set()
+        try:
+            pos = int(self.filter_entry.index(tk.INSERT))
+            self.filter_entry.icursor(pos + 1)
+        except Exception:
+            pass
+        return "break"
+
+    def _on_ctrl_left(self, _event: tk.Event[tk.Misc]) -> str:
+        self._seek_relative(-self.skim_seconds)
+        return "break"
+
+    def _on_ctrl_right(self, _event: tk.Event[tk.Misc]) -> str:
         self._seek_relative(self.skim_seconds)
+        return "break"
+
+    def _on_ctrl_up(self, _event: tk.Event[tk.Misc]) -> str:
+        if not self.filtered_indexes:
+            return "break"
+        self._select_pos(self.selected_filtered_pos - 1)
+        seg = self._current_segment()
+        if seg:
+            self._seek_to_absolute(seg.start_sec)
+        return "break"
+
+    def _on_ctrl_down(self, _event: tk.Event[tk.Misc]) -> str:
+        if not self.filtered_indexes:
+            return "break"
+        self._select_pos(self.selected_filtered_pos + 1)
+        seg = self._current_segment()
+        if seg:
+            self._seek_to_absolute(seg.start_sec)
         return "break"
 
     def _on_quit(self, _event: tk.Event[tk.Misc]) -> str:
@@ -673,11 +973,14 @@ class TranscriptPlayer:
             self.root.after(200, lambda: self.player.set_pause(0))
             return
         self.player.set_time(target_ms)
+        if self._skim_mode:
+            self._sync_skim_cursor_with_pos(target_ms / 1000.0)
 
     def _tick_ui(self) -> None:
         state = self.player.get_state()
         pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
+        self._tick_skim(state, pos_sec)
         length_ms = self.player.get_length()
         length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
         self.clock_var.set(self._render_time_progress(pos_sec, length_sec))
@@ -685,6 +988,97 @@ class TranscriptPlayer:
         if state == vlc.State.Playing:
             self.status_var.set(f"Playing @ {_fmt_hms(pos_sec)}")
         self.root.after(250, self._tick_ui)
+
+    def _filtered_clip_ranges(self) -> list[tuple[float, float, int]]:
+        if not self.filtered_indexes:
+            return []
+        pre = max(0, int(self._skim_pre_ms)) / 1000.0
+        post = max(0, int(self._skim_post_ms)) / 1000.0
+        ranges: list[tuple[float, float, int]] = []
+        for seg_idx in self.filtered_indexes:
+            seg = self.segments[seg_idx]
+            start = max(0.0, seg.start_sec - pre)
+            end = max(start, seg.end_sec + post)
+            ranges.append((start, end, seg_idx))
+        return ranges
+
+    def _sync_skim_cursor_with_pos(self, pos_sec: float) -> None:
+        ranges = self._filtered_clip_ranges()
+        if not ranges:
+            self._skim_cursor = 0
+            return
+        chosen = 0
+        for i, (start, end, _seg_idx) in enumerate(ranges):
+            if pos_sec < start:
+                chosen = i
+                break
+            if start <= pos_sec <= end:
+                chosen = i
+                break
+            chosen = min(i + 1, len(ranges) - 1)
+        self._skim_cursor = max(0, min(chosen, len(ranges) - 1))
+
+    def _start_skim_at_cursor(self, *, force_seek: bool = False) -> None:
+        ranges = self._filtered_clip_ranges()
+        if not ranges:
+            self._skim_mode = False
+            self.status_var.set("Skim mode disabled: no filtered transcript matches")
+            return
+        self._skim_cursor = max(0, min(self._skim_cursor, len(ranges) - 1))
+        start, _end, seg_idx = ranges[self._skim_cursor]
+        if force_seek:
+            self._seek_to_absolute(start)
+            self.player.set_pause(0)
+            self.selected_filtered_pos = self.filtered_indexes.index(seg_idx)
+            self._select_pos(self.selected_filtered_pos)
+            self._skim_last_seek_at = time.monotonic()
+
+    def _toggle_skim_mode(self) -> None:
+        self._skim_mode = not self._skim_mode
+        if self._skim_mode:
+            self._sync_skim_cursor_with_pos(max(0, self.player.get_time()) / 1000.0)
+            self._start_skim_at_cursor(force_seek=True)
+            if self._skim_mode:
+                self.status_var.set(
+                    f"Skim mode ON (pre={self._skim_pre_ms}ms, post={self._skim_post_ms}ms)"
+                )
+            return
+        self.status_var.set("Skim mode OFF")
+
+    def _tick_skim(self, state: vlc.State, pos_sec: float) -> None:
+        if not self._skim_mode:
+            return
+        if state not in {vlc.State.Playing, vlc.State.Paused, vlc.State.NothingSpecial}:
+            return
+        ranges = self._filtered_clip_ranges()
+        if not ranges:
+            self._skim_mode = False
+            self.status_var.set("Skim mode disabled: no filtered transcript matches")
+            return
+        self._skim_cursor = max(0, min(self._skim_cursor, len(ranges) - 1))
+        now = time.monotonic()
+        start, end, seg_idx = ranges[self._skim_cursor]
+        if pos_sec < start - 0.2 and (now - self._skim_last_seek_at) > 0.2:
+            self._seek_to_absolute(start)
+            self.player.set_pause(0)
+            self._skim_last_seek_at = now
+            return
+        if pos_sec <= end:
+            return
+        self._skim_cursor += 1
+        if self._skim_cursor >= len(ranges):
+            self._skim_mode = False
+            self.player.set_pause(1)
+            self.status_var.set("Skim mode complete")
+            return
+        next_start, _next_end, next_seg_idx = ranges[self._skim_cursor]
+        if (now - self._skim_last_seek_at) > 0.2:
+            self._seek_to_absolute(next_start)
+            self.player.set_pause(0)
+            self._skim_last_seek_at = now
+            if next_seg_idx in self.filtered_indexes:
+                self.selected_filtered_pos = self.filtered_indexes.index(next_seg_idx)
+                self._select_pos(self.selected_filtered_pos)
 
     def _caption_text_at(self, pos_sec: float) -> str:
         if not self.segments:
@@ -747,23 +1141,81 @@ class TranscriptPlayer:
             self._set_initial_split_ratio()
 
     def _on_open_search_popup(self, _event: tk.Event[tk.Misc]) -> str:
-        self._open_search_popup()
+        self._toggle_popup("finder", self._open_search_popup)
         return "break"
 
     def _on_open_video_picker_popup(self, _event: tk.Event[tk.Misc]) -> str:
-        self._open_video_picker_popup()
+        self._toggle_popup("open_video", self._open_video_picker_popup)
         return "break"
 
     def _on_open_ingest_popup(self, _event: tk.Event[tk.Misc]) -> str:
-        self._open_ingest_popup()
+        self._toggle_popup("ingest", self._open_ingest_popup)
+        return "break"
+
+    def _on_open_command_popup(self, _event: tk.Event[tk.Misc]) -> str:
+        self._toggle_popup("command", self._open_command_popup)
+        return "break"
+
+    def _on_open_ai_popup(self, _event: tk.Event[tk.Misc]) -> str:
+        self._toggle_popup("ai", self._open_ai_popup)
+        return "break"
+
+    def _on_open_settings_popup(self, _event: tk.Event[tk.Misc]) -> str:
+        self._toggle_popup("settings", self._open_settings_popup)
+        return "break"
+
+    def _on_ctrl_s(self, _event: tk.Event[tk.Misc]) -> str:
+        self._toggle_skim_mode()
+        return "break"
+
+    def _on_toggle_skim_mode(self, _event: tk.Event[tk.Misc]) -> str:
+        self._toggle_skim_mode()
+        return "break"
+
+    def _on_open_skim_popup(self, _event: tk.Event[tk.Misc]) -> str:
+        self._open_skim_popup()
         return "break"
 
     def _on_toggle_jobs_popup(self, _event: tk.Event[tk.Misc]) -> str:
-        if self._jobs_popup and self._jobs_popup.winfo_exists():
-            self._close_jobs_popup()
-        else:
-            self._open_jobs_popup()
+        self._toggle_popup("workers", self._open_jobs_popup)
         return "break"
+
+    def _on_toggle_details(self, _event: tk.Event[tk.Misc]) -> str:
+        if self._details_hidden:
+            self.caption_now_box.grid(row=1, column=0, sticky="ew")
+            self.clock_box.grid(row=2, column=0, sticky="ew")
+            self.left_status_box.grid(row=3, column=0, sticky="ew")
+            self._details_hidden = False
+            self._refresh_clock_now()
+            self.status_var.set("Details shown")
+            return "break"
+        self.caption_now_box.grid_remove()
+        self.clock_box.grid_remove()
+        self.left_status_box.grid_remove()
+        self._details_hidden = True
+        return "break"
+
+    def _on_type_to_filter(self, event: tk.Event[tk.Misc]) -> str | None:
+        if self._transcript_hidden:
+            return None
+        char = getattr(event, "char", "")
+        if not char or len(char) != 1 or not char.isprintable():
+            return None
+        state = int(getattr(event, "state", 0))
+        if state & 0x4:  # Control key mask
+            return None
+        widget = event.widget
+        if widget is self.filter_entry:
+            return None
+        self.filter_entry.focus_set()
+        try:
+            pos = int(self.filter_entry.index(tk.INSERT))
+            value = self.filter_var.get()
+            self.filter_var.set(value[:pos] + char + value[pos:])
+            self.filter_entry.icursor(pos + 1)
+            return "break"
+        except Exception:
+            return None
 
     def _on_toggle_transcript_log(self, _event: tk.Event[tk.Misc]) -> str:
         if self._transcript_hidden:
@@ -804,6 +1256,320 @@ class TranscriptPlayer:
         popup.configure(bg="#111111")
         popup.transient(self.root)
 
+    def _open_command_popup(self) -> None:
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Command Menu", "720x520")
+        self._command_popup = popup
+        self._register_popup("command", popup)
+        popup.rowconfigure(1, weight=1)
+        popup.columnconfigure(0, weight=1)
+
+        query_var = tk.StringVar(value="")
+        entry = ttk.Entry(popup, textvariable=query_var, style="Filter.TEntry")
+        entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+
+        listbox = tk.Listbox(
+            popup,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            exportselection=False,
+        )
+        listbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        commands: list[tuple[str, Callable[[], None]]] = [
+            ("Ingest Popup", lambda: self._toggle_popup("ingest", self._open_ingest_popup)),
+            ("Workers", lambda: self._toggle_popup("workers", self._open_jobs_popup)),
+            ("Open Video", lambda: self._toggle_popup("open_video", self._open_video_picker_popup)),
+            ("Finder", lambda: self._toggle_popup("finder", self._open_search_popup)),
+            ("AI Agent", lambda: self._toggle_popup("ai", self._open_ai_popup)),
+            ("Settings", lambda: self._toggle_popup("settings", self._open_settings_popup)),
+            ("Channel Browser", lambda: self._toggle_popup("channel", self._open_channel_popup)),
+            ("Subscriptions", lambda: self._toggle_popup("subscriptions", self._open_subscriptions_popup)),
+            ("Toggle Transcript Log", lambda: self._on_toggle_transcript_log(None)),  # type: ignore[arg-type]
+            ("Toggle Details", lambda: self._on_toggle_details(None)),  # type: ignore[arg-type]
+            ("Toggle Skim Mode", self._toggle_skim_mode),
+            ("Quit", self.close),
+        ]
+        filtered_indexes: list[int] = list(range(len(commands)))
+
+        def refresh(*_args: object) -> None:
+            needle = query_var.get().strip().lower()
+            filtered_indexes.clear()
+            listbox.delete(0, tk.END)
+            for idx, (label, _fn) in enumerate(commands):
+                if needle and needle not in label.lower():
+                    continue
+                filtered_indexes.append(idx)
+                listbox.insert(tk.END, label)
+            if filtered_indexes:
+                listbox.selection_set(0)
+
+        def run_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sel = listbox.curselection()
+            if not sel:
+                return "break"
+            pos = int(sel[0])
+            if pos < 0 or pos >= len(filtered_indexes):
+                return "break"
+            cmd_idx = filtered_indexes[pos]
+            _label, fn = commands[cmd_idx]
+            popup.destroy()
+            fn()
+            return "break"
+
+        def move(delta: int) -> str:
+            if not filtered_indexes:
+                return "break"
+            sel = listbox.curselection()
+            cur = int(sel[0]) if sel else 0
+            nxt = max(0, min(cur + delta, len(filtered_indexes) - 1))
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(nxt)
+            listbox.activate(nxt)
+            listbox.see(nxt)
+            return "break"
+
+        query_var.trace_add("write", refresh)
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        popup.bind("<Return>", run_selected)
+        popup.bind("<Up>", lambda _e: move(-1))
+        popup.bind("<Down>", lambda _e: move(1))
+        listbox.bind("<Double-Button-1>", run_selected)
+        entry.focus_set()
+        refresh()
+
+    def _ask_ai(self, prompt: str) -> str:
+        provider = str(self._ai_settings.get("ai_provider") or "ollama").lower()
+        if provider == "ollama":
+            self._ensure_ollama_ready(block=True)
+            base = str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434").rstrip("/")
+            model = str(self._ai_settings.get("ollama_model") or "llama3.2:3b")
+            payload = json.dumps({"model": model, "prompt": prompt, "stream": False}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base}/api/generate",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+                data=payload,
+            )
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                raw = resp.read()
+            body = json.loads(raw.decode("utf-8"))
+            return str(body.get("response") or "").strip() or "(empty response)"
+
+        base = str(self._ai_settings.get("api_base_url") or "https://api.openai.com").rstrip("/")
+        model = str(self._ai_settings.get("api_model") or "gpt-4o-mini")
+        key_env = str(self._ai_settings.get("api_key_env") or "OPENAI_API_KEY")
+        api_key = os.getenv(key_env, "")
+        if not api_key:
+            raise RuntimeError(f"Missing API key env var: {key_env}")
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            data=payload,
+        )
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            raw = resp.read()
+        body = json.loads(raw.decode("utf-8"))
+        choices = body.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            return "(no choices)"
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        msg = first.get("message") if isinstance(first, dict) else {}
+        if isinstance(msg, dict):
+            return str(msg.get("content") or "").strip() or "(empty response)"
+        return "(invalid response)"
+
+    def _open_ai_popup(self) -> None:
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Agent", "980x680")
+        self._ai_popup = popup
+        self._register_popup("ai", popup)
+        popup.rowconfigure(0, weight=1)
+        popup.columnconfigure(0, weight=1)
+
+        feed = tk.Text(
+            popup,
+            bg="#000000",
+            fg="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            wrap="word",
+            padx=8,
+            pady=8,
+            insertbackground="#ffffff",
+        )
+        feed.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+        feed.configure(state="disabled")
+
+        input_var = tk.StringVar(value="")
+        entry = ttk.Entry(popup, textvariable=input_var, style="Filter.TEntry")
+        entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+        provider = str(self._ai_settings.get("ai_provider", "ollama"))
+        if provider.lower() == "ollama":
+            self._start_ollama_bootstrap(background=True)
+        status_var = tk.StringVar(
+            value=f"Provider={provider} | Enter send | Esc close"
+        )
+        status = tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        status.grid(row=2, column=0, sticky="ew")
+
+        def append_line(prefix: str, text: str) -> None:
+            feed.configure(state="normal")
+            feed.insert(tk.END, f"[{prefix}] {text}\n\n")
+            feed.see("end")
+            feed.configure(state="disabled")
+
+        def send_prompt(_event: tk.Event[tk.Misc] | None = None) -> str:
+            prompt = input_var.get().strip()
+            if not prompt:
+                return "break"
+            input_var.set("")
+            append_line("you", prompt)
+            if provider.lower() == "ollama" and not self._ollama_bootstrap_done.is_set():
+                status_var.set(f"Ollama startup: {self._ollama_bootstrap_state} ...")
+            else:
+                status_var.set("Running model...")
+            self.root.update_idletasks()
+            try:
+                reply = self._ask_ai(prompt)
+                append_line("ai", reply)
+                status_var.set("Ready")
+            except urllib.error.URLError as exc:
+                append_line("err", str(exc))
+                status_var.set(f"AI error: {exc}")
+            except Exception as exc:
+                append_line("err", str(exc))
+                status_var.set(f"AI error: {exc}")
+            return "break"
+
+        def _tick_status() -> None:
+            if not popup.winfo_exists():
+                return
+            if provider.lower() == "ollama":
+                if self._ollama_bootstrap_done.is_set():
+                    if self._ollama_bootstrap_success:
+                        status_var.set(f"Provider={provider} ready ({self._ollama_model()})")
+                    else:
+                        status_var.set(
+                            f"Ollama init failed: {self._ollama_bootstrap_error or 'unknown error'}"
+                        )
+                else:
+                    status_var.set(f"Ollama startup: {self._ollama_bootstrap_state} ...")
+            popup.after(1000, _tick_status)
+
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        popup.bind("<Return>", send_prompt)
+        entry.focus_set()
+        _tick_status()
+
+    def _open_settings_popup(self) -> None:
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Settings", "860x520")
+        self._settings_popup = popup
+        self._register_popup("settings", popup)
+        popup.columnconfigure(1, weight=1)
+
+        fields = [
+            ("AI Provider (ollama/api)", "ai_provider"),
+            ("Ollama Model", "ollama_model"),
+            ("Ollama Base URL", "ollama_base_url"),
+            ("API Base URL", "api_base_url"),
+            ("API Key Env Var", "api_key_env"),
+            ("API Model", "api_model"),
+            ("Skim Pre Buffer ms", "_skim_pre_ms"),
+            ("Skim Post Buffer ms", "_skim_post_ms"),
+        ]
+        vars_map: dict[str, tk.StringVar] = {}
+        for i, (label, key) in enumerate(fields):
+            tk.Label(
+                popup,
+                text=label,
+                anchor="w",
+                bg="#111111",
+                fg="#d2d2d2",
+                font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            ).grid(row=i, column=0, sticky="w", padx=(8, 6), pady=(8 if i == 0 else 4, 0))
+            if key.startswith("_"):
+                val = str(getattr(self, key))
+            else:
+                val = str(self._ai_settings.get(key, ""))
+            var = tk.StringVar(value=val)
+            vars_map[key] = var
+            ttk.Entry(popup, textvariable=var, style="Filter.TEntry").grid(
+                row=i, column=1, sticky="ew", padx=(0, 8), pady=(8 if i == 0 else 4, 0)
+            )
+
+        status_var = tk.StringVar(value="Enter saves settings")
+        tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 8))
+
+        def save_now(_event: tk.Event[tk.Misc] | None = None) -> str:
+            try:
+                prev_provider = str(self._ai_settings.get("ai_provider") or "ollama")
+                prev_model = str(self._ai_settings.get("ollama_model") or "llama3.2:3b")
+                prev_base = str(self._ai_settings.get("ollama_base_url") or "http://127.0.0.1:11434")
+                self._ai_settings["ai_provider"] = vars_map["ai_provider"].get().strip() or "ollama"
+                self._ai_settings["ollama_model"] = vars_map["ollama_model"].get().strip() or "llama3.2:3b"
+                self._ai_settings["ollama_base_url"] = vars_map["ollama_base_url"].get().strip() or "http://127.0.0.1:11434"
+                self._ai_settings["api_base_url"] = vars_map["api_base_url"].get().strip() or "https://api.openai.com"
+                self._ai_settings["api_key_env"] = vars_map["api_key_env"].get().strip() or "OPENAI_API_KEY"
+                self._ai_settings["api_model"] = vars_map["api_model"].get().strip() or "gpt-4o-mini"
+                self._skim_pre_ms = max(0, int(vars_map["_skim_pre_ms"].get().strip() or "0"))
+                self._skim_post_ms = max(0, int(vars_map["_skim_post_ms"].get().strip() or "0"))
+                self._save_gui_settings()
+                new_provider = str(self._ai_settings.get("ai_provider") or "ollama")
+                if new_provider.lower() == "ollama":
+                    if (
+                        prev_provider.lower() != "ollama"
+                        or prev_model != str(self._ai_settings.get("ollama_model"))
+                        or prev_base != str(self._ai_settings.get("ollama_base_url"))
+                    ):
+                        self._start_ollama_bootstrap(background=True, force_reset=True)
+                status_var.set("Saved")
+                self.status_var.set("Settings saved")
+            except Exception as exc:
+                status_var.set(f"Save failed: {exc}")
+            return "break"
+
+        popup.bind("<Escape>", lambda _e: popup.destroy())
+        popup.bind("<Return>", save_now)
+
     def _open_search_popup(self) -> None:
         if self._search_popup and self._search_popup.winfo_exists():
             self._search_popup.focus_force()
@@ -812,6 +1578,7 @@ class TranscriptPlayer:
         popup = tk.Toplevel(self.root)
         self._apply_popup_style(popup, "Search DB", "900x620")
         self._search_popup = popup
+        self._register_popup("finder", popup)
         popup.rowconfigure(2, weight=1)
         popup.columnconfigure(0, weight=1)
 
@@ -977,6 +1744,7 @@ class TranscriptPlayer:
         popup = tk.Toplevel(self.root)
         self._apply_popup_style(popup, "Open Video", "900x620")
         self._video_picker_popup = popup
+        self._register_popup("open_video", popup)
         popup.rowconfigure(2, weight=1)
         popup.columnconfigure(0, weight=1)
 
@@ -1032,7 +1800,7 @@ class TranscriptPlayer:
 
         hint = tk.Label(
             popup,
-            text="Type title filter, Up/Down select, Enter open video, Esc close",
+            text="Type title filter, Up/Down select, Enter open, Delete remove video+transcript, Esc close",
             anchor="w",
             bg="#0d0d0d",
             fg="#8f8f8f",
@@ -1041,6 +1809,19 @@ class TranscriptPlayer:
             pady=6,
         )
         hint.grid(row=3, column=0, sticky="ew")
+        status_var = tk.StringVar(value="")
+        status_lbl = tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#d2d2d2",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        status_lbl.grid(row=4, column=0, sticky="ew")
+        pending_delete: dict[str, str | None] = {"video_id": None}
 
         def _set_selection(idx: int) -> None:
             if not self._video_picker_results:
@@ -1070,6 +1851,7 @@ class TranscriptPlayer:
                 title_list.insert(tk.END, title)
             if self._video_picker_results:
                 _set_selection(0)
+            status_var.set(f"{len(self._video_picker_results)} rows")
 
         def open_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
             sel = title_list.curselection()
@@ -1080,11 +1862,11 @@ class TranscriptPlayer:
                 return "break"
             row = self._video_picker_results[idx]
             video_id = str(row.get("video_id") or "")
-            transcript_path = Path(str(row.get("transcript_json_path") or ""))
+            transcript_raw = str(row.get("transcript_json_path") or "").strip()
+            transcript_path = Path(transcript_raw) if transcript_raw else None
             preferred = Path(str(row.get("local_video_path") or "")) if row.get("local_video_path") else None
-            if not transcript_path.exists():
-                self.status_var.set(f"Missing transcript for {video_id}")
-                return "break"
+            if transcript_path is not None and not transcript_path.exists():
+                transcript_path = None
             try:
                 video_path = resolve_playback_media_path(
                     self.ingester_config,
@@ -1114,6 +1896,38 @@ class TranscriptPlayer:
             _set_selection(cur + delta)
             return "break"
 
+        def delete_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sel = title_list.curselection()
+            if not sel:
+                status_var.set("No video selected")
+                return "break"
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(self._video_picker_results):
+                status_var.set("Invalid selection")
+                return "break"
+            row = self._video_picker_results[idx]
+            video_id = str(row.get("video_id") or "")
+            if not video_id:
+                status_var.set("Selection has no video id")
+                return "break"
+            if pending_delete.get("video_id") != video_id:
+                pending_delete["video_id"] = video_id
+                status_var.set(f"Press Delete again to remove {video_id}")
+                return "break"
+            pending_delete["video_id"] = None
+            try:
+                summary = self.ingester.delete_video_and_assets(video_id)
+                status_var.set(
+                    f"Deleted {video_id}: files={summary.get('deleted_files', 0)} "
+                    f"jobs={summary.get('jobs_deleted', 0)}"
+                )
+                if self.current_video_id == video_id:
+                    self._clear_loaded_session("Deleted currently loaded video")
+                refresh_results()
+            except Exception as exc:
+                status_var.set(f"Delete failed: {exc}")
+            return "break"
+
         query_var.trace_add("write", refresh_results)
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
         popup.bind("<Return>", open_selected)
@@ -1124,26 +1938,56 @@ class TranscriptPlayer:
         title_list.bind("<Up>", lambda _e: move_sel(-1))
         title_list.bind("<Down>", lambda _e: move_sel(1))
         title_list.bind("<Double-Button-1>", open_selected)
+        title_list.bind("<Delete>", delete_selected)
         count_list.bind("<Button-1>", lambda _e: "break")
+        popup.bind("<Delete>", delete_selected)
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
         refresh_results()
         query_entry.focus_set()
 
     def _open_ingest_popup(self) -> None:
-        if self._ingest_popup and self._ingest_popup.winfo_exists():
-            self._ingest_popup.focus_force()
-            return
-
         popup = tk.Toplevel(self.root)
-        self._apply_popup_style(popup, "Ingest URL", "880x160")
+        self._apply_popup_style(popup, "Ingest", "900x460")
         self._ingest_popup = popup
+        self._register_popup("ingest", popup)
+        popup.rowconfigure(2, weight=1)
         popup.columnconfigure(0, weight=1)
 
-        url_var = tk.StringVar()
-        entry = ttk.Entry(popup, textvariable=url_var, style="Filter.TEntry")
+        input_var = tk.StringVar()
+        entry = ttk.Entry(popup, textvariable=input_var, style="Filter.TEntry")
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
-        status = tk.StringVar(value="Enter URL and press Enter")
+        hint = tk.Label(
+            popup,
+            text="Input + Enter on command: Ingest (URL[s]) | Browse (channel) | Subscribe (channel)",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        hint.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+        listbox = tk.Listbox(
+            popup,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            exportselection=False,
+        )
+        listbox.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        commands = ["Ingest", "Browse", "Subscribe"]
+        for c in commands:
+            listbox.insert(tk.END, c)
+        listbox.selection_set(0)
+
+        status = tk.StringVar(value="Ready")
         status_lbl = tk.Label(
             popup,
             textvariable=status,
@@ -1154,54 +1998,391 @@ class TranscriptPlayer:
             padx=8,
             pady=6,
         )
-        status_lbl.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
-        pending_confirm: dict[str, object] = {"video_id": None, "url": None}
+        status_lbl.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
 
-        def enqueue_now(_event: tk.Event[tk.Misc] | None = None) -> str:
-            url = url_var.get().strip()
-            if not url:
-                status.set("URL required")
+        def _selected_command() -> str:
+            sel = listbox.curselection()
+            idx = int(sel[0]) if sel else 0
+            return commands[max(0, min(idx, len(commands) - 1))]
+
+        def run_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            cmd = _selected_command()
+            token = input_var.get().strip()
+            if cmd == "Ingest":
+                if not token:
+                    status.set("Provide one or more URLs separated by spaces")
+                    return "break"
+                urls = [u.strip() for u in token.split() if u.strip()]
+                if not urls:
+                    status.set("No URLs parsed")
+                    return "break"
+                try:
+                    result = self.ingester.enqueue_with_dedupe(urls, allow_overwrite=False)
+                    ids = list(result.get("queued_ids") or [])
+                    status.set(f"Queued {len(ids)} jobs")
+                    if ids:
+                        self.status_var.set(f"Queued ingest job {ids[0]}")
+                except Exception as exc:
+                    status.set(f"Ingest failed: {exc}")
+                return "break"
+
+            if cmd == "Browse":
+                if not token:
+                    status.set("Provide channel URL/@handle/name")
+                    return "break"
+                self._channel_default_ref = token
+                popup.destroy()
+                self._open_channel_popup()
+                self.status_var.set(f"Channel browse requested: {token}")
+                return "break"
+
+            if not token:
+                status.set("Provide channel URL/@handle/name")
                 return "break"
             try:
-                info = self.ingester.inspect_url(url)
-                exists = bool(info.get("exists"))
-                video_id = str(info.get("video_id") or "")
-                if exists:
-                    if pending_confirm.get("video_id") != video_id or pending_confirm.get("url") != url:
-                        pending_confirm["video_id"] = video_id
-                        pending_confirm["url"] = url
-                        title = str(info.get("title") or video_id)
-                        status.set(
-                            f"Exists: {title} ({video_id}). Press Enter again to save over, Esc to cancel."
-                        )
-                        return "break"
-                    result = self.ingester.enqueue_with_dedupe([url], allow_overwrite=True)
-                else:
-                    pending_confirm["video_id"] = None
-                    pending_confirm["url"] = None
-                    result = self.ingester.enqueue_with_dedupe([url], allow_overwrite=False)
-                ids = list(result.get("queued_ids") or [])
-                if not ids:
-                    status.set("Not queued")
-                    return "break"
-                status.set(f"Queued job_id={ids[0]}")
-                self.status_var.set(f"Queued ingest job {ids[0]}")
-                url_var.set("")
+                sub = self.ingester.add_channel_subscription(token, seed_with_latest=True)
+                status.set(f"Subscribed: {sub.get('channel_title')} ({sub.get('channel_key')})")
             except Exception as exc:
-                status.set(f"Error: {exc}")
+                status.set(f"Subscribe failed: {exc}")
             return "break"
 
-        popup.bind("<Return>", enqueue_now)
+        def move(delta: int) -> str:
+            sel = listbox.curselection()
+            cur = int(sel[0]) if sel else 0
+            nxt = max(0, min(cur + delta, len(commands) - 1))
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(nxt)
+            listbox.activate(nxt)
+            listbox.see(nxt)
+            return "break"
+
+        popup.bind("<Return>", run_selected)
+        popup.bind("<Up>", lambda _e: move(-1))
+        popup.bind("<Down>", lambda _e: move(1))
+        listbox.bind("<Return>", run_selected)
+        listbox.bind("<Double-Button-1>", run_selected)
         popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
         popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
         entry.focus_set()
 
-    def _open_jobs_popup(self) -> None:
+    def _open_skim_popup(self) -> None:
         popup = tk.Toplevel(self.root)
-        self._apply_popup_style(popup, "Ingest Jobs", "900x520")
-        self._jobs_popup = popup
+        self._apply_popup_style(popup, "Skim Settings", "520x190")
+        popup.columnconfigure(0, weight=1)
+
+        pre_var = tk.StringVar(value=str(self._skim_pre_ms))
+        post_var = tk.StringVar(value=str(self._skim_post_ms))
+        status_var = tk.StringVar(
+            value=f"Current: {'ON' if self._skim_mode else 'OFF'} (pre={self._skim_pre_ms}ms, post={self._skim_post_ms}ms)"
+        )
+
+        pre_entry = ttk.Entry(popup, textvariable=pre_var, style="Filter.TEntry")
+        pre_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        post_entry = ttk.Entry(popup, textvariable=post_var, style="Filter.TEntry")
+        post_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+        hint = tk.Label(
+            popup,
+            text="Line1=pre-buffer ms | Line2=post-buffer ms | Enter apply | Ctrl-J toggle skim",
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            padx=8,
+            pady=6,
+        )
+        hint.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+        status_lbl = tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#d2d2d2",
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            padx=8,
+            pady=6,
+        )
+        status_lbl.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        def apply_values(_event: tk.Event[tk.Misc] | None = None) -> str:
+            try:
+                pre = max(0, int(pre_var.get().strip() or "0"))
+                post = max(0, int(post_var.get().strip() or "0"))
+            except ValueError:
+                status_var.set("Pre/post values must be integers in milliseconds")
+                return "break"
+            self._skim_pre_ms = pre
+            self._skim_post_ms = post
+            status_var.set(
+                f"Applied: {'ON' if self._skim_mode else 'OFF'} (pre={pre}ms, post={post}ms)"
+            )
+            return "break"
+
+        popup.bind("<Return>", apply_values)
+        popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
+        popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
+        pre_entry.focus_set()
+
+    def _open_channel_popup(self) -> None:
+        if self._channel_popup and self._channel_popup.winfo_exists():
+            self._channel_popup.focus_force()
+            return
+
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Channel Browser", "980x680")
+        self._channel_popup = popup
+        self._register_popup("channel", popup)
+        popup.rowconfigure(2, weight=1)
+        popup.columnconfigure(0, weight=1)
+
+        channel_var = tk.StringVar(value=self._channel_default_ref)
+        channel_entry = ttk.Entry(popup, textvariable=channel_var, style="Filter.TEntry")
+        channel_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+
+        limit_var = tk.StringVar(value="30")
+        limit_entry = ttk.Entry(popup, textvariable=limit_var, style="Filter.TEntry")
+        limit_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+
+        listbox = tk.Listbox(
+            popup,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            exportselection=False,
+        )
+        listbox.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        status_var = tk.StringVar(
+            value="Enter channel URL/@handle/name then Enter to list videos. Enter on row queues download."
+        )
+        status_lbl = tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        status_lbl.grid(row=3, column=0, sticky="ew")
+
+        def refresh_channel_videos(_event: tk.Event[tk.Misc] | None = None) -> str:
+            ref = channel_var.get().strip()
+            if not ref:
+                status_var.set("Channel reference required")
+                return "break"
+            try:
+                limit = max(1, min(100, int(limit_var.get().strip() or "30")))
+            except ValueError:
+                status_var.set("Limit must be an integer between 1 and 100")
+                return "break"
+            try:
+                data = self.ingester.list_channel_videos(ref, limit=limit)
+                self._channel_results = [dict(row) for row in (data.get("entries") or [])]
+                listbox.delete(0, tk.END)
+                for row in self._channel_results:
+                    title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+                    listbox.insert(tk.END, title)
+                channel_title = str(data.get("channel") or ref)
+                status_var.set(
+                    f"{channel_title}: {len(self._channel_results)} videos loaded. Ctrl-S to subscribe this channel."
+                )
+                if self._channel_results:
+                    listbox.selection_set(0)
+            except Exception as exc:
+                status_var.set(f"Failed to list channel videos: {exc}")
+            return "break"
+
+        def enqueue_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sel = listbox.curselection()
+            if not sel:
+                status_var.set("No video selected")
+                return "break"
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(self._channel_results):
+                status_var.set("Invalid selection")
+                return "break"
+            row = self._channel_results[idx]
+            url = str(row.get("url") or "").strip()
+            if not url:
+                status_var.set("Selected row has no URL")
+                return "break"
+            try:
+                result = self.ingester.enqueue_with_dedupe([url], allow_overwrite=False)
+                ids = list(result.get("queued_ids") or [])
+                if not ids:
+                    status_var.set("Not queued (already exists)")
+                    return "break"
+                status_var.set(f"Queued job_id={ids[0]}")
+                self.status_var.set(f"Queued ingest job {ids[0]}")
+            except Exception as exc:
+                status_var.set(f"Queue failed: {exc}")
+            return "break"
+
+        def subscribe_channel(_event: tk.Event[tk.Misc] | None = None) -> str:
+            ref = channel_var.get().strip()
+            if not ref:
+                status_var.set("Channel reference required")
+                return "break"
+            try:
+                sub = self.ingester.add_channel_subscription(ref, seed_with_latest=True)
+                status_var.set(
+                    f"Subscribed: {sub.get('channel_title')} ({sub.get('channel_key')})"
+                )
+            except Exception as exc:
+                status_var.set(f"Subscribe failed: {exc}")
+            return "break"
+
+        popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
+        popup.bind("<Control-s>", subscribe_channel)
+        channel_entry.bind("<Return>", refresh_channel_videos)
+        limit_entry.bind("<Return>", refresh_channel_videos)
+        listbox.bind("<Return>", enqueue_selected)
+        listbox.bind("<Double-Button-1>", enqueue_selected)
+        popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
+        channel_entry.focus_set()
+
+    def _open_subscriptions_popup(self) -> None:
+        if self._subscriptions_popup and self._subscriptions_popup.winfo_exists():
+            self._subscriptions_popup.focus_force()
+            return
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Subscriptions", "920x620")
+        self._subscriptions_popup = popup
+        self._register_popup("subscriptions", popup)
         popup.rowconfigure(0, weight=1)
         popup.columnconfigure(0, weight=1)
+
+        listbox = tk.Listbox(
+            popup,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            exportselection=False,
+        )
+        listbox.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
+
+        status_var = tk.StringVar(value="R refresh | Delete remove selected | P poll now")
+        status_lbl = tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        status_lbl.grid(row=1, column=0, sticky="ew")
+        rows_cache: list[dict[str, Any]] = []
+
+        def refresh_rows(_event: tk.Event[tk.Misc] | None = None) -> str:
+            nonlocal rows_cache
+            try:
+                rows = self.ingester.list_channel_subscriptions(active_only=False)
+                rows_cache = [dict(r) for r in rows]
+                listbox.delete(0, tk.END)
+                for row in rows_cache:
+                    title = str(row.get("channel_title") or row.get("channel_key") or "")
+                    key = str(row.get("channel_key") or "")
+                    last_seen = str(row.get("last_seen_video_id") or "-")
+                    listbox.insert(tk.END, f"{title} | {key} | last_seen={last_seen}")
+                status_var.set(f"{len(rows_cache)} subscriptions loaded")
+                if rows_cache:
+                    listbox.selection_set(0)
+            except Exception as exc:
+                status_var.set(f"Failed to load subscriptions: {exc}")
+            return "break"
+
+        def remove_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sel = listbox.curselection()
+            if not sel:
+                status_var.set("No subscription selected")
+                return "break"
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(rows_cache):
+                status_var.set("Invalid selection")
+                return "break"
+            channel_key = str(rows_cache[idx].get("channel_key") or "")
+            if not channel_key:
+                status_var.set("Selected row has no channel key")
+                return "break"
+            try:
+                removed = self.ingester.remove_channel_subscription(channel_key)
+                status_var.set(f"Removed={removed} channel_key={channel_key}")
+                refresh_rows()
+            except Exception as exc:
+                status_var.set(f"Remove failed: {exc}")
+            return "break"
+
+        def poll_now(_event: tk.Event[tk.Misc] | None = None) -> str:
+            try:
+                summary = self.ingester.poll_subscriptions_once()
+                status_var.set(
+                    f"Poll complete: scanned={summary.get('scanned', 0)} queued={summary.get('queued', 0)}"
+                )
+            except Exception as exc:
+                status_var.set(f"Poll failed: {exc}")
+            return "break"
+
+        popup.bind("<Escape>", lambda _e: (popup.destroy(), self.filter_entry.focus_set()))
+        popup.bind("<KeyPress-r>", refresh_rows)
+        popup.bind("<Delete>", remove_selected)
+        popup.bind("<KeyPress-p>", poll_now)
+        popup.protocol("WM_DELETE_WINDOW", lambda: (popup.destroy(), self.filter_entry.focus_set()))
+        refresh_rows()
+
+    def _restart_workers(self, target: int) -> None:
+        target = max(0, int(target))
+        self.ingester.stop_background_workers()
+        if target > 0:
+            self.ingester.start_background_workers(target)
+        self._worker_target_count = target
+        self._workers_paused = False
+
+    def _run_worker_command(self, command: str) -> str:
+        label = command.strip().lower()
+        if label == "create":
+            self._restart_workers(self._worker_target_count + 1)
+            return f"Workers: {self._worker_target_count}"
+        if label == "retire":
+            self._restart_workers(max(0, self._worker_target_count - 1))
+            return f"Workers: {self._worker_target_count}"
+        if label == "pause":
+            self.ingester.stop_background_workers()
+            self._workers_paused = True
+            return "Workers paused"
+        if label == "resume":
+            if self._worker_target_count > 0:
+                self.ingester.start_background_workers(self._worker_target_count)
+            self._workers_paused = False
+            return f"Workers resumed ({self._worker_target_count})"
+        if label == "cancel":
+            return "Cancel is not yet wired to per-job interruption"
+        if label == "assign":
+            return "Assign task via Ctrl-N Ingest popup"
+        return "Unknown command"
+
+    def _open_jobs_popup(self) -> None:
+        popup = tk.Toplevel(self.root)
+        self._apply_popup_style(popup, "Workers", "980x560")
+        self._jobs_popup = popup
+        self._register_popup("workers", popup)
+        popup.rowconfigure(0, weight=1)
+        popup.columnconfigure(0, weight=2)
+        popup.columnconfigure(1, weight=1)
 
         text = tk.Text(
             popup,
@@ -1214,11 +2395,66 @@ class TranscriptPlayer:
             padx=8,
             pady=8,
         )
-        text.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 8))
+        text.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=(8, 8))
         text.configure(state="disabled")
         self._jobs_text = text
 
+        cmd_list = tk.Listbox(
+            popup,
+            bg="#000000",
+            fg="#ffffff",
+            selectbackground="#161616",
+            selectforeground="#ffffff",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] - 2),
+            exportselection=False,
+        )
+        cmd_list.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=(8, 8))
+        self._workers_cmd_list = cmd_list
+        commands = ["Create", "Retire", "Assign", "Pause", "Resume", "Cancel"]
+        for cmd in commands:
+            cmd_list.insert(tk.END, cmd)
+        cmd_list.selection_set(0)
+
+        status_var = tk.StringVar(value="Enter executes worker command")
+        status_lbl = tk.Label(
+            popup,
+            textvariable=status_var,
+            anchor="w",
+            bg="#0d0d0d",
+            fg="#8f8f8f",
+            font=(FONT["STYLE"], FONT["SIZE"] - 3),
+            padx=8,
+            pady=6,
+        )
+        status_lbl.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+
+        def run_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
+            sel = cmd_list.curselection()
+            if not sel:
+                return "break"
+            label = str(cmd_list.get(sel[0]))
+            status_var.set(self._run_worker_command(label))
+            self._refresh_jobs_popup()
+            return "break"
+
+        def move(delta: int) -> str:
+            sel = cmd_list.curselection()
+            cur = int(sel[0]) if sel else 0
+            nxt = max(0, min(cur + delta, len(commands) - 1))
+            cmd_list.selection_clear(0, tk.END)
+            cmd_list.selection_set(nxt)
+            cmd_list.activate(nxt)
+            cmd_list.see(nxt)
+            return "break"
+
         popup.bind("<Escape>", lambda _e: self._close_jobs_popup())
+        popup.bind("<Up>", lambda _e: move(-1))
+        popup.bind("<Down>", lambda _e: move(1))
+        popup.bind("<Return>", run_selected)
+        cmd_list.bind("<Double-Button-1>", run_selected)
         popup.protocol("WM_DELETE_WINDOW", self._close_jobs_popup)
         self._refresh_jobs_popup()
 
@@ -1233,6 +2469,7 @@ class TranscriptPlayer:
             self._jobs_popup.destroy()
         self._jobs_popup = None
         self._jobs_text = None
+        self._workers_cmd_list = None
         self.filter_entry.focus_set()
 
     def _refresh_jobs_popup(self) -> None:
@@ -1245,6 +2482,7 @@ class TranscriptPlayer:
             counts = snapshot.get("counts", {})
             jobs = snapshot.get("jobs", [])
             lines = [
+                f"workers_target={self._worker_target_count} paused={self._workers_paused}",
                 f"queued={counts.get('queued', 0)}  "
                 f"downloading={counts.get('downloading', 0)}  "
                 f"transcribing={counts.get('transcribing', 0)}  "
@@ -1290,7 +2528,7 @@ class TranscriptPlayer:
         self,
         *,
         video_id: str,
-        transcript_json: Path,
+        transcript_json: Path | None,
         video_path: Path,
         audio_path: Path | None,
         start_sec: float,
@@ -1300,7 +2538,7 @@ class TranscriptPlayer:
         self._load_fail_count = 0
         self._proxy_attempted = False
         self.transcript_json = transcript_json
-        self.segments = self._load_segments(transcript_json)
+        self.segments = self._load_segments(transcript_json) if transcript_json and transcript_json.exists() else []
         self._segment_starts = [seg.start_sec for seg in self.segments]
         self.filtered_indexes = list(range(len(self.segments)))
         self.selected_filtered_pos = 0
@@ -1308,7 +2546,30 @@ class TranscriptPlayer:
         self.filter_var.set(filter_text)
         if not filter_text:
             self._refresh_caption_view()
-        self.status_var.set(f"Loaded video at {_fmt_hms(start_sec)}")
+        if self.segments:
+            self.status_var.set(f"Loaded video at {_fmt_hms(start_sec)}")
+        else:
+            self.status_var.set(
+                f"Loaded video at {_fmt_hms(start_sec)} (transcript not ready yet)"
+            )
+
+    def _clear_loaded_session(self, message: str) -> None:
+        self.current_video_id = None
+        self.transcript_json = None
+        self.video_path = None
+        self.audio_path = None
+        self.segments = []
+        self._segment_starts = []
+        self.filtered_indexes = []
+        self.selected_filtered_pos = 0
+        self._skim_mode = False
+        self._refresh_caption_view()
+        self.caption_now_var.set("")
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self.status_var.set(message)
 
     def close(self) -> None:
         self._close_jobs_popup()
@@ -1321,9 +2582,24 @@ class TranscriptPlayer:
         if self._ingest_popup and \
             self._ingest_popup.winfo_exists():
             self._ingest_popup.destroy()
+        if self._channel_popup and \
+            self._channel_popup.winfo_exists():
+            self._channel_popup.destroy()
+        if self._subscriptions_popup and \
+            self._subscriptions_popup.winfo_exists():
+            self._subscriptions_popup.destroy()
         try:
             self.ingester.stop_background_workers()
             self.player.stop()
+            if self._ollama_started_by_app and self._ollama_proc and self._ollama_proc.poll() is None:
+                try:
+                    self._ollama_proc.terminate()
+                    self._ollama_proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        self._ollama_proc.kill()
+                    except Exception:
+                        pass
         finally:
             self.root.destroy()
 

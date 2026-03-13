@@ -1,6 +1,5 @@
-"""Alog package."""
+"""Compatibility package that re-exports the current log package."""
 
-from .config import IngesterConfig
-from .service import IngesterService
+from log import IngesterConfig, IngesterService
 
 __all__ = ["IngesterConfig", "IngesterService"]
