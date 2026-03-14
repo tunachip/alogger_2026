@@ -63,6 +63,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._search_popup = None
         self._command_popup = None
         self._video_picker_popup = None
+        self._queue_picker_popup = None
         self._ingest_popup = None
         self._ai_popup = None
         self._settings_popup = None
@@ -107,6 +108,11 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             else 1
         )
         self._transcriber_target_count = (
+            self.workers
+            if self.workers > 0
+            else 1
+        )
+        self._summarizer_target_count = (
             self.workers
             if self.workers > 0
             else 1
@@ -156,24 +162,35 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             self._ai_settings.get("default_transcribers")
             or self._worker_target_count
             or 1))
+        self._summarizer_target_count = max(0, int(
+            self._ai_settings.get("default_summarizers")
+            or self._worker_target_count
+            or 1))
         if self._worker_target_count <= 0:
             self._worker_target_count = max(
                 self._downloader_target_count,
-                self._transcriber_target_count)
+                self._transcriber_target_count,
+                self._summarizer_target_count)
         self.ingester.set_runtime_options(
             auto_transcribe_default=bool(
                 self._ai_settings.get("auto_transcribe_default", True)),
             subscription_db_max_videos=max(0, int(
                 self._ai_settings.get("subscription_db_max_videos")
                 or 0)),
+            job_retry_limit=max(0, int(
+                self._ai_settings.get("job_retry_limit")
+                or 0)),
+            ai_runtime_settings=self._build_ai_runtime_settings(),
         )
         if self.workers > 0:
             self.ingester.start_background_workers(
                 max(self.workers,
                     self._downloader_target_count
-                    + self._transcriber_target_count),
+                    + self._transcriber_target_count
+                    + self._summarizer_target_count),
                 downloader_count=self._downloader_target_count,
                 transcriber_count=self._transcriber_target_count,
+                summarizer_count=self._summarizer_target_count,
             )
         if str(self._ai_settings.get("ai_provider")
                or "ollama").lower() == "ollama":
@@ -540,6 +557,35 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
     def _auto_transcribe_default(self) -> bool:
         return bool(self._ai_settings.get("auto_transcribe_default", True))
 
+    def _build_ai_runtime_settings(self) -> dict[str, Any]:
+        return {
+            "ai_provider": str(self._ai_settings.get("ai_provider") or "ollama"),
+            "ollama_model": str(self._ai_settings.get("ollama_model") or "llama3.2:3b"),
+            "ollama_base_url": str(
+                self._ai_settings.get("ollama_base_url")
+                or "http://127.0.0.1:11434"
+            ),
+            "api_base_url": str(
+                self._ai_settings.get("api_base_url")
+                or "https://api.openai.com"
+            ),
+            "api_key_env": str(
+                self._ai_settings.get("api_key_env")
+                or "OPENAI_API_KEY"
+            ),
+            "api_model": str(self._ai_settings.get("api_model") or "gpt-4o-mini"),
+            "auto_summary_default": bool(
+                self._ai_settings.get("auto_summary_default", False)
+            ),
+            "summary_segment_limit": max(
+                0,
+                int(self._ai_settings.get("summary_segment_limit") or 0),
+            ),
+            "summary_instructions_path": str(
+                self._ai_settings.get("summary_instructions_path") or ""
+            ),
+        }
+
     def _ollama_server_healthy(self) -> bool:
         try:
             req = urllib.request.Request(
@@ -745,7 +791,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         launchers: list[tuple[str, Callable[[], None]]] = [
             ("Cmd", lambda: self._toggle_popup("command", self._open_command_popup)),
             ("Ingest", lambda: self._toggle_popup("ingest", self._open_ingest_popup)),
-            ("Workers", lambda: self._toggle_popup("workers", self._open_jobs_popup)),
+            ("Workflows", lambda: self._toggle_popup("workers", self._open_jobs_popup)),
             ("Open", lambda: self._toggle_popup("open_video", self._open_video_picker_popup)),
             ("Find", lambda: self._toggle_popup("finder", self._open_search_popup)),
             ("AI", lambda: self._toggle_popup("ai", self._open_ai_popup)),

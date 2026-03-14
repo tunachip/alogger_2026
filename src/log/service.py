@@ -5,9 +5,11 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from typing import Callable
 
+from .ai import generate_transcript_summary, merged_ai_settings
 from .config import IngesterConfig
 from .db import DB, Job
 from .notify import send_webhook
@@ -32,13 +34,19 @@ class IngesterService:
         self.db = DB(config.db_path)
         self.auto_transcribe_default = True
         self.subscription_db_max_videos = 0
+        self.job_retry_limit = 0
+        self._ai_runtime_settings = merged_ai_settings()
         self.downloader_worker_count = max(1, int(config.worker_count))
         self.transcriber_worker_count = max(1, int(config.worker_count))
+        self.summarizer_worker_count = max(1, int(config.worker_count))
         self._download_sem = threading.Semaphore(self.downloader_worker_count)
         self._transcribe_sem = threading.Semaphore(self.transcriber_worker_count)
+        self._summarize_sem = threading.Semaphore(self.summarizer_worker_count)
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
         self._subscription_thread: threading.Thread | None = None
+        self._summary_state_lock = threading.Lock()
+        self._active_summary_jobs: dict[int, dict[str, object]] = {}
 
     def init(self) -> None:
         self.config.ensure_dirs()
@@ -51,7 +59,7 @@ class IngesterService:
         *,
         auto_transcribe: bool | None = None,
     ) -> list[int]:
-        return self.db.enqueue(urls, priority=priority, auto_transcribe=auto_transcribe)
+        return self.db.enqueue_download(urls, priority=priority, auto_transcribe=auto_transcribe)
 
     def inspect_url(self, url: str) -> dict[str, object]:
         self.init()
@@ -89,7 +97,7 @@ class IngesterService:
             if bool(info.get("exists")) and not allow_overwrite:
                 conflicts.append(info)
                 continue
-            ids = self.db.enqueue([url], priority=priority, auto_transcribe=auto_transcribe)
+            ids = self.db.enqueue_download([url], priority=priority, auto_transcribe=auto_transcribe)
             queued_ids.extend(ids)
         return {"queued_ids": queued_ids, "conflicts": conflicts}
 
@@ -98,18 +106,180 @@ class IngesterService:
         *,
         auto_transcribe_default: bool | None = None,
         subscription_db_max_videos: int | None = None,
+        job_retry_limit: int | None = None,
+        ai_runtime_settings: dict[str, object] | None = None,
     ) -> None:
         if auto_transcribe_default is not None:
             self.auto_transcribe_default = bool(auto_transcribe_default)
         if subscription_db_max_videos is not None:
             self.subscription_db_max_videos = max(0, int(subscription_db_max_videos))
+        if job_retry_limit is not None:
+            self.job_retry_limit = max(0, int(job_retry_limit))
+        if ai_runtime_settings is not None:
+            self._ai_runtime_settings = merged_ai_settings(ai_runtime_settings)
+
+    def _summary_enabled(self) -> bool:
+        return bool(self._ai_runtime_settings.get("auto_summary_default", False))
+
+    def _ensure_summary_ollama_ready(self) -> None:
+        pass
+
+    def _generate_video_summary(
+        self,
+        *,
+        video_id: str,
+        metadata: dict[str, object],
+        segments: list[dict[str, object]],
+        job_id: int,
+        worker_id: int,
+        force: bool = False,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> None:
+        if (not force and not self._summary_enabled()) or not segments:
+            return
+        with self._summarize_sem:
+            started_at = time.monotonic()
+            with self._summary_state_lock:
+                self._active_summary_jobs[job_id] = {
+                    "job_id": job_id,
+                    "video_id": video_id,
+                    "worker_id": worker_id,
+                    "started_monotonic": started_at,
+                }
+            if progress_cb:
+                progress_cb("summary_start", {"job_id": job_id, "video_id": video_id})
+            try:
+                payload = generate_transcript_summary(
+                    transcript_segments=segments,
+                    metadata=metadata,
+                    settings=self._ai_runtime_settings,
+                    ensure_ollama_ready=self._ensure_summary_ollama_ready,
+                )
+                summary = str(payload.get("summary") or "").strip()
+                genres_raw = payload.get("genre") or []
+                genres = [str(item).strip() for item in genres_raw if str(item).strip()]
+                merged_fields = {
+                    "summary": summary,
+                    "genre": genres,
+                    "summary_model": payload.get("model"),
+                    "summary_segment_limit": payload.get("segment_limit"),
+                }
+                self.db.merge_video_metadata_fields(video_id, merged_fields)
+                if progress_cb:
+                    progress_cb(
+                        "summary_done",
+                        {
+                            "job_id": job_id,
+                            "video_id": video_id,
+                            "genre_count": len(genres),
+                            "summary_length": len(summary),
+                        },
+                    )
+                self._notify(
+                    "summary_done",
+                    job_id=job_id,
+                    video_id=video_id,
+                    worker_id=worker_id,
+                    genre_count=len(genres),
+                    summary_length=len(summary),
+                )
+            except Exception as exc:
+                self.db.merge_video_metadata_fields(
+                    video_id,
+                    {
+                        "summary_error": str(exc),
+                    },
+                )
+                if progress_cb:
+                    progress_cb(
+                        "summary_failed",
+                        {
+                            "job_id": job_id,
+                            "video_id": video_id,
+                            "error": str(exc),
+                        },
+                    )
+                self._notify(
+                    "summary_failed",
+                    job_id=job_id,
+                    video_id=video_id,
+                    worker_id=worker_id,
+                    error=str(exc),
+                )
+            finally:
+                with self._summary_state_lock:
+                    self._active_summary_jobs.pop(job_id, None)
+
+    def _handle_job_failure(
+        self,
+        job: Job,
+        exc: Exception,
+        *,
+        worker_id: int,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> None:
+        error = str(exc)
+        if int(job.retries) < int(self.job_retry_limit):
+            self.db.retry_job(job.id, error_text=error)
+            self._notify(
+                "retrying",
+                job_id=job.id,
+                url=job.url,
+                error=error,
+                worker_id=worker_id,
+                retries=int(job.retries) + 1,
+                retry_limit=int(self.job_retry_limit),
+            )
+            if progress_cb:
+                progress_cb(
+                    "retrying",
+                    {
+                        "job_id": job.id,
+                        "url": job.url,
+                        "worker_id": worker_id,
+                        "error": error,
+                        "retries": int(job.retries) + 1,
+                        "retry_limit": int(self.job_retry_limit),
+                    },
+                )
+            return
+        self.db.update_job_status(job.id, "failed", error_text=error)
+        self._notify("failed", job_id=job.id, url=job.url, error=error, worker_id=worker_id)
+        if progress_cb:
+            progress_cb(
+                "failed",
+                {
+                    "job_id": job.id,
+                    "url": job.url,
+                    "worker_id": worker_id,
+                    "error": error,
+                },
+            )
 
     def run_forever(self) -> None:
         self.init()
         self._stop_event.clear()
         self._start_subscription_poller()
-        with ThreadPoolExecutor(max_workers=self.config.worker_count) as executor:
-            futures = [executor.submit(self._worker_loop, i) for i in range(self.config.worker_count)]
+        total_workers = max(
+            1,
+            self.downloader_worker_count
+            + self.transcriber_worker_count
+            + self.summarizer_worker_count,
+        )
+        with ThreadPoolExecutor(max_workers=total_workers) as executor:
+            futures = []
+            futures.extend(
+                executor.submit(self._download_worker_loop, i)
+                for i in range(self.downloader_worker_count)
+            )
+            futures.extend(
+                executor.submit(self._transcribe_worker_loop, i)
+                for i in range(self.transcriber_worker_count)
+            )
+            futures.extend(
+                executor.submit(self._summary_worker_loop, i)
+                for i in range(self.summarizer_worker_count)
+            )
             try:
                 for f in futures:
                     f.result()
@@ -123,6 +293,65 @@ class IngesterService:
     def process_job_id(self, job_id: int, worker_id: int = 0) -> dict[str, object]:
         return self.process_job_id_with_progress(job_id, worker_id=worker_id)
 
+    def enqueue_video_for_transcription(
+        self,
+        video_id: str,
+        *,
+        priority: int = 0,
+        force: bool = False,
+    ) -> dict[str, object]:
+        self.init()
+        video = self.db.get_video(video_id)
+        if not video:
+            raise PipelineError(f"Unknown video id: {video_id}")
+        playable = self.db.get_latest_playable_job_for_video(video_id)
+        media_path = str((playable or {}).get("local_video_path") or "").strip()
+        if not media_path:
+            raise PipelineError("Video has no local media to transcribe")
+        pending = self.db.pending_job_for_video_stage(video_id, "transcribe")
+        if pending and not force:
+            return {"queued": False, "reason": "already_queued", "job": pending}
+        job_id = self.db.enqueue_video_stage(
+            video_id=video_id,
+            source_url=str(video.get("source_url") or playable.get("source_url") or ""),
+            queue_stage="transcribe",
+            priority=priority,
+            auto_transcribe=True,
+            local_video_path=media_path,
+            transcript_json_path=str((playable or {}).get("transcript_json_path") or "").strip() or None,
+        )
+        return {"queued": True, "job_id": job_id, "video_id": video_id, "queue_stage": "transcribe"}
+
+    def enqueue_video_for_summary(
+        self,
+        video_id: str,
+        *,
+        priority: int = 0,
+        force: bool = False,
+    ) -> dict[str, object]:
+        self.init()
+        video = self.db.get_video(video_id)
+        if not video:
+            raise PipelineError(f"Unknown video id: {video_id}")
+        playable = self.db.get_latest_playable_job_for_video(video_id)
+        media_path = str((playable or {}).get("local_video_path") or "").strip()
+        transcript_path = str((playable or {}).get("transcript_json_path") or "").strip()
+        if not transcript_path:
+            raise PipelineError("Video has no transcript to summarize")
+        pending = self.db.pending_job_for_video_stage(video_id, "summarize")
+        if pending and not force:
+            return {"queued": False, "reason": "already_queued", "job": pending}
+        job_id = self.db.enqueue_video_stage(
+            video_id=video_id,
+            source_url=str(video.get("source_url") or playable.get("source_url") or ""),
+            queue_stage="summarize",
+            priority=priority,
+            auto_transcribe=True,
+            local_video_path=media_path or None,
+            transcript_json_path=transcript_path,
+        )
+        return {"queued": True, "job_id": job_id, "video_id": video_id, "queue_stage": "summarize"}
+
     def process_job_id_with_progress(
         self,
         job_id: int,
@@ -131,29 +360,48 @@ class IngesterService:
         progress_cb: Callable[[str, dict[str, object]], None] | None = None,
     ) -> dict[str, object]:
         self.init()
-        job = self.db.reserve_job_by_id(job_id)
-        if not job:
-            row = self.db.get_job(job_id)
-            if row:
-                return {"processed": False, "reason": "job_not_queued", "job": row}
-            return {"processed": False, "reason": "job_not_found", "job_id": job_id}
-        try:
-            self._process_job(job, worker_id, progress_cb=progress_cb)
-        except Exception as exc:
-            self.db.update_job_status(job.id, "failed", error_text=str(exc))
-            self._notify("failed", job_id=job.id, url=job.url, error=str(exc), worker_id=worker_id)
-            if progress_cb:
-                progress_cb(
-                    "failed",
-                    {
-                        "job_id": job.id,
-                        "url": job.url,
-                        "worker_id": worker_id,
-                        "error": str(exc),
-                    },
+        processed_any = False
+        while True:
+            job = self.db.reserve_job_by_id(job_id)
+            if not job:
+                row = self.db.get_job(job_id)
+                if not processed_any:
+                    if row:
+                        return {"processed": False, "reason": "job_not_queued", "job": row}
+                    return {"processed": False, "reason": "job_not_found", "job_id": job_id}
+                break
+            processed_any = True
+            try:
+                self._process_reserved_job(job, worker_id, progress_cb=progress_cb)
+            except Exception as exc:
+                self._handle_job_failure(
+                    job,
+                    exc,
+                    worker_id=worker_id,
+                    progress_cb=progress_cb,
                 )
+                break
         row = self.db.get_job(job.id)
         return {"processed": True, "job": row if row else {"id": job.id}}
+
+    def _process_reserved_job(
+        self,
+        job: Job,
+        worker_id: int,
+        *,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> None:
+        stage = str(job.queue_stage or "download")
+        if stage == "download":
+            self._process_download_job(job, worker_id, progress_cb=progress_cb)
+            return
+        if stage == "transcribe":
+            self._process_transcribe_job(job, worker_id, progress_cb=progress_cb)
+            return
+        if stage == "summarize":
+            self._process_summary_job(job, worker_id, progress_cb=progress_cb)
+            return
+        raise PipelineError(f"Unsupported queue stage: {stage}")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -165,26 +413,43 @@ class IngesterService:
         *,
         downloader_count: int | None = None,
         transcriber_count: int | None = None,
+        summarizer_count: int | None = None,
     ) -> None:
         self.init()
-        if worker_count <= 0 and (downloader_count or 0) <= 0 and (transcriber_count or 0) <= 0:
+        if (
+            worker_count <= 0
+            and (downloader_count or 0) <= 0
+            and (transcriber_count or 0) <= 0
+            and (summarizer_count or 0) <= 0
+        ):
             return
         if self._worker_threads:
             return
         d_count = max(0, int(self.downloader_worker_count if downloader_count is None else downloader_count))
         t_count = max(0, int(self.transcriber_worker_count if transcriber_count is None else transcriber_count))
-        if d_count <= 0 and t_count <= 0:
+        s_count = max(0, int(self.summarizer_worker_count if summarizer_count is None else summarizer_count))
+        if d_count <= 0 and t_count <= 0 and s_count <= 0:
             return
         self.downloader_worker_count = max(1, d_count or 1)
         self.transcriber_worker_count = max(1, t_count or 1)
+        self.summarizer_worker_count = max(1, s_count or 1)
         self._download_sem = threading.Semaphore(self.downloader_worker_count)
         self._transcribe_sem = threading.Semaphore(self.transcriber_worker_count)
-        total_threads = max(int(worker_count), self.downloader_worker_count + self.transcriber_worker_count)
+        self._summarize_sem = threading.Semaphore(self.summarizer_worker_count)
         self._stop_event.clear()
-        self._worker_threads = [
-            threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
-            for i in range(total_threads)
-        ]
+        self._worker_threads = []
+        self._worker_threads.extend(
+            threading.Thread(target=self._download_worker_loop, args=(i,), daemon=True)
+            for i in range(self.downloader_worker_count)
+        )
+        self._worker_threads.extend(
+            threading.Thread(target=self._transcribe_worker_loop, args=(i,), daemon=True)
+            for i in range(self.transcriber_worker_count)
+        )
+        self._worker_threads.extend(
+            threading.Thread(target=self._summary_worker_loop, args=(i,), daemon=True)
+            for i in range(self.summarizer_worker_count)
+        )
         for t in self._worker_threads:
             t.start()
         self._start_subscription_poller()
@@ -221,20 +486,41 @@ class IngesterService:
                 self._notify("subscription_poll_failed", error=str(exc))
             self._stop_event.wait(interval)
 
-    def _worker_loop(self, worker_id: int) -> None:
+    def _download_worker_loop(self, worker_id: int) -> None:
         while not self._stop_event.is_set():
-            job = self.db.reserve_next_job()
+            job = self.db.reserve_next_job_for_stage("download")
             if not job:
                 time.sleep(self.config.poll_interval_sec)
                 continue
 
             try:
-                self._process_job(job, worker_id)
+                self._process_download_job(job, worker_id)
             except Exception as exc:  # defensive catch for service stability
-                self.db.update_job_status(job.id, "failed", error_text=str(exc))
-                self._notify("failed", job_id=job.id, url=job.url, error=str(exc), worker_id=worker_id)
+                self._handle_job_failure(job, exc, worker_id=worker_id)
 
-    def _process_job(
+    def _transcribe_worker_loop(self, worker_id: int) -> None:
+        while not self._stop_event.is_set():
+            job = self.db.reserve_next_job_for_stage("transcribe")
+            if not job:
+                time.sleep(self.config.poll_interval_sec)
+                continue
+            try:
+                self._process_transcribe_job(job, worker_id)
+            except Exception as exc:
+                self._handle_job_failure(job, exc, worker_id=worker_id)
+
+    def _summary_worker_loop(self, worker_id: int) -> None:
+        while not self._stop_event.is_set():
+            job = self.db.reserve_next_job_for_stage("summarize")
+            if not job:
+                time.sleep(self.config.poll_interval_sec)
+                continue
+            try:
+                self._process_summary_job(job, worker_id)
+            except Exception as exc:
+                self._handle_job_failure(job, exc, worker_id=worker_id)
+
+    def _process_download_job(
         self,
         job: Job,
         worker_id: int,
@@ -249,98 +535,162 @@ class IngesterService:
             raise PipelineError("yt-dlp metadata did not include video id")
         if progress_cb:
             progress_cb("metadata_done", {"job_id": job.id, "video_id": str(video_id)})
-
         self.db.upsert_video(video_id=video_id, source_url=job.url, metadata=metadata)
-
         with self._download_sem:
             if progress_cb:
                 progress_cb("download_start", {"job_id": job.id, "video_id": str(video_id)})
             local_video_path = download_video(self.config, job.url, video_id)
             if progress_cb:
-                progress_cb(
-                    "download_done",
-                    {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
-                )
-        self.db.update_job_status(
-            job.id,
-            "transcribing",
-            video_id=video_id,
-            local_video_path=str(local_video_path),
-        )
+                progress_cb("download_done", {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)})
         should_transcribe = (
             self.auto_transcribe_default
             if job.auto_transcribe is None
             else bool(int(job.auto_transcribe))
         )
-        transcript_json_path: Path | None = None
         if should_transcribe:
-            with self._transcribe_sem:
-                if progress_cb:
-                    progress_cb(
-                        "transcribe_start",
-                        {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(local_video_path)},
-                    )
-                transcript_json_path = transcribe_video(self.config, local_video_path, video_id)
-                if progress_cb:
-                    progress_cb(
-                        "transcribe_done",
-                        {
-                            "job_id": job.id,
-                            "video_id": str(video_id),
-                            "transcript_json_path": str(transcript_json_path),
-                        },
-                    )
-                    progress_cb("index_start", {"job_id": job.id, "video_id": str(video_id)})
-                segments = load_whisper_segments(transcript_json_path)
-                self.db.replace_transcript_segments(video_id=video_id, segments=segments)
-                if progress_cb:
-                    progress_cb(
-                        "index_done",
-                        {"job_id": job.id, "video_id": str(video_id), "segment_count": len(segments)},
-                    )
-                    progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
-        elif progress_cb:
-            progress_cb("transcribe_skipped", {"job_id": job.id, "video_id": str(video_id)})
-            progress_cb("merge_start", {"job_id": job.id, "video_id": str(video_id)})
-
-        playback_path = merge_streams_for_playback(self.config, video_id=video_id)
-        final_media_path = playback_path if playback_path is not None else local_video_path
-        if progress_cb:
-            progress_cb(
-                "merge_done",
-                {
-                    "job_id": job.id,
-                    "video_id": str(video_id),
-                    "local_video_path": str(final_media_path),
-                },
+            self.db.queue_job_stage(
+                job.id,
+                queue_stage="transcribe",
+                video_id=str(video_id),
+                local_video_path=str(local_video_path),
             )
-
+            if progress_cb:
+                progress_cb("transcribe_queued", {"job_id": job.id, "video_id": str(video_id)})
+            return
+        if progress_cb:
+            progress_cb("transcribe_skipped", {"job_id": job.id, "video_id": str(video_id)})
+        final_media_path = self._finalize_job_media(
+            video_id=str(video_id),
+            fallback_path=local_video_path,
+            job_id=job.id,
+            progress_cb=progress_cb,
+        )
         self.db.update_job_status(
             job.id,
             "done",
-            video_id=video_id,
+            queue_stage="download",
+            video_id=str(video_id),
             local_video_path=str(final_media_path),
-            transcript_json_path=(str(transcript_json_path) if transcript_json_path else None),
         )
         if progress_cb:
-            progress_cb(
-                "done",
-                {
-                    "job_id": job.id,
-                    "video_id": str(video_id),
-                    "local_video_path": str(final_media_path),
-                    "transcript_json_path": (str(transcript_json_path) if transcript_json_path else None),
-                },
+            progress_cb("done", {"job_id": job.id, "video_id": str(video_id), "local_video_path": str(final_media_path), "transcript_json_path": None})
+
+    def _process_transcribe_job(
+        self,
+        job: Job,
+        worker_id: int,
+        *,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> None:
+        video_id = str(job.video_id or "")
+        local_video_path = Path(str(job.local_video_path or ""))
+        if not video_id or not str(local_video_path):
+            raise PipelineError("Transcribe job missing local video path")
+        with self._transcribe_sem:
+            if progress_cb:
+                progress_cb("transcribe_start", {"job_id": job.id, "video_id": video_id, "local_video_path": str(local_video_path)})
+            transcript_json_path = transcribe_video(self.config, local_video_path, video_id)
+            if progress_cb:
+                progress_cb("transcribe_done", {"job_id": job.id, "video_id": video_id, "transcript_json_path": str(transcript_json_path)})
+                progress_cb("index_start", {"job_id": job.id, "video_id": video_id})
+            segments = load_whisper_segments(transcript_json_path)
+            self.db.replace_transcript_segments(video_id=video_id, segments=segments)
+            if progress_cb:
+                progress_cb("index_done", {"job_id": job.id, "video_id": video_id, "segment_count": len(segments)})
+        if self._summary_enabled():
+            self.db.queue_job_stage(
+                job.id,
+                queue_stage="summarize",
+                video_id=video_id,
+                local_video_path=str(local_video_path),
+                transcript_json_path=str(transcript_json_path),
             )
-        self._notify(
-            "done",
-            job_id=job.id,
-            url=job.url,
+            if progress_cb:
+                progress_cb("summary_queued", {"job_id": job.id, "video_id": video_id})
+            return
+        final_media_path = self._finalize_job_media(
             video_id=video_id,
-            transcript_json_path=(str(transcript_json_path) if transcript_json_path else None),
-            worker_id=worker_id,
-            transcribed=should_transcribe,
+            fallback_path=local_video_path,
+            job_id=job.id,
+            progress_cb=progress_cb,
         )
+        self.db.update_job_status(
+            job.id,
+            "done",
+            queue_stage="transcribe",
+            video_id=video_id,
+            local_video_path=str(final_media_path),
+            transcript_json_path=str(transcript_json_path),
+        )
+        if progress_cb:
+            progress_cb("done", {"job_id": job.id, "video_id": video_id, "local_video_path": str(final_media_path), "transcript_json_path": str(transcript_json_path)})
+
+    def _process_summary_job(
+        self,
+        job: Job,
+        worker_id: int,
+        *,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> None:
+        video_id = str(job.video_id or "")
+        transcript_json_path = Path(str(job.transcript_json_path or ""))
+        fallback_path = Path(str(job.local_video_path or ""))
+        if not video_id or not str(transcript_json_path):
+            raise PipelineError("Summary job missing transcript path")
+        metadata = self.db.get_video(video_id)
+        if not metadata:
+            raise PipelineError(f"Unknown video id: {video_id}")
+        rich_metadata = dict(metadata)
+        raw_metadata = str(rich_metadata.get("metadata_json") or "").strip()
+        if raw_metadata:
+            try:
+                loaded = json.loads(raw_metadata)
+                if isinstance(loaded, dict):
+                    rich_metadata.update(loaded)
+            except Exception:
+                pass
+        segments = load_whisper_segments(transcript_json_path)
+        self._generate_video_summary(
+            video_id=video_id,
+            metadata=rich_metadata,
+            segments=segments,
+            job_id=job.id,
+            worker_id=worker_id,
+            force=True,
+            progress_cb=progress_cb,
+        )
+        final_media_path = self._finalize_job_media(
+            video_id=video_id,
+            fallback_path=fallback_path,
+            job_id=job.id,
+            progress_cb=progress_cb,
+        )
+        self.db.update_job_status(
+            job.id,
+            "done",
+            queue_stage="summarize",
+            video_id=video_id,
+            local_video_path=str(final_media_path) if str(final_media_path) else None,
+            transcript_json_path=str(transcript_json_path),
+        )
+        if progress_cb:
+            progress_cb("done", {"job_id": job.id, "video_id": video_id, "local_video_path": str(final_media_path), "transcript_json_path": str(transcript_json_path)})
+
+    def _finalize_job_media(
+        self,
+        *,
+        video_id: str,
+        fallback_path: Path,
+        job_id: int,
+        progress_cb: Callable[[str, dict[str, object]], None] | None = None,
+    ) -> Path:
+        if progress_cb:
+            progress_cb("merge_start", {"job_id": job_id, "video_id": video_id})
+        playback_path = merge_streams_for_playback(self.config, video_id=video_id)
+        final_media_path = playback_path if playback_path is not None else fallback_path
+        if progress_cb:
+            progress_cb("merge_done", {"job_id": job_id, "video_id": video_id, "local_video_path": str(final_media_path)})
+        return final_media_path
 
     def _notify(self, event: str, **payload: object) -> None:
         message = {"event": event, **payload}
@@ -356,7 +706,26 @@ class IngesterService:
         return self.db.list_jobs(limit=limit)
 
     def dashboard_snapshot(self) -> dict[str, object]:
-        return self.db.get_dashboard_snapshot()
+        snapshot = self.db.get_dashboard_snapshot()
+        now = time.monotonic()
+        with self._summary_state_lock:
+            active_summary = [
+                {
+                    "job_id": int(row.get("job_id") or 0),
+                    "video_id": str(row.get("video_id") or ""),
+                    "worker_id": int(row.get("worker_id") or 0),
+                    "elapsed_sec": max(
+                        0.0,
+                        now - float(row.get("started_monotonic") or now),
+                    ),
+                }
+                for row in self._active_summary_jobs.values()
+            ]
+        counts = dict(snapshot.get("counts") or {})
+        counts["summarizing"] = len(active_summary)
+        snapshot["counts"] = counts
+        snapshot["active_summary_jobs"] = active_summary
+        return snapshot
 
     def search_segments(self, query_text: str, *, limit: int = 200) -> list[dict[str, object]]:
         return self.db.search_transcript_segments(query_text, limit=limit)
@@ -441,12 +810,56 @@ class IngesterService:
         self.init()
         return self.db.delete_jobs_by_status(["queued"])
 
+    def clear_next_queued_job(self) -> dict[str, object] | None:
+        self.init()
+        return self.db.delete_oldest_job_by_status(["queued"])
+
+    def clear_next_queued_job_for_stage(self, stage: str) -> dict[str, object] | None:
+        self.init()
+        return self.db.delete_oldest_queued_job_for_stage(stage)
+
     def kill_active_jobs(self) -> int:
         self.init()
         return self.db.fail_jobs_by_status(
             ["downloading", "transcribing"],
             error_text="killed from worker popup",
         )
+
+    def kill_next_active_job(self) -> dict[str, object] | None:
+        self.init()
+        return self.db.fail_oldest_job_by_status(
+            ["downloading", "transcribing"],
+            error_text="killed from workflow popup",
+        )
+
+    def kill_next_active_job_for_stage(self, stage: str) -> dict[str, object] | None:
+        self.init()
+        return self.db.fail_oldest_running_job_for_stage(
+            stage,
+            error_text="killed from workflow popup",
+        )
+
+    def kill_job(self, job_id: int) -> bool:
+        self.init()
+        with self._summary_state_lock:
+            self._active_summary_jobs.pop(job_id, None)
+        return self.db.fail_job(job_id, error_text="killed from workflow popup")
+
+    def kill_oldest_summary_job(self) -> dict[str, object] | None:
+        self.init()
+        with self._summary_state_lock:
+            rows = sorted(
+                self._active_summary_jobs.values(),
+                key=lambda row: float(row.get("started_monotonic") or 0.0),
+            )
+            if not rows:
+                return None
+            payload = dict(rows[0])
+            job_id = int(payload.get("job_id") or 0)
+            self._active_summary_jobs.pop(job_id, None)
+        if job_id > 0:
+            self.db.fail_job(job_id, error_text="killed from workflow popup")
+        return payload
 
     def list_channel_videos(self, channel_ref: str, *, limit: int = 30) -> dict[str, object]:
         return list_channel_videos(self.config, channel_ref, limit=limit)

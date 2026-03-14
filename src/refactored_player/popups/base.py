@@ -175,6 +175,13 @@ class PopupBaseMixin:
             keysym = str(getattr(event, "keysym", ""))
             state = int(getattr(event, "state", 0))
             ctrl = bool(state & 0x4)
+            if (
+                hasattr(entry, "completion_is_active")
+                and callable(getattr(entry, "completion_is_active"))
+                and bool(entry.completion_is_active())
+                and keysym in {"Up", "Down", "Return", "Tab", "Escape"}
+            ):
+                return "break"
 
             if keysym == "Return":
                 return on_enter()
@@ -433,6 +440,8 @@ class PopupBaseMixin:
         self,
         parent: tk.Misc,
         textvariable: tk.StringVar,
+        *,
+        enable_field_completion: bool = False,
     ) -> QueryEntry:
         return QueryEntry(
             parent,
@@ -442,6 +451,7 @@ class PopupBaseMixin:
             accent_fg=self._theme_color("FG_ACCENT"),
             border=self._theme_color("BORDER"),
             font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
+            enable_field_completion=enable_field_completion,
         )
 
     def _create_status_label(

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 import re
 import tkinter as tk
-import urllib.request
 from tkinter import ttk
 from typing import Any
+
+from log.ai import ask_ai_text
 
 from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
 from ..utils import format_hms as _fmt_hms
@@ -21,65 +21,11 @@ class AIPopupMixin:
                 f"{api_context}\n\nUser request:\n{prompt}\n\n"
                 "Return ONLY JSON with top-level key `actions` (array)."
             )
-        provider = str(self._ai_settings.get(
-            "ai_provider") or "ollama").lower()
-        if provider == "ollama":
-            self._ensure_ollama_ready(block=True)
-            base = str(self._ai_settings.get("ollama_base_url")
-                       or "http://127.0.0.1:11434").rstrip("/")
-            model = str(self._ai_settings.get("ollama_model") or "llama3.2:3b")
-            payload = json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "stream": False
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                f"{base}/api/generate",
-                method="POST",
-                headers={"Content-Type": "application/json"},
-                data=payload,
-            )
-            with urllib.request.urlopen(req, timeout=120.0) as resp:
-                raw = resp.read()
-            body = json.loads(raw.decode("utf-8"))
-            return str(body.get("response") or ""
-                       ).strip() or "(empty response)"
-
-        base = str(self._ai_settings.get("api_base_url")
-                   or "https://api.openai.com").rstrip("/")
-        model = str(self._ai_settings.get("api_model") or "gpt-4o-mini")
-        key_env = str(self._ai_settings.get("api_key_env") or "OPENAI_API_KEY")
-        api_key = os.getenv(key_env, "")
-        if not api_key:
-            raise RuntimeError(f"Missing API key env var: {key_env}")
-        payload = json.dumps({
-            "model": model,
-            "messages": [{
-                "role": "user",
-                "content": prompt
-            }],
-            "temperature": 0.2,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"{base}/v1/chat/completions",
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            data=payload,
+        return ask_ai_text(
+            prompt,
+            self._ai_settings,
+            ensure_ollama_ready=lambda: self._ensure_ollama_ready(block=True),
         )
-        with urllib.request.urlopen(req, timeout=120.0) as resp:
-            raw = resp.read()
-        body = json.loads(raw.decode("utf-8"))
-        choices = body.get("choices") or []
-        if not isinstance(choices, list) or not choices:
-            return "(no choices)"
-        first = choices[0] if isinstance(choices[0], dict) else {}
-        msg = first.get("message") if isinstance(first, dict) else {}
-        if isinstance(msg, dict):
-            return str(msg.get("content") or "").strip() or "(empty response)"
-        return "(invalid response)"
 
     def _agent_api_context(self) -> str:
         return (

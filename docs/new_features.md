@@ -5,9 +5,6 @@
 - support downloading & ingesting from email address (users email the address, programs downloads file, clears email on success)
 - discord bot url-to-ingest support
 
-### Automatic Retry on Failed Downloads / Transcriptions
-- configurable amount of retries per job in settings
-
 ### Always On Mode:
 - launch back end on startup, closing app only closes front end
 
@@ -17,22 +14,42 @@
 - use youtube metadata or use transcript summary to group item into queryable genres
 - in settings, allow for custom summary instrcutions (set by path)
 
-### filter tags for search
-- add a set of reserved flags for search filtering, add semicolon argument splitting, add not-flags, add wildcard flags 
-  Examples:
-  1. title field contains 'slay the spire' and transcription contains both 'the' and 'of'
-    'TITLE slay the spire; the & of'
-  2. creator field contains 'north' and transcription contains either 'how' or 'where'
-    'CREATOR north; how | where'
-  3. genre field does not contain 'comedy' and transcription contains anything
-    'GENRE! comedy; *'
-  4. any field contains 'north' and transcription contains anything
-    '* north; *'
-  5. title field contains anything and transcription doesn't contain 'wow'
-    '* *; TS! wow'
-  6. title field contains 'milk' and not 'water' and transcript doesn't contain either 'soda' or 'teeth'
-    'TITLE milk; TITLE! water; TS! soda | teeth'
-  7. transcript doesn't contain both 'horse' and 'bear' (can contain either, just not both)
-    'TS! horse & bear'
+### multiple fields visualized in search
+- default header fields: video, creator, length
+- draggable position / divisions
+- set the sort hierarchy via roman-numeral nerd font char next to field title in header row
+- add / remove fields to header in order to choose what to visualize
 
-  as you can see, TS (transcript segment) is assumed unless a reserved all-caps field is provided as first word of a semicolon broken string
+## workflow UI
+
+1. when killing a job, we highlight the worker with the accent color in the visualization
+2. when unqueue a video, we highlight the filename with the accent color in the visualization
+
+## Video Search Preview pane
+1. add a preview pane, just like we have with browse, with a thumbnail, name, creator, and description.
+
+## player UI
+
+1. play/pause button (nerd font text char)
+2. playback speed setting (default 1, accept text or option from drop-down)
+3. toggleable metadata pane (below player, on the left, sticks to the player on dynamic split)
+metadata pane looks like this:
++------------------------------------------+
+video player
+...
+...
+...
+...
+...
++------------------------------------------+
+closed captions (via transcription)
++------------------------------------------+
+ [x1.5] [###############.........]
++------------------------------------------+
+  title
+  creator
+  genre
+  description
+  ...
+  ...
++------------------------------------------+

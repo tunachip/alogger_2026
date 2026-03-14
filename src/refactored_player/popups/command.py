@@ -32,10 +32,14 @@ class CommandPopupMixin:
         commands: list[tuple[str, Callable[[], None]]] = [
             ("Ingest Popup", lambda: self._toggle_popup(
                 "ingest", self._open_ingest_popup)),
-            ("Workers", lambda: self._toggle_popup(
+            ("Workflows", lambda: self._toggle_popup(
                 "workers", self._open_jobs_popup)),
             ("Open Video", lambda: self._toggle_popup(
                 "open_video", self._open_video_picker_popup)),
+            ("Queue Transcribe", lambda: self._toggle_popup(
+                "queue_picker", lambda: self._open_queue_picker_popup("transcribe"))),
+            ("Queue Summary", lambda: self._toggle_popup(
+                "queue_picker", lambda: self._open_queue_picker_popup("summarize"))),
             ("Finder", lambda: self._toggle_popup(
                 "finder", self._open_search_popup)),
             ("AI Agent", lambda: self._toggle_popup("ai", self._open_ai_popup)),

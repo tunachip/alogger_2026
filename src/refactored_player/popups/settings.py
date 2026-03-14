@@ -117,7 +117,7 @@ class SettingsPopupMixin:
         keybind_defs: list[tuple[str, str]] = [
             ("Command menu", "open_command"),
             ("Ingest menu", "open_ingest"),
-            ("Workers", "open_workers"),
+            ("Workflows", "open_workers"),
             ("Open video", "open_video"),
             ("Finder", "open_finder"),
             ("AI", "open_ai"),
@@ -173,6 +173,12 @@ class SettingsPopupMixin:
                             self._ai_settings.get("default_transcribers", 1))
                     },
                     {
+                        "id": "default_summarizers",
+                        "key": "Summarizers",
+                        "value": str(
+                            self._ai_settings.get("default_summarizers", 1))
+                    },
+                    {
                         "id": "auto_transcribe_default",
                         "key": "Auto Transcribe",
                         "value": (
@@ -180,6 +186,12 @@ class SettingsPopupMixin:
                             if self._auto_transcribe_default()
                             else "off"
                         )
+                    },
+                    {
+                        "id": "job_retry_limit",
+                        "key": "Retry Limit",
+                        "value": str(
+                            self._ai_settings.get("job_retry_limit", 0))
                     },
                     {
                         "id": "skim_pre",
@@ -318,6 +330,31 @@ class SettingsPopupMixin:
                             or "gpt-4o-mini"
                         )
                     },
+                    {
+                        "id": "auto_summary_default",
+                        "key": "Auto Summary",
+                        "value": (
+                            "on"
+                            if bool(self._ai_settings.get("auto_summary_default", False))
+                            else "off"
+                        ),
+                    },
+                    {
+                        "id": "summary_segment_limit",
+                        "key": "Summary Segments",
+                        "value": str(
+                            self._ai_settings.get("summary_segment_limit")
+                            or 0
+                        ),
+                    },
+                    {
+                        "id": "summary_instructions_path",
+                        "key": "Summary Instructions",
+                        "value": str(
+                            self._ai_settings.get("summary_instructions_path")
+                            or ""
+                        ),
+                    },
                 ]
             rows: list[dict[str, str]] = []
             kb = self._ai_settings.get("keybinds") or {}
@@ -384,6 +421,12 @@ class SettingsPopupMixin:
                 elif row_id == "default_transcribers":
                     self._ai_settings["default_transcribers"] = max(
                         0, int(token or "0"))
+                elif row_id == "default_summarizers":
+                    self._ai_settings["default_summarizers"] = max(
+                        0, int(token or "0"))
+                elif row_id == "job_retry_limit":
+                    self._ai_settings["job_retry_limit"] = max(
+                        0, int(token or "0"))
                 elif row_id == "auto_transcribe_default":
                     self._ai_settings["auto_transcribe_default"] = token.lower() in {
                         "1", "true", "yes", "on"}
@@ -446,11 +489,18 @@ class SettingsPopupMixin:
                     "ollama_base_url",
                     "api_base_url",
                     "api_key_env",
-                    "api_model"
+                    "api_model",
+                    "summary_instructions_path",
                 }:
                     self._ai_settings[row_id] = token
                     if row_id == "ai_provider" and not token:
                         self._ai_settings[row_id] = "ollama"
+                elif row_id == "auto_summary_default":
+                    self._ai_settings["auto_summary_default"] = token.lower() in {
+                        "1", "true", "yes", "on"}
+                elif row_id == "summary_segment_limit":
+                    self._ai_settings["summary_segment_limit"] = max(
+                        0, int(token or "0"))
                 elif row_id.startswith("kb:"):
                     action = row_id.split(":", 1)[1]
                     kb = self._ai_settings.get("keybinds")
@@ -464,6 +514,7 @@ class SettingsPopupMixin:
                 self._ai_settings["default_worker_count"] = max(
                     int(self._ai_settings.get("default_downloaders") or 0),
                     int(self._ai_settings.get("default_transcribers") or 0),
+                    int(self._ai_settings.get("default_summarizers") or 0),
                 )
                 self.ingester.set_runtime_options(
                     auto_transcribe_default=bool(self._ai_settings.get(
@@ -473,6 +524,10 @@ class SettingsPopupMixin:
                     subscription_db_max_videos=int(self._ai_settings.get(
                         "subscription_db_max_videos"
                     ) or 0),
+                    job_retry_limit=int(self._ai_settings.get(
+                        "job_retry_limit"
+                    ) or 0),
+                    ai_runtime_settings=self._build_ai_runtime_settings(),
                 )
                 target_downloaders = max(0, int(self._ai_settings.get(
                     "default_downloaders"
@@ -480,16 +535,25 @@ class SettingsPopupMixin:
                 target_transcribers = max(0, int(self._ai_settings.get(
                     "default_transcribers"
                 ) or 0))
-                target_workers = max(target_downloaders, target_transcribers)
+                target_summarizers = max(0, int(self._ai_settings.get(
+                    "default_summarizers"
+                ) or 0))
+                target_workers = max(
+                    target_downloaders,
+                    target_transcribers,
+                    target_summarizers,
+                )
                 if (
                     self._worker_target_count != target_workers
                     or self._downloader_target_count != target_downloaders
                     or self._transcriber_target_count != target_transcribers
+                    or self._summarizer_target_count != target_summarizers
                 ):
                     self._restart_workers(
                         target_workers,
                         target_downloaders,
-                        target_transcribers
+                        target_transcribers,
+                        target_summarizers,
                     )
 
                 self._apply_theme()

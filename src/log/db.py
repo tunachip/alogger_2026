@@ -28,7 +28,12 @@ class Job:
     url: str
     status: str
     priority: int
+    queue_stage: str = "download"
+    video_id: str | None = None
+    local_video_path: str | None = None
+    transcript_json_path: str | None = None
     auto_transcribe: int | None = None
+    retries: int = 0
 
 
 class DB:
@@ -58,6 +63,7 @@ class DB:
                     status TEXT NOT NULL CHECK(status IN (
                         'queued','downloading','transcribing','done','failed'
                     )),
+                    queue_stage TEXT NOT NULL DEFAULT 'download',
                     auto_transcribe INTEGER,
                     priority INTEGER NOT NULL DEFAULT 0,
                     retries INTEGER NOT NULL DEFAULT 0,
@@ -149,6 +155,7 @@ class DB:
                 """
             )
             self._ensure_column(conn, "ingest_jobs", "auto_transcribe", "INTEGER")
+            self._ensure_column(conn, "ingest_jobs", "queue_stage", "TEXT NOT NULL DEFAULT 'download'")
             self._ensure_column(conn, "channel_subscriptions", "auto_transcribe", "INTEGER")
 
     def _ensure_column(
@@ -171,14 +178,23 @@ class DB:
         *,
         auto_transcribe: bool | None = None,
     ) -> list[int]:
+        return self.enqueue_download(urls, priority=priority, auto_transcribe=auto_transcribe)
+
+    def enqueue_download(
+        self,
+        urls: list[str],
+        priority: int = 0,
+        *,
+        auto_transcribe: bool | None = None,
+    ) -> list[int]:
         now = utc_now_iso()
         ids: list[int] = []
         with self.connect() as conn:
             for url in urls:
                 cur = conn.execute(
                     """
-                    INSERT INTO ingest_jobs(source_url, status, auto_transcribe, priority, created_at)
-                    VALUES (?, 'queued', ?, ?, ?)
+                    INSERT INTO ingest_jobs(source_url, status, queue_stage, auto_transcribe, priority, created_at)
+                    VALUES (?, 'queued', 'download', ?, ?, ?)
                     """,
                     (url, None if auto_transcribe is None else (1 if auto_transcribe else 0), priority, now),
                 )
@@ -186,35 +202,47 @@ class DB:
         return ids
 
     def reserve_next_job(self) -> Job | None:
+        return self.reserve_next_job_for_stage("download")
+
+    def reserve_next_job_for_stage(self, stage: str) -> Job | None:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT id, source_url, status, priority, auto_transcribe
+                SELECT id, source_url, status, queue_stage, priority, video_id,
+                       local_video_path, transcript_json_path, auto_transcribe, retries
                 FROM ingest_jobs
                 WHERE status = 'queued'
+                  AND queue_stage = ?
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
-                """
+                """,
+                (stage,),
             ).fetchone()
             if not row:
                 conn.execute("COMMIT")
                 return None
+            active_status = "downloading" if stage == "download" else "transcribing"
             conn.execute(
                 """
                 UPDATE ingest_jobs
-                SET status='downloading', started_at=?, error_text=NULL
+                SET status=?, started_at=?, error_text=NULL
                 WHERE id=? AND status='queued'
                 """,
-                (utc_now_iso(), row["id"]),
+                (active_status, utc_now_iso(), row["id"]),
             )
             conn.execute("COMMIT")
             return Job(
                 id=int(row["id"]),
                 url=str(row["source_url"]),
-                status="downloading",
+                status=active_status,
+                queue_stage=str(row["queue_stage"] or stage),
                 priority=int(row["priority"]),
+                video_id=(str(row["video_id"]) if row["video_id"] is not None else None),
+                local_video_path=(str(row["local_video_path"]) if row["local_video_path"] is not None else None),
+                transcript_json_path=(str(row["transcript_json_path"]) if row["transcript_json_path"] is not None else None),
                 auto_transcribe=(None if row["auto_transcribe"] is None else int(row["auto_transcribe"])),
+                retries=int(row["retries"] or 0),
             )
 
     def reserve_job_by_id(self, job_id: int) -> Job | None:
@@ -222,7 +250,8 @@ class DB:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT id, source_url, status, priority, auto_transcribe
+                SELECT id, source_url, status, queue_stage, priority, video_id,
+                       local_video_path, transcript_json_path, auto_transcribe, retries
                 FROM ingest_jobs
                 WHERE id=?
                 LIMIT 1
@@ -235,21 +264,28 @@ class DB:
             if str(row["status"]) != "queued":
                 conn.execute("COMMIT")
                 return None
+            stage = str(row["queue_stage"] or "download")
+            active_status = "downloading" if stage == "download" else "transcribing"
             conn.execute(
                 """
                 UPDATE ingest_jobs
-                SET status='downloading', started_at=?, error_text=NULL
+                SET status=?, started_at=?, error_text=NULL
                 WHERE id=? AND status='queued'
                 """,
-                (utc_now_iso(), job_id),
+                (active_status, utc_now_iso(), job_id),
             )
             conn.execute("COMMIT")
             return Job(
                 id=int(row["id"]),
                 url=str(row["source_url"]),
-                status="downloading",
+                status=active_status,
+                queue_stage=stage,
                 priority=int(row["priority"]),
+                video_id=(str(row["video_id"]) if row["video_id"] is not None else None),
+                local_video_path=(str(row["local_video_path"]) if row["local_video_path"] is not None else None),
+                transcript_json_path=(str(row["transcript_json_path"]) if row["transcript_json_path"] is not None else None),
                 auto_transcribe=(None if row["auto_transcribe"] is None else int(row["auto_transcribe"])),
+                retries=int(row["retries"] or 0),
             )
 
     def update_job_status(
@@ -258,6 +294,7 @@ class DB:
         status: str,
         *,
         error_text: str | None = None,
+        queue_stage: str | None = None,
         video_id: str | None = None,
         local_video_path: str | None = None,
         transcript_json_path: str | None = None,
@@ -269,6 +306,7 @@ class DB:
                 UPDATE ingest_jobs
                 SET status=?,
                     error_text=COALESCE(?, error_text),
+                    queue_stage=COALESCE(?, queue_stage),
                     video_id=COALESCE(?, video_id),
                     local_video_path=COALESCE(?, local_video_path),
                     transcript_json_path=COALESCE(?, transcript_json_path),
@@ -278,6 +316,7 @@ class DB:
                 (
                     status,
                     error_text,
+                    queue_stage,
                     video_id,
                     local_video_path,
                     transcript_json_path,
@@ -285,6 +324,98 @@ class DB:
                     job_id,
                 ),
             )
+
+    def retry_job(self, job_id: int, *, error_text: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status='queued',
+                    queue_stage=COALESCE(queue_stage, 'download'),
+                    retries=retries + 1,
+                    error_text=?,
+                    started_at=NULL,
+                    finished_at=NULL
+                WHERE id=?
+                """,
+                (error_text, job_id),
+            )
+
+    def queue_job_stage(
+        self,
+        job_id: int,
+        *,
+        queue_stage: str,
+        video_id: str | None = None,
+        local_video_path: str | None = None,
+        transcript_json_path: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status='queued',
+                    queue_stage=?,
+                    error_text=NULL,
+                    video_id=COALESCE(?, video_id),
+                    local_video_path=COALESCE(?, local_video_path),
+                    transcript_json_path=COALESCE(?, transcript_json_path),
+                    started_at=NULL,
+                    finished_at=NULL
+                WHERE id=?
+                """,
+                (queue_stage, video_id, local_video_path, transcript_json_path, job_id),
+            )
+
+    def pending_job_for_video_stage(self, video_id: str, stage: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_url, status, queue_stage, priority, retries, video_id
+                FROM ingest_jobs
+                WHERE video_id=?
+                  AND queue_stage=?
+                  AND status IN ('queued', 'downloading', 'transcribing')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (video_id, stage),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def enqueue_video_stage(
+        self,
+        *,
+        video_id: str,
+        source_url: str,
+        queue_stage: str,
+        priority: int = 0,
+        auto_transcribe: bool | None = None,
+        local_video_path: str | None = None,
+        transcript_json_path: str | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ingest_jobs(
+                    source_url, status, queue_stage, auto_transcribe, priority,
+                    video_id, local_video_path, transcript_json_path, created_at
+                )
+                VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_url,
+                    queue_stage,
+                    None if auto_transcribe is None else (1 if auto_transcribe else 0),
+                    priority,
+                    video_id,
+                    local_video_path,
+                    transcript_json_path,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
 
     def upsert_video(
         self,
@@ -359,12 +490,51 @@ class DB:
                 rows,
             )
 
+    def merge_video_metadata_fields(
+        self,
+        video_id: str,
+        fields: dict[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT metadata_json
+                FROM videos
+                WHERE video_id=?
+                LIMIT 1
+                """,
+                (video_id,),
+            ).fetchone()
+            payload: dict[str, Any] = {}
+            if row:
+                raw = str(row["metadata_json"] or "").strip()
+                if raw:
+                    try:
+                        loaded = json.loads(raw)
+                        if isinstance(loaded, dict):
+                            payload = loaded
+                    except Exception:
+                        payload = {}
+            payload.update(fields)
+            conn.execute(
+                """
+                UPDATE videos
+                SET metadata_json=?, updated_at=?
+                WHERE video_id=?
+                """,
+                (
+                    json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                    utc_now_iso(),
+                    video_id,
+                ),
+            )
+
     def list_jobs(self, limit: int = 25) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT id, source_url, status, priority, error_text,
-                       auto_transcribe, video_id, created_at, started_at, finished_at
+                       queue_stage, auto_transcribe, retries, video_id, created_at, started_at, finished_at
                 FROM ingest_jobs
                 ORDER BY id DESC
                 LIMIT ?
@@ -378,6 +548,7 @@ class DB:
             row = conn.execute(
                 """
                 SELECT id, source_url, status, priority, error_text,
+                       queue_stage, retries,
                        auto_transcribe, video_id, local_video_path, transcript_json_path,
                        created_at, started_at, finished_at
                 FROM ingest_jobs
@@ -427,7 +598,8 @@ class DB:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT video_id, source_url, title, channel, duration_sec, upload_date
+                SELECT video_id, source_url, title, channel, uploader_id, duration_sec, upload_date,
+                       webpage_url, thumbnail, metadata_json
                 FROM videos
                 WHERE video_id=?
                 LIMIT 1
@@ -496,20 +668,42 @@ class DB:
                 return None
             return dict(row)
 
+    def get_latest_playable_job_for_video(self, video_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, video_id, source_url, local_video_path, transcript_json_path, status, queue_stage
+                FROM ingest_jobs
+                WHERE video_id=?
+                  AND local_video_path IS NOT NULL
+                  AND status IN ('transcribing', 'done')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (video_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def get_dashboard_snapshot(self, *, sample_size: int = 100) -> dict[str, Any]:
         with self.connect() as conn:
             count_rows = conn.execute(
                 """
-                SELECT status, COUNT(*) AS n
+                SELECT status, queue_stage, COUNT(*) AS n
                 FROM ingest_jobs
-                GROUP BY status
+                GROUP BY status, queue_stage
                 """
             ).fetchall()
-            counts = {str(r["status"]): int(r["n"]) for r in count_rows}
+            counts: dict[str, int] = {}
+            stage_counts: dict[str, int] = {}
+            for row in count_rows:
+                status_key = str(row["status"])
+                counts[status_key] = counts.get(status_key, 0) + int(row["n"])
+                stage_key = f"{str(row['queue_stage'] or 'download')}_{str(row['status'])}"
+                stage_counts[stage_key] = int(row["n"])
 
             active_rows = conn.execute(
                 """
-                SELECT id, source_url, status, created_at, started_at
+                SELECT id, source_url, status, queue_stage, video_id, created_at, started_at
                 FROM ingest_jobs
                 WHERE status IN ('downloading', 'transcribing')
                 ORDER BY started_at ASC
@@ -539,6 +733,8 @@ class DB:
                     "id": int(row["id"]),
                     "source_url": str(row["source_url"]),
                     "status": str(row["status"]),
+                    "queue_stage": str(row["queue_stage"] or "download"),
+                    "video_id": (str(row["video_id"]) if row["video_id"] is not None else ""),
                     "created_at": row["created_at"],
                     "started_at": row["started_at"],
                     "elapsed_sec": elapsed_sec,
@@ -573,6 +769,7 @@ class DB:
                 "done": counts.get("done", 0),
                 "failed": counts.get("failed", 0),
             },
+            "stage_counts": stage_counts,
             "active_jobs": active_jobs,
             "avg_duration_sec": avg_duration_sec,
             "median_duration_sec": median_duration_sec,
@@ -725,8 +922,11 @@ class DB:
                     COALESCE(v.title, v.video_id) AS title,
                     v.channel,
                     v.uploader_id,
+                    v.duration_sec,
+                    v.upload_date,
                     v.source_url,
                     v.webpage_url,
+                    v.metadata_json,
                     j.local_video_path,
                     j.transcript_json_path
                 FROM videos v
@@ -794,6 +994,45 @@ class DB:
             ).rowcount
             return int(n or 0)
 
+    def delete_oldest_job_by_status(self, statuses: list[str]) -> dict[str, Any] | None:
+        states = [s.strip().lower() for s in statuses if s and s.strip()]
+        if not states:
+            return None
+        placeholders = ",".join("?" for _ in states)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT id, source_url, status, video_id
+                FROM ingest_jobs
+                WHERE status IN ({placeholders})
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                tuple(states),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM ingest_jobs WHERE id=?", (row["id"],))
+            return dict(row)
+
+    def delete_oldest_queued_job_for_stage(self, stage: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_url, status, queue_stage, video_id
+                FROM ingest_jobs
+                WHERE status='queued'
+                  AND queue_stage=?
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (stage,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM ingest_jobs WHERE id=?", (row["id"],))
+            return dict(row)
+
     def fail_jobs_by_status(self, statuses: list[str], *, error_text: str | None = None) -> int:
         states = [s.strip().lower() for s in statuses if s and s.strip()]
         if not states:
@@ -811,6 +1050,89 @@ class DB:
                 (error_text, utc_now_iso(), *states),
             ).rowcount
             return int(n or 0)
+
+    def fail_oldest_job_by_status(
+        self,
+        statuses: list[str],
+        *,
+        error_text: str | None = None,
+    ) -> dict[str, Any] | None:
+        states = [s.strip().lower() for s in statuses if s and s.strip()]
+        if not states:
+            return None
+        placeholders = ",".join("?" for _ in states)
+        finished_at = utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT id, source_url, status, video_id
+                FROM ingest_jobs
+                WHERE status IN ({placeholders})
+                ORDER BY started_at ASC, created_at ASC, id ASC
+                LIMIT 1
+                """,
+                tuple(states),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status='failed',
+                    error_text=COALESCE(?, error_text),
+                    finished_at=COALESCE(finished_at, ?)
+                WHERE id=?
+                """,
+                (error_text, finished_at, row["id"]),
+            )
+            return dict(row)
+
+    def fail_oldest_running_job_for_stage(
+        self,
+        stage: str,
+        *,
+        error_text: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, source_url, status, queue_stage, video_id
+                FROM ingest_jobs
+                WHERE status IN ('downloading', 'transcribing')
+                  AND queue_stage=?
+                ORDER BY started_at ASC, created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (stage,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status='failed',
+                    error_text=COALESCE(?, error_text),
+                    finished_at=COALESCE(finished_at, ?)
+                WHERE id=?
+                """,
+                (error_text, utc_now_iso(), row["id"]),
+            )
+            return dict(row)
+
+    def fail_job(self, job_id: int, *, error_text: str | None = None) -> bool:
+        with self.connect() as conn:
+            n = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status='failed',
+                    error_text=COALESCE(?, error_text),
+                    finished_at=COALESCE(finished_at, ?)
+                WHERE id=?
+                  AND status IN ('downloading', 'transcribing')
+                """,
+                (error_text, utc_now_iso(), job_id),
+            ).rowcount
+            return bool(n)
 
     def upsert_channel_subscription(
         self,

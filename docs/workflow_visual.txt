@@ -1,0 +1,27 @@
+# docs/workflow_visual.md
+
+
+### New Workflow Visualization
+(Ctrl-i workers menu update)
++-----------------------------------+-----------------------+
+|	DOWNLOAD													| COMMANDS							|
+|		[queue]  [workers] [ progress ]	|	  option1							|
+|		1. ...   1. &      [###.......]	|		option2							|
+|	  2. ...   2. &      [#######...]	|		...									|
+|		3. ...   3. &      [zzz.......]	|												|
+|	TRANSCRIBE												|												|
+|		[queue]  [workers] [ progress ]	|												|
+|		1. ...   1. &      [###.......]	|												|
+|		2. ...   2. &      [#######...]	|												|
+|		3. ...   3. &      [zzz.......]	|												|
+| SUMMARIZE													|												|
+|		[queue]  [workers] [ progress ]	|												|
+|		1. ...   1. &      [###.......]	|												|
+|		2. ...   2. &      [#######...]	|												|
+|		3. ...   3. &      [zzz.......]	|												|
+| FINISHED 													|												|
+|		[file]	 [result]								|												|
+|		1. ...	 success								|												|
+|		2. ...	 success								|												|
+|		3. ...	 failed  								|												|
++-----------------------------------+-----------------------+
