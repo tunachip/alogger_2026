@@ -4,7 +4,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from ..constants import FONT, FONT_SIZE_OFFSETS, LISTBOX, POPUP_SIZES, THEME
+from ..constants import FONT_SIZE_OFFSETS, ICONS, LISTBOX, POPUP_SIZES
 from ..utils import format_hms as _fmt_hms
 
 
@@ -159,8 +159,9 @@ class JobsPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
-        visual = tk.Frame(popup, bg=THEME["APP_BG"])
+        visual = tk.Frame(content, bg=self._theme_color("APP_BG"))
         visual.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
         # Prioritize queue/finished readability over worker stack columns.
         for col, wt in enumerate((5, 2, 2, 5)):
@@ -174,9 +175,9 @@ class JobsPopupMixin:
                 visual,
                 text=text,
                 anchor="w",
-                bg=THEME["SURFACE_BG"],
-                fg=THEME["FG_MUTED"],
-                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+                bg=self._theme_color("SURFACE_BG"),
+                fg=self._theme_color("FG_MUTED"),
+                font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
                 padx=8,
                 pady=4,
             ).grid(
@@ -207,11 +208,11 @@ class JobsPopupMixin:
 
         dl_text = tk.Text(
             visual,
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG"],
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG"),
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             wrap="none",
             padx=8,
             pady=8,
@@ -228,11 +229,11 @@ class JobsPopupMixin:
 
         tr_text = tk.Text(
             visual,
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG"],
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG"),
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             wrap="none",
             padx=8,
             pady=8,
@@ -249,8 +250,8 @@ class JobsPopupMixin:
 
         done_list = self._create_listbox(
             visual,
-            fg=THEME["FG_SOFT"],
-            select_fg=THEME["FG"],
+            fg=self._theme_color("FG_SOFT"),
+            select_fg=self._theme_color("FG"),
             font_delta=FONT_SIZE_OFFSETS["SMALL"],
         )
         done_list.grid(
@@ -262,7 +263,7 @@ class JobsPopupMixin:
         self._jobs_done_list = done_list
 
         cmd_list = self._create_listbox(
-            popup,
+            content,
             font_delta=FONT_SIZE_OFFSETS["BODY"],
         )
         cmd_list.configure(height=LISTBOX["COMMAND_HEIGHT"])
@@ -282,9 +283,9 @@ class JobsPopupMixin:
         cmd_list.selection_set(0)
 
         status_var = tk.StringVar(
-            value="Enter executes command | Up/Down move command cursor")
+            value=self._status_hint("jobs"))
         status_lbl = self._create_status_label(
-            popup,
+            content,
             status_var,
             font_delta=FONT_SIZE_OFFSETS["SMALL"],
         )
@@ -297,23 +298,23 @@ class JobsPopupMixin:
         )
 
         agent_head = tk.Label(
-            popup,
+            content,
             text="Agent Activity",
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=4,
         )
         agent_head.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 2))
         agent_text = tk.Text(
-            popup,
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG_SOFT"],
+            content,
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG_SOFT"),
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             wrap="word",
             height=LISTBOX["AGENT_HEIGHT"],
             padx=8,
@@ -415,15 +416,17 @@ class JobsPopupMixin:
                 r.get("status")) == "downloading"]
             transcribing_active = [r for r in active_jobs if str(
                 r.get("status")) == "transcribing"]
+            failed_recent = [r for r in finished_jobs if str(r.get("status")) == "failed"]
 
-            def _worker_lines(
+            def _worker_rows(
                 kind: str,
                 count: int,
-                active: list[dict[str, Any]]
-            ) -> list[str]:
-                lines: list[str] = []
+                active: list[dict[str, Any]],
+                *,
+                failure_slots: int = 0,
+            ) -> list[dict[str, str]]:
+                rows: list[dict[str, str]] = []
                 blink = "█" if (self._worker_anim_tick % 2 == 0) else "."
-                z_phase = (self._worker_anim_tick % 3) + 1
                 for i in range(max(0, count)):
                     if i < len(active):
                         job = active[i]
@@ -431,71 +434,81 @@ class JobsPopupMixin:
                         target = 120.0 if kind == "downloading" else 300.0
                         fill = max(
                             0, min(10, int((elapsed / max(1.0, target)) * 10.0)))
-                        bar = "[" + ("█" * max(0, fill - 1)) + (blink if fill >
-                                                                0 else ".") + ("." * max(0, 10 - fill)) + "]"
-                        lines.append(f"⛑{i+1:02d} ({kind})")
-                        lines.append(f"{bar} job={job.get('id')}")
+                        bar = "[" + ("█" * max(0, fill - 1)) + (blink if fill > 0 else ".") + ("." * max(0, 10 - fill)) + "]"
+                        rows.append({
+                            "icon_tag": "active",
+                            "bar_tag": "active",
+                            "suffix": f" {bar} job={job.get('id')}",
+                        })
                     else:
-                        z = "z" * z_phase
-                        lines.append(f"⛑{i+1:02d} (idle)")
-                        lines.append(f"[{z:<10}]")
-                    lines.append("")
-                return lines or ["(none)"]
+                        rows.append({
+                            "icon_tag": "error" if i < failure_slots else "idle",
+                            "bar_tag": "error" if i < failure_slots else "idle",
+                            "suffix": " [..........]",
+                        })
+                return rows or [{
+                    "icon_tag": "idle",
+                    "bar_tag": "idle",
+                    "suffix": " (none)",
+                }]
 
             dl_lines = [
-                f"downloaders={self._downloader_target_count}",
-                f"transcribers={self._transcriber_target_count}",
                 self._workers_eta_line(),
-                "",
-                *_worker_lines("downloading",
-                               self._downloader_target_count, downloading_active),
             ]
             tr_lines = [
-                f"queued={counts.get('queued', 0)} done={counts.get(
-                    'done', 0)} failed={counts.get('failed', 0)}",
+                f"queued={counts.get('queued', 0)} done={counts.get('done', 0)} failed={counts.get('failed', 0)}",
                 "",
-                *_worker_lines("transcribing",
-                               self._transcriber_target_count, transcribing_active),
             ]
+            dl_workers = _worker_rows(
+                "downloading",
+                self._downloader_target_count,
+                downloading_active,
+                failure_slots=max(0, min(self._downloader_target_count - len(downloading_active), len(failed_recent))),
+            )
+            tr_workers = _worker_rows(
+                "transcribing",
+                self._transcriber_target_count,
+                transcribing_active,
+                failure_slots=max(0, min(self._transcriber_target_count - len(transcribing_active), max(0, len(failed_recent) - self._downloader_target_count))),
+            )
             if self._jobs_dl_text and self._jobs_dl_text.winfo_exists():
                 self._jobs_dl_text.configure(state="normal")
                 self._jobs_dl_text.delete("1.0", tk.END)
-                self._jobs_dl_text.tag_configure("idle", foreground="#39d5ff")
-                self._jobs_dl_text.tag_configure("hat", foreground="#f7d154")
+                self._jobs_dl_text.tag_configure("idle", foreground=self._theme_color("FG_LOG"))
+                self._jobs_dl_text.tag_configure("active", foreground=self._theme_color("FG_ACCENT"))
+                self._jobs_dl_text.tag_configure("error", foreground=self._theme_color("FG_ERROR"))
+                self._jobs_dl_text.tag_configure("meta", foreground=self._theme_color("FG_SOFT"))
                 for line in dl_lines:
-                    tag = None
-                    if line.startswith("[") and "z" in line:
-                        tag = "idle"
-                    elif line.startswith("⛑"):
-                        tag = "hat"
-                    self._jobs_dl_text.insert(
-                        tk.END, line + "\n", (() if tag is None else (tag,)))
+                    self._jobs_dl_text.insert(tk.END, line + "\n", ("meta",))
+                self._jobs_dl_text.insert(tk.END, "\n")
+                for row in dl_workers:
+                    self._jobs_dl_text.insert(tk.END, ICONS["WORKER"], (row["icon_tag"],))
+                    self._jobs_dl_text.insert(tk.END, row["suffix"] + "\n", (row["bar_tag"],))
                 self._jobs_dl_text.configure(state="disabled")
             if self._jobs_tr_text and self._jobs_tr_text.winfo_exists():
                 self._jobs_tr_text.configure(state="normal")
                 self._jobs_tr_text.delete("1.0", tk.END)
-                self._jobs_tr_text.tag_configure("idle", foreground="#39d5ff")
-                self._jobs_tr_text.tag_configure("hat", foreground="#f7d154")
+                self._jobs_tr_text.tag_configure("idle", foreground=self._theme_color("FG_LOG"))
+                self._jobs_tr_text.tag_configure("active", foreground=self._theme_color("FG_ACCENT"))
+                self._jobs_tr_text.tag_configure("error", foreground=self._theme_color("FG_ERROR"))
+                self._jobs_tr_text.tag_configure("meta", foreground=self._theme_color("FG_SOFT"))
                 for line in tr_lines:
-                    tag = None
-                    if line.startswith("[") and "z" in line:
-                        tag = "idle"
-                    elif line.startswith("⛑"):
-                        tag = "hat"
-                    self._jobs_tr_text.insert(
-                        tk.END, line + "\n", (() if tag is None else (tag,)))
+                    self._jobs_tr_text.insert(tk.END, line + "\n", ("meta",))
+                for row in tr_workers:
+                    self._jobs_tr_text.insert(tk.END, ICONS["WORKER"], (row["icon_tag"],))
+                    self._jobs_tr_text.insert(tk.END, row["suffix"] + "\n", (row["bar_tag"],))
                 self._jobs_tr_text.configure(state="disabled")
             if self._jobs_agent_text and self._jobs_agent_text.winfo_exists():
                 self._jobs_agent_text.configure(state="normal")
                 self._jobs_agent_text.delete("1.0", tk.END)
                 self._jobs_agent_text.tag_configure(
-                    "act", foreground="#7fd7ff")
+                    "act", foreground=self._theme_color("FG_INFO"))
                 self._jobs_agent_text.tag_configure(
-                    "err", foreground="#ff8a8a")
+                    "err", foreground=self._theme_color("FG_ERROR"))
                 self._jobs_agent_text.tag_configure(
-                    "summary", foreground="#f7d154")
+                    "summary", foreground=self._theme_color("FG_ACCENT"))
                 self._jobs_agent_text.tag_configure(
-                    "info", foreground="#b0b0b0")
+                    "info", foreground=self._theme_color("FG_LOG"))
                 for row in self._agent_activity[-80:]:
                     kind = str(row.get("kind") or "info")
                     msg = str(row.get("message") or "")

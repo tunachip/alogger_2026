@@ -6,8 +6,8 @@ from typing import Callable
 
 import vlc
 
-from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_ATTRS, THEME
-from ..models import OverlayPanel
+from ..constants import FONT_SIZE_OFFSETS, POPUP_ATTRS
+from ..models import OverlayPanel, QueryEntry
 
 
 class PopupBaseMixin:
@@ -29,8 +29,7 @@ class PopupBaseMixin:
             self._active_popup_name = None
 
     def _register_popup(self, name: str, popup: tk.Toplevel) -> None:
-        # Embedded libVLC can intermittently overdraw Tk popups on some WMs.
-        # Pause video rendering while any popup is open to stabilize stacking.
+        # Pause playback while any popup is open, but keep the player visible.
         if not self._active_popup_name:
             try:
                 if self.player.get_state() == vlc.State.Playing:
@@ -40,11 +39,6 @@ class PopupBaseMixin:
                     self._popup_paused_player = False
             except Exception:
                 self._popup_paused_player = False
-            try:
-                self.video_panel.grid_remove()
-                self._popup_video_hidden = True
-            except Exception:
-                self._popup_video_hidden = False
         self._active_popup_name = name
 
         def _on_destroy(_event: tk.Event[tk.Misc]) -> None:
@@ -61,14 +55,6 @@ class PopupBaseMixin:
                 except Exception:
                     pass
                 self._popup_paused_player = False
-            if self._active_popup_name is None and self._popup_video_hidden:
-                try:
-                    self.video_panel.grid(row=0, column=0, sticky="nsew")
-                    self.root.update_idletasks()
-                    self._bind_video_output(self.video_panel.winfo_id())
-                except Exception:
-                    pass
-                self._popup_video_hidden = False
 
         popup.bind("<Destroy>", _on_destroy, add="+")
 
@@ -255,9 +241,13 @@ class PopupBaseMixin:
 
     def _on_toggle_transcript_log(self, _event: tk.Event[tk.Misc]) -> str:
         if self._transcript_hidden:
-            self.shell.add(self.right_panel, minsize=200)
+            minsize = 180 if self._shell_stacked else 200
+            self.shell.add(self.right_panel, minsize=minsize)
             if self._split_x_before_hide is not None:
-                self.shell.sash_place(0, self._split_x_before_hide, 0)
+                if self._shell_stacked:
+                    self.shell.sash_place(0, 0, self._split_x_before_hide)
+                else:
+                    self.shell.sash_place(0, self._split_x_before_hide, 0)
             self.filter_entry.configure(state="normal")
             self.filter_entry.focus_set()
             self._transcript_hidden = False
@@ -268,11 +258,13 @@ class PopupBaseMixin:
             return "break"
 
         total_w = self.shell.winfo_width()
-        if total_w > 0:
+        total_h = self.shell.winfo_height()
+        if total_w > 0 and total_h > 0:
             try:
-                self._split_x_before_hide = int(self.shell.sash_coord(0)[0])
+                sash_x, sash_y = self.shell.sash_coord(0)
+                self._split_x_before_hide = int(sash_y if self._shell_stacked else sash_x)
             except Exception:
-                self._split_x_before_hide = int(total_w * 3 / 4)
+                self._split_x_before_hide = int((total_h * 2 / 3) if self._shell_stacked else (total_w * 3 / 4))
         self.filter_entry.configure(state="disabled")
         self.video_panel.focus_set()
         try:
@@ -289,7 +281,7 @@ class PopupBaseMixin:
     def _apply_popup_style(self, popup: tk.Toplevel, title: str, size: str) -> None:
         popup.title(title)
         popup.geometry(size)
-        popup.configure(bg=THEME["APP_BG"])
+        popup.configure(bg=self._theme_color("APP_BG"))
         popup.lift()
         popup.focus_set()
         self._apply_font_scale_tree(popup)
@@ -312,14 +304,65 @@ class PopupBaseMixin:
                 return None
         popup = OverlayPanel(self.root)
         self._apply_popup_style(popup, title, size)
+        content: tk.Misc = popup
+        if bool(self._ai_settings.get("show_popup_top_bar", True)):
+            popup.rowconfigure(1, weight=1)
+            popup.columnconfigure(0, weight=1)
+            header = tk.Frame(
+                popup,
+                bg=self._theme_color("SURFACE_BG"),
+                highlightthickness=0,
+                bd=0,
+            )
+            header.grid(row=0, column=0, sticky="ew")
+            header.columnconfigure(0, weight=1)
+            title_label = tk.Label(
+                header,
+                text=title,
+                anchor="w",
+                bg=self._theme_color("SURFACE_BG"),
+                fg=self._theme_color("FG_SOFT"),
+                font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"], bold=True),
+                padx=8,
+                pady=4,
+            )
+            title_label.grid(row=0, column=0, sticky="ew")
+            close_label = tk.Label(
+                header,
+                text="x",
+                anchor="center",
+                bg=self._theme_color("SURFACE_BG"),
+                fg=self._theme_color("FG_MUTED"),
+                font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"], bold=True),
+                padx=8,
+                pady=4,
+                cursor="hand2",
+            )
+            close_label.grid(row=0, column=1, sticky="e")
+            content_frame = tk.Frame(
+                popup,
+                bg=self._theme_color("APP_BG"),
+                highlightthickness=0,
+                bd=0,
+            )
+            content_frame.grid(row=1, column=0, sticky="nsew")
+            content = content_frame
+            close_label.bind("<Button-1>", lambda _e: popup.request_close(), add="+")
+            popup._alog_popup_header = header  # type: ignore[attr-defined]
+            popup._alog_popup_content = content_frame  # type: ignore[attr-defined]
+        else:
+            popup._alog_popup_content = popup  # type: ignore[attr-defined]
         if attr_name:
             setattr(self, attr_name, popup)
         self._register_popup(name, popup)
         for row, weight in (row_weights or {}).items():
-            popup.rowconfigure(row, weight=weight)
+            content.rowconfigure(row, weight=weight)
         for column, weight in (column_weights or {}).items():
-            popup.columnconfigure(column, weight=weight)
+            content.columnconfigure(column, weight=weight)
         return popup
+
+    def _popup_content(self, popup: tk.Toplevel) -> tk.Misc:
+        return getattr(popup, "_alog_popup_content", popup)
 
     def _close_popup_window(
         self,
@@ -359,7 +402,7 @@ class PopupBaseMixin:
         self,
         parent: tk.Misc,
         *,
-        fg: str = THEME["FG"],
+        fg: str | None = None,
         select_fg: str | None = None,
         font_delta: int = FONT_SIZE_OFFSETS["BODY"],
         bold: bool = False,
@@ -368,15 +411,15 @@ class PopupBaseMixin:
     ) -> tk.Listbox:
         font_spec: tuple[str, int] | tuple[str, int, str]
         if bold:
-            font_spec = (FONT["STYLE"], FONT["SIZE"] + font_delta, "bold")
+            font_spec = self._ui_font(font_delta, bold=True)
         else:
-            font_spec = (FONT["STYLE"], FONT["SIZE"] + font_delta)
+            font_spec = self._ui_font(font_delta)
         return tk.Listbox(
             parent,
-            bg=THEME["PANEL_BG"],
-            fg=fg,
-            selectbackground=THEME["SELECT_BG"],
-            selectforeground=select_fg or fg,
+            bg=self._theme_color("PANEL_BG"),
+            fg=fg or self._theme_color("FG"),
+            selectbackground=self._theme_color("SELECT_BG"),
+            selectforeground=select_fg or fg or self._theme_color("FG"),
             activestyle="none",
             borderwidth=0,
             highlightthickness=0,
@@ -386,12 +429,27 @@ class PopupBaseMixin:
             takefocus=takefocus,
         )
 
+    def _create_query_entry(
+        self,
+        parent: tk.Misc,
+        textvariable: tk.StringVar,
+    ) -> QueryEntry:
+        return QueryEntry(
+            parent,
+            textvariable=textvariable,
+            bg=self._theme_color("SURFACE_ALT_BG"),
+            fg=self._theme_color("FG"),
+            accent_fg=self._theme_color("FG_ACCENT"),
+            border=self._theme_color("BORDER"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
+        )
+
     def _create_status_label(
         self,
         parent: tk.Misc,
         status_var: tk.StringVar,
         *,
-        fg: str = THEME["FG_MUTED"],
+        fg: str | None = None,
         font_delta: int = FONT_SIZE_OFFSETS["BODY"],
         padx: int = 8,
         pady: int = 6,
@@ -400,9 +458,9 @@ class PopupBaseMixin:
             parent,
             textvariable=status_var,
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=fg,
-            font=(FONT["STYLE"], FONT["SIZE"] + font_delta),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=fg or self._theme_color("FG_MUTED"),
+            font=self._ui_font(font_delta),
             padx=padx,
             pady=pady,
         )

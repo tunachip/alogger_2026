@@ -3,7 +3,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
-from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
+from ..constants import FONT_SIZE_OFFSETS, POPUP_SIZES
 
 
 class IngestPopupMixin:
@@ -18,24 +18,25 @@ class IngestPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         input_var = tk.StringVar()
-        entry = ttk.Entry(popup, textvariable=input_var, style="Filter.TEntry")
+        entry = ttk.Entry(content, textvariable=input_var, style="Filter.TEntry")
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
         hint = tk.Label(
-                    popup,
-                    text="Input + Enter on command: Ingest (URL[s]) | Browse (channel) | Subscribe (channel)",
+                    content,
+                    text=self._status_hint("ingest"),
                     anchor="w",
-                    bg=THEME["SURFACE_BG"],
-                    fg=THEME["FG_MUTED"],
-                    font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+                    bg=self._theme_color("SURFACE_BG"),
+                    fg=self._theme_color("FG_MUTED"),
+                    font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )
         hint.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
-        listbox = self._create_listbox(popup)
+        listbox = self._create_listbox(content)
         listbox.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         commands = ["Ingest", "Browse", "Subscribe"]
         for c in commands:
@@ -43,7 +44,7 @@ class IngestPopupMixin:
         listbox.selection_set(0)
 
         status = tk.StringVar(value="Ready")
-        status_lbl = self._create_status_label(popup, status)
+        status_lbl = self._create_status_label(content, status)
         status_lbl.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         def _selected_command() -> str:

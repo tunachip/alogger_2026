@@ -678,39 +678,40 @@ class AIPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         feed = tk.Text(
-            popup,
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG"],
+            content,
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG"),
             borderwidth=0,
             highlightthickness=0,
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
             wrap="word",
             padx=8,
             pady=8,
-            insertbackground=THEME["FG"],
+            insertbackground=self._theme_color("FG"),
         )
         feed.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
         feed.configure(state="disabled")
 
         input_var = tk.StringVar(value="")
-        entry = ttk.Entry(popup, textvariable=input_var, style="Filter.TEntry")
+        entry = ttk.Entry(content, textvariable=input_var, style="Filter.TEntry")
         entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         provider = str(self._ai_settings.get("ai_provider", "ollama"))
         if provider.lower() == "ollama":
             self._start_ollama_bootstrap(background=True)
         status_var = tk.StringVar(
-            value=f"Provider={provider} | Enter send | Esc close"
+            value=self._status_hint("ai", provider=provider)
         )
         status = tk.Label(
-            popup,
+            content,
             textvariable=status_var,
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )

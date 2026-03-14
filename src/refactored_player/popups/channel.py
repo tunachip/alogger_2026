@@ -20,6 +20,7 @@ except Exception:
 from alog.pipeline import resolve_playback_media_path
 
 from ..constants import FONT, FONT_SIZE_OFFSETS, LAYOUT, POPUP_SIZES, THEME
+from ..utils import matches_search_query
 
 
 class ChannelPopupMixin:
@@ -166,7 +167,55 @@ class ChannelPopupMixin:
         )
         return True, f"opened video {video_id}"
 
+    def _open_channel_prompt_popup(self) -> None:
+        popup = self._create_popup_window(
+            name="channel",
+            title="Browse Source",
+            size=POPUP_SIZES["GOTO"],
+            attr_name="_channel_popup",
+            reuse_existing=True,
+            column_weights={0: 1},
+        )
+        if popup is None:
+            return
+        content = self._popup_content(popup)
+
+        ref_var = tk.StringVar(value=str(self._channel_default_ref or "").strip())
+        entry = self._create_query_entry(content, ref_var)
+        entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        status_var = tk.StringVar(value=self._status_hint("browse_prompt"))
+        self._create_status_label(content, status_var).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=(0, 8),
+        )
+
+        def submit(_event: tk.Event[tk.Misc] | None = None) -> str:
+            token = ref_var.get().strip()
+            if not token:
+                status_var.set("Enter a browse source first")
+                return "break"
+            self._channel_default_ref = token
+            self._close_popup_window(
+                popup,
+                after_close=lambda: setattr(self, "_channel_popup", None),
+                focus_filter=False,
+            )
+            self._open_channel_popup()
+            return "break"
+
+        popup.bind("<Return>", submit)
+        entry.bind("<Return>", submit)
+        self._bind_popup_close(popup, focus_filter=False)
+        entry.focus_set()
+
     def _open_channel_popup(self) -> None:
+        channel_ref = str(self._channel_default_ref or "").strip()
+        if not channel_ref:
+            self._open_channel_prompt_popup()
+            return
         popup = self._create_popup_window(
                     name="channel",
                     title="Channel Browser",
@@ -178,25 +227,18 @@ class ChannelPopupMixin:
         )
         if popup is None:
             return
-
-        channel_ref = str(self._channel_default_ref or "").strip()
-        if not channel_ref:
-            self.status_var.set(
-                "No channel selected. Open Ctrl-N and choose Browse first.")
-            self._close_popup_window(popup)
-            return
+        content = self._popup_content(popup)
 
         filter_var = tk.StringVar(value="")
-        filter_entry = ttk.Entry(
-            popup, textvariable=filter_var, style="Filter.TEntry")
+        filter_entry = self._create_query_entry(content, filter_var)
         filter_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
         limit_var = tk.StringVar(value="30")
         limit_entry = ttk.Entry(
-            popup, textvariable=limit_var, style="Filter.TEntry")
+            content, textvariable=limit_var, style="Filter.TEntry")
         limit_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
-        body = tk.Frame(popup, bg=THEME["APP_BG"])
+        body = tk.Frame(content, bg=self._theme_color("APP_BG"))
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=2, minsize=360)
@@ -205,9 +247,9 @@ class ChannelPopupMixin:
 
         preview_frame = tk.Frame(
             body,
-            bg=THEME["PANEL_BG"],
+            bg=self._theme_color("PANEL_BG"),
             highlightthickness=1,
-            highlightbackground=THEME["BORDER"],
+            highlightbackground=self._theme_color("BORDER"),
             bd=0,
             width=LAYOUT["PREVIEW_WIDTH"],
             height=LAYOUT["PREVIEW_HEIGHT"],
@@ -227,7 +269,7 @@ class ChannelPopupMixin:
         preview_image_height = LAYOUT["PREVIEW_IMAGE_HEIGHT"]
         preview_image_box = tk.Frame(
             preview_frame,
-            bg=THEME["PANEL_BG"],
+            bg=self._theme_color("PANEL_BG"),
             width=preview_image_width,
             height=preview_image_height,
             highlightthickness=0,
@@ -241,12 +283,12 @@ class ChannelPopupMixin:
 
         preview_image_lbl = tk.Label(
             preview_image_box,
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG_MUTED"],
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG_MUTED"),
             text="Preview loading...",
             anchor="center",
             justify="center",
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
         )
         preview_image_lbl.grid(row=0, column=0, sticky="nsew")
         preview_title_var = tk.StringVar(value="")
@@ -257,9 +299,9 @@ class ChannelPopupMixin:
             textvariable=preview_title_var,
             anchor="w",
             justify="left",
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"], bold=True),
             wraplength=320,
         )
         preview_title_lbl.grid(
@@ -269,9 +311,9 @@ class ChannelPopupMixin:
             textvariable=preview_creator_var,
             anchor="w",
             justify="left",
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG_SOFT"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG_SOFT"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             wraplength=320,
         )
         preview_creator_lbl.grid(
@@ -281,9 +323,9 @@ class ChannelPopupMixin:
             textvariable=preview_tags_var,
             anchor="nw",
             justify="left",
-            bg=THEME["PANEL_BG"],
-            fg=THEME["FG_INFO"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG_INFO"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             wraplength=320,
         )
         preview_tags_lbl.grid(
@@ -291,13 +333,10 @@ class ChannelPopupMixin:
         preview_photo: dict[str, Any] = {"image": None}
 
         status_var = tk.StringVar(
-            value=(
-                f"Channel: {channel_ref} | Type to filter videos | Enter queues selected | "
-                "Ctrl-R reload | Ctrl-S subscribe"
-            )
+            value=f"Channel: {channel_ref} | {self._status_hint('browse')}"
         )
         status_lbl = self._create_status_label(
-            popup,
+            content,
             status_var,
             font_delta=-3,
         )
@@ -421,7 +460,7 @@ class ChannelPopupMixin:
                             or "untitled").replace("\n", " ").strip()
                 creator = str(row.get("uploader") or row.get("channel") or "")
                 hay = f"{title} {creator} {row.get('video_id') or ''}".lower()
-                if query and query not in hay:
+                if query and not matches_search_query(hay, query):
                     continue
                 filtered_positions.append(idx)
                 listbox.insert(tk.END, title)

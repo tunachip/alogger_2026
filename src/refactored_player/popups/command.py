@@ -5,6 +5,7 @@ from tkinter import ttk
 from typing import Callable
 
 from ..constants import POPUP_SIZES
+from ..utils import matches_search_query
 
 
 class CommandPopupMixin:
@@ -19,12 +20,13 @@ class CommandPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         query_var = tk.StringVar(value="")
-        entry = ttk.Entry(popup, textvariable=query_var, style="Filter.TEntry")
+        entry = self._create_query_entry(content, query_var)
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
-        listbox = self._create_listbox(popup)
+        listbox = self._create_listbox(content)
         listbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
         commands: list[tuple[str, Callable[[], None]]] = [
@@ -58,7 +60,7 @@ class CommandPopupMixin:
             filtered_indexes.clear()
             listbox.delete(0, tk.END)
             for idx, (label, _fn) in enumerate(commands):
-                if needle and needle not in label.lower():
+                if needle and not matches_search_query(label, needle):
                     continue
                 filtered_indexes.append(idx)
                 listbox.insert(tk.END, label)

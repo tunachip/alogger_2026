@@ -12,6 +12,8 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Any, Callable
 
+import vlc
+
 from alog.config import IngesterConfig
 from alog.service import IngesterService
 
@@ -19,9 +21,12 @@ from .constants import (
     DEFAULT_KEYBINDS,
     FONT,
     FONT_SIZE_OFFSETS,
+    ICONS,
     LAYOUT,
     POPUP_SIZES,
+    STATUS_HINTS,
     THEME,
+    THEME_SETTING_IDS,
     build_default_gui_settings,
 )
 from .playback import PlaybackMixin
@@ -196,6 +201,14 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._clock_prefix_len = len("[00:00:00] ")
         self._clock_last_length_sec = 0.0
         self._font_size_delta = 0
+        self._drag_origin_x = 0
+        self._drag_origin_y = 0
+        self._window_origin_x = 0
+        self._window_origin_y = 0
+        self._shell_stacked = False
+        self._shell_layout_mode = "horizontal"
+        self._launch_buttons: list[tk.Widget] = []
+        self._root_layout_after_id: str | None = None
 
         self._setup_styles()
         self._build_layout()
@@ -205,10 +218,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._build_vlc()
         self._refresh_caption_view()
         if not self.video_path:
-            self.status_var.set(
-                "No video loaded. " +
-                "Press Ctrl-O to open by title " +
-                "or Ctrl-F to search captions.")
+            self.status_var.set(self._status_hint("startup"))
         self._tick_ui()
 
     def _setup_styles(self) -> None:
@@ -244,12 +254,62 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             ],
         )
 
+    def _theme_color(self, key: str) -> str:
+        setting_id = THEME_SETTING_IDS.get(key)
+        if setting_id:
+            return str(self._ai_settings.get(setting_id) or THEME[key])
+        return str(THEME.get(key, ""))
+
+    def _ui_font(
+        self,
+        delta: int = 0,
+        *,
+        bold: bool = False,
+    ) -> tuple[str, int] | tuple[str, int, str]:
+        family = str(
+            getattr(self, "_ui_font_family", None)
+            or self._ai_settings.get("font_family")
+            or FONT["STYLE"]
+        )
+        size = max(
+            8,
+            int(getattr(self, "_ui_font_size", FONT["SIZE"])) + int(delta),
+        )
+        if bold:
+            return (family, size, "bold")
+        return (family, size)
+
+    def _shortcut_label(self, action: str) -> str:
+        keybinds = self._ai_settings.get("keybinds")
+        if not isinstance(keybinds, dict):
+            keybinds = DEFAULT_KEYBINDS
+        token = str(
+            keybinds.get(action, DEFAULT_KEYBINDS.get(action, ""))
+        ).strip()
+        return token or DEFAULT_KEYBINDS.get(action, "")
+
+    def _status_hint(self, name: str, **values: str) -> str:
+        template = STATUS_HINTS.get(name, "")
+        context = {
+            action: self._shortcut_label(action)
+            for action in DEFAULT_KEYBINDS
+        }
+        context.update(values)
+        try:
+            return template.format(**context)
+        except Exception:
+            return template
+
     def _apply_theme(self) -> None:
-        bg = str(self._ai_settings.get("theme_bg") or THEME["APP_BG"])
-        panel_bg = str(self._ai_settings.get("theme_panel_bg") or THEME["PANEL_BG"])
-        fg = str(self._ai_settings.get("theme_fg") or THEME["FG"])
-        muted = str(self._ai_settings.get("theme_muted_fg") or THEME["FG_MUTED"])
-        accent = str(self._ai_settings.get("theme_accent_fg") or THEME["FG_ACCENT"])
+        bg = self._theme_color("APP_BG")
+        panel_bg = self._theme_color("PANEL_BG")
+        surface_bg = self._theme_color("SURFACE_BG")
+        surface_alt_bg = self._theme_color("SURFACE_ALT_BG")
+        fg = self._theme_color("FG")
+        muted = self._theme_color("FG_MUTED")
+        accent = self._theme_color("FG_ACCENT")
+        soft = self._theme_color("FG_SOFT")
+        border = self._theme_color("BORDER")
         try:
             family = str(self._ai_settings.get("font_family") or FONT["STYLE"])
             base_size = max(8, int(
@@ -258,25 +318,31 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             family = FONT["STYLE"]
             base_size = FONT["SIZE"]
         size = max(8, min(64, base_size + int(self._font_size_delta)))
+        self._ui_font_family = family
+        self._ui_font_size = size
         self._text_font.configure(family=family, size=size)
         self._text_font_bold.configure(family=family, size=size)
         self.root.configure(bg=bg)
+        if hasattr(self, "title_bar"):
+            self.title_bar.configure(bg=surface_bg)
+        if hasattr(self, "launch_bar"):
+            self.launch_bar.configure(bg=surface_bg)
         self.left_panel.configure(bg=panel_bg)
         self.right_panel.configure(bg=bg)
         self.video_panel.configure(bg=panel_bg)
         self.clock_view.configure(
-            bg=THEME["SURFACE_BG"],
+            bg=surface_bg,
             fg=fg,
             insertbackground=fg,
             font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold")
         )
         self.caption_now_box.configure(
-            bg=THEME["SURFACE_BG"],
+            bg=surface_bg,
             fg=fg,
             font=(family, size + FONT_SIZE_OFFSETS["BODY"])
         )
         self.root_status_box.configure(
-            bg=THEME["SURFACE_BG"],
+            bg=surface_bg,
             fg=fg,
             font=(family, size)
         )
@@ -300,7 +366,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         )
         self.caption_view.tag_configure(
             "selected",
-            background="#282828"
+            background=self._theme_color("SELECTED_ROW_BG")
         )
         self.caption_view.tag_configure(
             "selected_txt",
@@ -309,14 +375,71 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         style = ttk.Style(self.root)
         style.configure(
             "Filter.TEntry",
-            fieldbackground=THEME["SURFACE_ALT_BG"],
+            fieldbackground=surface_alt_bg,
             foreground=fg,
+            bordercolor=border,
+            lightcolor=border,
+            darkcolor=border,
+            insertcolor=fg,
             font=(family, max(8, size - 1))
         )
+        style.configure("Terminal.TNotebook", background=bg)
         style.configure(
             "Terminal.TNotebook.Tab",
+            background=surface_bg,
+            foreground=muted,
             font=(family, max(8, size + FONT_SIZE_OFFSETS["SMALL"]))
         )
+        style.map(
+            "Terminal.TNotebook.Tab",
+            background=[
+                ("selected", panel_bg),
+                ("active", self._theme_color("SELECT_BG"))
+            ],
+            foreground=[
+                ("selected", fg),
+                ("active", soft)
+            ],
+        )
+        if hasattr(self, "title_label"):
+            self.title_label.configure(
+                bg=surface_bg,
+                fg=soft,
+                font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold"),
+            )
+        if hasattr(self, "title_close"):
+            self.title_close.configure(
+                bg=surface_bg,
+                fg=muted,
+                font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold"),
+            )
+        if hasattr(self, "video_pause_overlay"):
+            self.video_pause_overlay.configure(
+                bg=self._theme_color("VIDEO_OVERLAY_BG"),
+                fg=self._theme_color("VIDEO_OVERLAY_FG"),
+                font=(family, max(18, size + 18), "bold"),
+            )
+        if hasattr(self, "filter_entry") and hasattr(self.filter_entry, "configure_colors"):
+            try:
+                self.filter_entry.configure_colors(
+                    bg=surface_alt_bg,
+                    fg=fg,
+                    accent_fg=accent,
+                    border=border,
+                    font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
+                )
+            except Exception:
+                pass
+        for button in getattr(self, "_launch_buttons", []):
+            try:
+                button.configure(
+                    bg=surface_bg,
+                    fg=soft,
+                    font=(family, max(8, size + FONT_SIZE_OFFSETS["SMALL"])),
+                )
+            except Exception:
+                pass
+        self._apply_root_chrome_settings()
         self._refresh_clock_now()
 
     def _apply_font_scale_tree(
@@ -352,7 +475,8 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
                         }
                         setattr(widget, "_alog_base_font", base)
                     new_size = max(8, min(64, int(base["size"]) + int(self._font_size_delta)))
-                    parts: list[Any] = [base["family"], new_size]
+                    desired_family = str(self._ai_settings.get("font_family") or FONT["STYLE"])
+                    parts: list[Any] = [desired_family, new_size]
                     if str(base.get("weight")) == "bold":
                         parts.append("bold")
                     if str(base.get("slant")) == "italic":
@@ -570,15 +694,89 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=0)
         self.root.rowconfigure(1, weight=0)
+        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=0)
+        self.title_bar = tk.Frame(
+            self.root,
+            bg=THEME["SURFACE_BG"],
+            height=LAYOUT["TITLEBAR_HEIGHT"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self.title_bar.grid(row=0, column=0, sticky="ew")
+        self.title_bar.grid_propagate(False)
+        self.title_bar.columnconfigure(0, weight=1)
+        self.title_bar.columnconfigure(1, weight=0)
+        self.title_label = tk.Label(
+            self.title_bar,
+            text="Alogger Player",
+            anchor="w",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_SOFT"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
+            padx=LAYOUT["BAR_PAD_X"],
+            pady=LAYOUT["BAR_PAD_Y"],
+        )
+        self.title_label.grid(row=0, column=0, sticky="ew")
+        self.title_close = tk.Label(
+            self.title_bar,
+            text="x",
+            anchor="center",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_MUTED"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
+            padx=LAYOUT["BAR_PAD_X"],
+            pady=LAYOUT["BAR_PAD_Y"],
+            cursor="hand2",
+        )
+        self.title_close.grid(row=0, column=1, sticky="e")
+        self.launch_bar = tk.Frame(
+            self.root,
+            bg=THEME["SURFACE_BG"],
+            height=LAYOUT["LAUNCHBAR_HEIGHT"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self.launch_bar.grid(row=1, column=0, sticky="ew")
+        self.launch_bar.grid_propagate(False)
+        self.launch_bar.columnconfigure(99, weight=1)
+        launchers: list[tuple[str, Callable[[], None]]] = [
+            ("Cmd", lambda: self._toggle_popup("command", self._open_command_popup)),
+            ("Ingest", lambda: self._toggle_popup("ingest", self._open_ingest_popup)),
+            ("Workers", lambda: self._toggle_popup("workers", self._open_jobs_popup)),
+            ("Open", lambda: self._toggle_popup("open_video", self._open_video_picker_popup)),
+            ("Find", lambda: self._toggle_popup("finder", self._open_search_popup)),
+            ("AI", lambda: self._toggle_popup("ai", self._open_ai_popup)),
+            ("Goto", self._open_goto_popup),
+            ("Settings", lambda: self._toggle_popup("settings", self._open_settings_popup)),
+            ("Browse", lambda: self._toggle_popup("channel", self._open_channel_popup)),
+            ("Subs", lambda: self._toggle_popup("subscriptions", self._open_subscriptions_popup)),
+        ]
+        self._launch_buttons = []
+        for idx, (label, command) in enumerate(launchers):
+            button = tk.Label(
+                self.launch_bar,
+                text=label,
+                anchor="center",
+                bg=THEME["SURFACE_BG"],
+                fg=THEME["FG_SOFT"],
+                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+                padx=LAYOUT["BAR_PAD_X"],
+                pady=LAYOUT["BAR_PAD_Y"],
+                cursor="hand2",
+            )
+            button.grid(row=0, column=idx, sticky="w", padx=(0 if idx == 0 else 2, 0))
+            button.bind("<Button-1>", lambda _e, fn=command: fn(), add="+")
+            self._launch_buttons.append(button)
         self.shell = tk.PanedWindow(
             self.root,
             orient=tk.HORIZONTAL,
             sashrelief=tk.FLAT,
             sashwidth=LAYOUT["SASH_WIDTH"]
         )
-        self.shell.grid(row=0, column=0, sticky="nsew")
+        self.shell.grid(row=2, column=0, sticky="nsew")
         self.left_panel = tk.Frame(self.shell, bg=THEME["PANEL_BG"])
         self.right_panel = tk.Frame(self.shell, bg=THEME["APP_BG"])
         self.shell.add(self.left_panel, minsize=1000)
@@ -589,6 +787,18 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self.left_panel.columnconfigure(0, weight=1)
         self.video_panel = tk.Frame(self.left_panel, bg=THEME["PANEL_BG"], highlightthickness=0, bd=0)
         self.video_panel.grid(row=0, column=0, sticky="nsew")
+        self.video_pause_overlay = tk.Label(
+            self.left_panel,
+            text=ICONS["PAUSE"],
+            anchor="center",
+            justify="center",
+            bg=self._theme_color("VIDEO_OVERLAY_BG"),
+            fg=self._theme_color("VIDEO_OVERLAY_FG"),
+            font=self._ui_font(18, bold=True),
+            padx=18,
+            pady=8,
+        )
+        self.video_pause_overlay.place_forget()
         self.clock_view = tk.Text(
             self.left_panel,
             bg=THEME["SURFACE_BG"],
@@ -632,11 +842,11 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             padx=10,
             pady=6,
         )
-        self.root_status_box.grid(row=1, column=0, sticky="ew")
+        self.root_status_box.grid(row=3, column=0, sticky="ew")
         self.right_panel.rowconfigure(1, weight=1)
         self.right_panel.columnconfigure(0, weight=1)
         self.filter_var = tk.StringVar()
-        self.filter_entry = ttk.Entry(self.right_panel, textvariable=self.filter_var, style="Filter.TEntry")
+        self.filter_entry = self._create_query_entry(self.right_panel, self.filter_var)
         self.filter_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
         self.caption_view = tk.Text(
             self.right_panel,
@@ -660,6 +870,118 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self.caption_view.tag_configure("selected_txt", font=self._text_font_bold)
         self._row_ranges: list[tuple[str, str]] = []
         self._row_text_ranges: list[tuple[str, str]] = []
+        self._bind_window_controls()
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self._apply_root_chrome_settings()
+
+    def _bind_window_controls(self) -> None:
+        for widget in (self.title_bar, self.title_label):
+            widget.bind("<ButtonPress-1>", self._on_begin_window_drag, add="+")
+            widget.bind("<B1-Motion>", self._on_window_drag, add="+")
+            widget.bind("<Double-Button-1>", self._on_toggle_window_maximize, add="+")
+        self.title_close.bind("<Button-1>", lambda _e: self.close(), add="+")
+
+    def _apply_root_chrome_settings(self) -> None:
+        show_root_top_bar = bool(self._ai_settings.get("show_root_top_bar", True))
+        show_launch_bar = bool(self._ai_settings.get("show_launch_bar", True))
+        if hasattr(self, "title_bar"):
+            if show_root_top_bar:
+                self.title_bar.grid()
+            else:
+                self.title_bar.grid_remove()
+        if hasattr(self, "launch_bar"):
+            if show_launch_bar:
+                self.launch_bar.grid()
+            else:
+                self.launch_bar.grid_remove()
+        self._schedule_root_layout_refresh()
+
+    def _on_root_configure(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is not self.root:
+            return
+        self._schedule_root_layout_refresh()
+
+    def _schedule_root_layout_refresh(self) -> None:
+        if self._root_layout_after_id is not None:
+            try:
+                self.root.after_cancel(self._root_layout_after_id)
+            except Exception:
+                pass
+        self._root_layout_after_id = self.root.after(30, self._refresh_root_layout)
+
+    def _refresh_root_layout(self) -> None:
+        self._root_layout_after_id = None
+        if not hasattr(self, "shell"):
+            return
+        try:
+            self.root.update_idletasks()
+            total_w = int(self.shell.winfo_width())
+            total_h = int(self.shell.winfo_height())
+        except Exception:
+            return
+        if total_w > 0 and total_h > 0:
+            self._apply_shell_layout(total_w, total_h)
+        self._position_video_overlay()
+
+    def _position_video_overlay(self) -> None:
+        if not hasattr(self, "video_pause_overlay") or not hasattr(self, "video_panel"):
+            return
+        try:
+            panel_x = int(self.video_panel.winfo_x())
+            panel_y = int(self.video_panel.winfo_y())
+            panel_w = int(self.video_panel.winfo_width())
+            panel_h = int(self.video_panel.winfo_height())
+        except Exception:
+            return
+        if panel_w <= 0 or panel_h <= 0:
+            self.video_pause_overlay.place_forget()
+            return
+        self.video_pause_overlay.place(
+            x=panel_x + (panel_w // 2),
+            y=panel_y + (panel_h // 2),
+            anchor="center",
+        )
+
+    def _refresh_pause_overlay(self, state: vlc.State | None = None) -> None:
+        if not hasattr(self, "video_pause_overlay"):
+            return
+        if not self.video_path:
+            self.video_pause_overlay.place_forget()
+            return
+        try:
+            current = state if state is not None else self.player.get_state()
+        except Exception:
+            current = None
+        if current in {vlc.State.Paused, vlc.State.Stopped}:
+            self._position_video_overlay()
+            self.video_pause_overlay.lift()
+            return
+        self.video_pause_overlay.place_forget()
+
+    def _on_begin_window_drag(self, event: tk.Event[tk.Misc]) -> str:
+        self._drag_origin_x = int(getattr(event, "x_root", 0))
+        self._drag_origin_y = int(getattr(event, "y_root", 0))
+        self._window_origin_x = int(self.root.winfo_x())
+        self._window_origin_y = int(self.root.winfo_y())
+        return "break"
+
+    def _on_window_drag(self, event: tk.Event[tk.Misc]) -> str:
+        delta_x = int(getattr(event, "x_root", 0)) - self._drag_origin_x
+        delta_y = int(getattr(event, "y_root", 0)) - self._drag_origin_y
+        width = max(1, int(self.root.winfo_width()))
+        height = max(1, int(self.root.winfo_height()))
+        x = self._window_origin_x + delta_x
+        y = self._window_origin_y + delta_y
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        return "break"
+
+    def _on_toggle_window_maximize(self, _event: tk.Event[tk.Misc]) -> str:
+        try:
+            current = bool(self.root.wm_attributes("-zoomed"))
+            self.root.wm_attributes("-zoomed", not current)
+        except Exception:
+            pass
+        return "break"
 
     def _display_to_tk_sequence(self, value: str) -> str | None:
         token = str(value or "").strip()

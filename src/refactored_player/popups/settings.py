@@ -4,7 +4,16 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any
 
-from ..constants import DEFAULT_KEYBINDS, FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
+from ..constants import (
+    DEFAULT_KEYBINDS,
+    FONT,
+    FONT_SIZE_OFFSETS,
+    POPUP_SIZES,
+    THEME,
+    THEME_SETTINGS_FIELDS,
+)
+
+
 class SettingsPopupMixin:
     def _open_settings_popup(self) -> None:
         popup = self._create_popup_window(
@@ -17,8 +26,9 @@ class SettingsPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
-        tabs = ttk.Notebook(popup, style="Terminal.TNotebook")
+        tabs = ttk.Notebook(content, style="Terminal.TNotebook")
         tabs.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
 
         tab_names = ["Ingest", "Theme", "Subscription", "AI", "Keybinds"]
@@ -37,9 +47,9 @@ class SettingsPopupMixin:
                 frame,
                 text="Key",
                 anchor="w",
-                bg=THEME["SURFACE_BG"],
-                fg=THEME["FG_MUTED"],
-                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+                bg=self._theme_color("SURFACE_BG"),
+                fg=self._theme_color("FG_MUTED"),
+                font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
                 padx=8,
                 pady=4,
             ).grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(8, 4))
@@ -47,36 +57,36 @@ class SettingsPopupMixin:
                 frame,
                 text="Value",
                 anchor="w",
-                bg=THEME["SURFACE_BG"],
-                fg=THEME["FG_MUTED"],
-                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+                bg=self._theme_color("SURFACE_BG"),
+                fg=self._theme_color("FG_MUTED"),
+                font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
                 padx=8,
                 pady=4,
             ).grid(row=0, column=1, sticky="ew", padx=(4, 8), pady=(8, 4))
 
             k_list = tk.Listbox(
                 frame,
-                bg=THEME["PANEL_BG"],
-                fg=THEME["FG_SOFT"],
-                selectbackground=THEME["SELECT_BG"],
-                selectforeground=THEME["FG"],
+                bg=self._theme_color("PANEL_BG"),
+                fg=self._theme_color("FG_SOFT"),
+                selectbackground=self._theme_color("SELECT_BG"),
+                selectforeground=self._theme_color("FG"),
                 activestyle="none",
                 borderwidth=0,
                 highlightthickness=0,
                 exportselection=False,
-                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
+                font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
             )
             v_list = tk.Listbox(
                 frame,
-                bg=THEME["PANEL_BG"],
-                fg=THEME["FG"],
-                selectbackground=THEME["SELECT_BG"],
-                selectforeground=THEME["FG"],
+                bg=self._theme_color("PANEL_BG"),
+                fg=self._theme_color("FG"),
+                selectbackground=self._theme_color("SELECT_BG"),
+                selectforeground=self._theme_color("FG"),
                 activestyle="none",
                 borderwidth=0,
                 highlightthickness=0,
                 exportselection=False,
-                font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
+                font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
             )
             k_list.grid(row=1, column=0, sticky="nsew",
                         padx=(8, 4), pady=(0, 8))
@@ -87,19 +97,19 @@ class SettingsPopupMixin:
 
         edit_var = tk.StringVar(value="")
         edit_entry = ttk.Entry(
-            popup, textvariable=edit_var, style="Filter.TEntry")
+            content, textvariable=edit_var, style="Filter.TEntry")
         edit_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
         edit_entry.grid_remove()
 
         status_var = tk.StringVar(
-            value="Up/Down select row | Left/Right change tab | Enter edit | Esc close")
+            value=self._status_hint("settings"))
         tk.Label(
-            popup,
+            content,
             textvariable=status_var,
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         ).grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
@@ -183,47 +193,18 @@ class SettingsPopupMixin:
                     },
                 ]
             if tab_idx == 1:
-                return [
+                rows = [
                     {
-                        "id": "theme_bg",
-                        "key": "App Background",
+                        "id": setting_id,
+                        "key": label,
                         "value": str(
-                            self._ai_settings.get("theme_bg")
-                            or THEME["APP_BG"]
+                            self._ai_settings.get(setting_id)
+                            or THEME[theme_key]
                         )
-                    },
-                    {
-                        "id": "theme_panel_bg",
-                        "key": "Panel Background",
-                        "value": str(
-                            self._ai_settings.get("theme_panel_bg")
-                            or THEME["PANEL_BG"]
-                        )
-                    },
-                    {
-                        "id": "theme_fg",
-                        "key": "Primary Text",
-                        "value": str(
-                            self._ai_settings.get("theme_fg")
-                            or THEME["FG"]
-                        )
-                    },
-                    {
-                        "id": "theme_muted_fg",
-                        "key": "Muted Text",
-                        "value": str(
-                            self._ai_settings.get("theme_muted_fg")
-                            or THEME["FG_MUTED"]
-                        )
-                    },
-                    {
-                        "id": "theme_accent_fg",
-                        "key": "Accent Text",
-                        "value": str(
-                            self._ai_settings.get("theme_accent_fg")
-                            or THEME["FG_ACCENT"]
-                        )
-                    },
+                    }
+                    for setting_id, label, theme_key in THEME_SETTINGS_FIELDS
+                ]
+                rows.extend([
                     {
                         "id": "font_family",
                         "key": "Font Family",
@@ -240,7 +221,23 @@ class SettingsPopupMixin:
                             or FONT["SIZE"]
                         )
                     },
-                ]
+                    {
+                        "id": "show_root_top_bar",
+                        "key": "Root Top Bar",
+                        "value": "on" if bool(self._ai_settings.get("show_root_top_bar", True)) else "off",
+                    },
+                    {
+                        "id": "show_launch_bar",
+                        "key": "Launch Bar",
+                        "value": "on" if bool(self._ai_settings.get("show_launch_bar", True)) else "off",
+                    },
+                    {
+                        "id": "show_popup_top_bar",
+                        "key": "Popup Top Bars",
+                        "value": "on" if bool(self._ai_settings.get("show_popup_top_bar", True)) else "off",
+                    },
+                ])
+                return rows
             if tab_idx == 2:
                 rows = [
                     {
@@ -394,13 +391,7 @@ class SettingsPopupMixin:
                     self._skim_pre_ms = max(0, int(token or "0"))
                 elif row_id == "skim_post":
                     self._skim_post_ms = max(0, int(token or "0"))
-                elif row_id in {
-                    "theme_bg",
-                    "theme_panel_bg",
-                    "theme_fg",
-                    "theme_muted_fg",
-                    "theme_accent_fg"
-                }:
+                elif row_id in {field[0] for field in THEME_SETTINGS_FIELDS}:
                     color = _norm_hex(token)
                     if not color:
                         return "Invalid hex color; use #RRGGBB"
@@ -409,6 +400,12 @@ class SettingsPopupMixin:
                     self._ai_settings["font_family"] = token or FONT["STYLE"]
                 elif row_id == "font_size":
                     self._ai_settings["font_size"] = max(8, int(token or "12"))
+                elif row_id in {
+                    "show_root_top_bar",
+                    "show_launch_bar",
+                    "show_popup_top_bar",
+                }:
+                    self._ai_settings[row_id] = token.lower() in {"1", "true", "yes", "on"}
                 elif row_id == "subscription_db_max_videos":
                     self._ai_settings["subscription_db_max_videos"] = max(
                         0, int(token or "0"))
@@ -497,6 +494,7 @@ class SettingsPopupMixin:
 
                 self._apply_theme()
                 self._apply_font_scale_tree(self.root, reset_base=True)
+                self._apply_root_chrome_settings()
                 self._refresh_caption_view()
                 self._apply_shortcut_bindings()
                 self._save_gui_settings()

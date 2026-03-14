@@ -1,3 +1,8 @@
+## TODO
+
+
+## Notes
+
 ## Alogger2026 TODO List
 
 ### 2.14.2026
@@ -5,3 +10,5 @@
 - [ ] impliment auto-cleanup feature
 - [ ] recreate API with human & ai endpoints
 - [ ] create proper 'config' file imports
+
+- [ ] Test with Mac Video Editor (Person)

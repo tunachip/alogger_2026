@@ -28,6 +28,9 @@ THEME = {
     "FG_IDLE": "#39d5ff",
     "FG_ERROR": "#ff8a8a",
     "FG_LOG": "#b0b0b0",
+    "SELECTED_ROW_BG": "#282828",
+    "VIDEO_OVERLAY_BG": "#111111",
+    "VIDEO_OVERLAY_FG": "#ffffff",
 }
 
 POPUP_SIZES = {
@@ -49,6 +52,10 @@ LAYOUT = {
     "PROGRESS_BAR_WIDTH": 28,
     "POPUP_MIN_WIDTH": 320,
     "POPUP_MIN_HEIGHT": 180,
+    "TITLEBAR_HEIGHT": 24,
+    "LAUNCHBAR_HEIGHT": 24,
+    "BAR_PAD_X": 8,
+    "BAR_PAD_Y": 2,
     "PREVIEW_WIDTH": 360,
     "PREVIEW_HEIGHT": 520,
     "PREVIEW_IMAGE_WIDTH": 344,
@@ -59,6 +66,66 @@ LISTBOX = {
     "COUNT_WIDTH": 8,
     "COMMAND_HEIGHT": 6,
     "AGENT_HEIGHT": 8,
+}
+
+ICONS = {
+    "WORKER": "",
+    "PAUSE": "⏸",
+}
+
+THEME_SETTING_IDS: dict[str, str] = {
+    "APP_BG": "theme_bg",
+    "PANEL_BG": "theme_panel_bg",
+    "SURFACE_BG": "theme_surface_bg",
+    "SURFACE_ALT_BG": "theme_surface_alt_bg",
+    "BORDER": "theme_border",
+    "SELECT_BG": "theme_select_bg",
+    "FG": "theme_fg",
+    "FG_SOFT": "theme_soft_fg",
+    "FG_MUTED": "theme_muted_fg",
+    "FG_ACCENT": "theme_accent_fg",
+    "FG_INFO": "theme_info_fg",
+    "FG_IDLE": "theme_idle_fg",
+    "FG_ERROR": "theme_error_fg",
+    "FG_LOG": "theme_log_fg",
+    "SELECTED_ROW_BG": "theme_selected_bg",
+    "VIDEO_OVERLAY_BG": "theme_video_overlay_bg",
+    "VIDEO_OVERLAY_FG": "theme_video_overlay_fg",
+}
+
+THEME_SETTINGS_FIELDS: list[tuple[str, str, str]] = [
+    ("theme_bg", "App Background", "APP_BG"),
+    ("theme_panel_bg", "Panel Background", "PANEL_BG"),
+    ("theme_surface_bg", "Surface Background", "SURFACE_BG"),
+    ("theme_surface_alt_bg", "Input Background", "SURFACE_ALT_BG"),
+    ("theme_border", "Border", "BORDER"),
+    ("theme_select_bg", "Selection Background", "SELECT_BG"),
+    ("theme_fg", "Primary Text", "FG"),
+    ("theme_soft_fg", "Soft Text", "FG_SOFT"),
+    ("theme_muted_fg", "Muted Text", "FG_MUTED"),
+    ("theme_accent_fg", "Accent Text", "FG_ACCENT"),
+    ("theme_info_fg", "Info Text", "FG_INFO"),
+    ("theme_idle_fg", "Idle Text", "FG_IDLE"),
+    ("theme_error_fg", "Error Text", "FG_ERROR"),
+    ("theme_log_fg", "Log Text", "FG_LOG"),
+    ("theme_selected_bg", "Selected Row", "SELECTED_ROW_BG"),
+    ("theme_video_overlay_bg", "Pause Overlay BG", "VIDEO_OVERLAY_BG"),
+    ("theme_video_overlay_fg", "Pause Overlay FG", "VIDEO_OVERLAY_FG"),
+]
+
+STATUS_HINTS: dict[str, str] = {
+    "startup": "No video loaded. Press {open_video} to open by title or {open_finder} to search captions.",
+    "jobs": "Enter execute | Up/Down move command cursor | Esc close",
+    "browse": "Type to filter videos | Enter queue selected | Ctrl-R reload | Ctrl-S subscribe",
+    "search": "Type query | Up/Down select | Enter open video | Esc close",
+    "video_picker": "Type title filter | Up/Down select | Enter open | Delete remove video+transcript | Esc close",
+    "ingest": "Input + Enter on command: Ingest (URL[s]) | Browse (channel) | Subscribe (channel)",
+    "subscriptions": "R refresh | Delete remove selected | P poll now",
+    "goto": "Type digits only: 2=SS, 3-4=MMSS, 5+=HHMMSS",
+    "skim": "Line1=pre-buffer ms | Line2=post-buffer ms | Enter apply | Ctrl-J toggle skim",
+    "settings": "Up/Down select row | Left/Right change tab | Enter edit | Esc close",
+    "ai": "Provider={provider} | Enter send | Esc close",
+    "browse_prompt": "Enter a channel URL, @handle, or name to browse",
 }
 
 DEFAULT_KEYBINDS: dict[str, str] = {
@@ -115,10 +182,25 @@ def build_default_gui_settings() -> dict[str, Any]:
         "subscription_db_max_videos": 0,
         "theme_bg": THEME["APP_BG"],
         "theme_panel_bg": THEME["PANEL_BG"],
+        "theme_surface_bg": THEME["SURFACE_BG"],
+        "theme_surface_alt_bg": THEME["SURFACE_ALT_BG"],
+        "theme_border": THEME["BORDER"],
+        "theme_select_bg": THEME["SELECT_BG"],
         "theme_fg": THEME["FG"],
+        "theme_soft_fg": THEME["FG_SOFT"],
         "theme_muted_fg": THEME["FG_MUTED"],
         "theme_accent_fg": THEME["FG_ACCENT"],
+        "theme_info_fg": THEME["FG_INFO"],
+        "theme_idle_fg": THEME["FG_IDLE"],
+        "theme_error_fg": THEME["FG_ERROR"],
+        "theme_log_fg": THEME["FG_LOG"],
+        "theme_selected_bg": THEME["SELECTED_ROW_BG"],
+        "theme_video_overlay_bg": THEME["VIDEO_OVERLAY_BG"],
+        "theme_video_overlay_fg": THEME["VIDEO_OVERLAY_FG"],
         "font_family": FONT["STYLE"],
         "font_size": FONT["SIZE"],
+        "show_root_top_bar": True,
+        "show_launch_bar": True,
+        "show_popup_top_bar": True,
         "keybinds": dict(DEFAULT_KEYBINDS),
     }

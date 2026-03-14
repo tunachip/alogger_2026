@@ -7,10 +7,96 @@ from typing import Any
 
 from alog.pipeline import resolve_playback_media_path
 
-from ..constants import FONT, FONT_SIZE_OFFSETS, LISTBOX, POPUP_SIZES, THEME
+from ..constants import FONT_SIZE_OFFSETS, LISTBOX, POPUP_SIZES
+from ..utils import matches_search_query, parse_search_query
 
 
 class SearchPopupMixin:
+    def _search_videos_with_query(
+        self,
+        query_text: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses = parse_search_query(query_text)
+        if not clauses:
+            return []
+        merged: dict[str, dict[str, Any]] = {}
+        for clause in clauses:
+            clause_rows: dict[str, dict[str, Any]] | None = None
+            for term in clause:
+                rows = [
+                    dict(row)
+                    for row in self.ingester.search_videos(term, limit=max(limit * 4, 100))
+                ]
+                term_map = {
+                    str(row.get("video_id") or "").strip(): row
+                    for row in rows
+                    if str(row.get("video_id") or "").strip()
+                }
+                if clause_rows is None:
+                    clause_rows = term_map
+                    continue
+                shared_ids = set(clause_rows).intersection(term_map)
+                clause_rows = {
+                    video_id: {
+                        **clause_rows[video_id],
+                        "match_count": int(clause_rows[video_id].get("match_count") or 0)
+                        + int(term_map[video_id].get("match_count") or 0),
+                        "first_start_ms": min(
+                            int(clause_rows[video_id].get("first_start_ms") or 0),
+                            int(term_map[video_id].get("first_start_ms") or 0),
+                        ),
+                    }
+                    for video_id in shared_ids
+                }
+            for video_id, row in (clause_rows or {}).items():
+                existing = merged.get(video_id)
+                if existing is None:
+                    merged[video_id] = row
+                    continue
+                existing["match_count"] = max(
+                    int(existing.get("match_count") or 0),
+                    int(row.get("match_count") or 0),
+                )
+                existing["first_start_ms"] = min(
+                    int(existing.get("first_start_ms") or 0),
+                    int(row.get("first_start_ms") or 0),
+                )
+        rows = list(merged.values())
+        rows.sort(
+            key=lambda row: (
+                -int(row.get("match_count") or 0),
+                int(row.get("first_start_ms") or 0),
+            )
+        )
+        return rows[:limit]
+
+    def _search_video_titles_with_query(
+        self,
+        query_text: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rows = [
+            dict(row)
+            for row in self.ingester.search_video_titles("", limit=max(limit * 4, 300))
+        ]
+        if not query_text.strip():
+            return rows[:limit]
+        filtered = [
+            row
+            for row in rows
+            if matches_search_query(
+                str(row.get("title") or row.get("video_id") or ""),
+                query_text,
+            )
+        ]
+        filtered.sort(
+            key=lambda row: str(row.get("title") or row.get("video_id") or "").lower()
+        )
+        return filtered[:limit]
+
     def _open_search_popup(self) -> None:
         popup = self._create_popup_window(
                     name="finder",
@@ -23,33 +109,33 @@ class SearchPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         query_var = tk.StringVar(value=self.filter_var.get().strip())
-        query_entry = ttk.Entry(
-            popup, textvariable=query_var, style="Filter.TEntry")
+        query_entry = self._create_query_entry(content, query_var)
         query_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
         header = tk.Label(
-            popup,
+            content,
             text="Matches  Title (matches = number of matching caption segments)",
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=4,
         )
         header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
 
-        body = tk.Frame(popup, bg=THEME["APP_BG"])
+        body = tk.Frame(content, bg=self._theme_color("APP_BG"))
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
         count_list = self._create_listbox(
             body,
-            fg=THEME["FG_ACCENT"],
-            select_fg=THEME["FG_ACCENT"],
+            fg=self._theme_color("FG_ACCENT"),
+            select_fg=self._theme_color("FG_ACCENT"),
             width=LISTBOX["COUNT_WIDTH"],
             bold=True,
             takefocus=0,
@@ -59,12 +145,12 @@ class SearchPopupMixin:
         title_list.grid(row=0, column=1, sticky="nsew")
 
         hint = tk.Label(
-            popup,
-            text="Type query, Up/Down select, Enter open video, Esc close",
+            content,
+            text=self._status_hint("search"),
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )
@@ -84,7 +170,7 @@ class SearchPopupMixin:
             self._search_results = []
             if not query:
                 return
-            rows = self.ingester.search_videos(query, limit=200)
+            rows = self._search_videos_with_query(query, limit=200)
             self._search_results = [dict(r) for r in rows]
             for row in self._search_results:
                 title = str(
@@ -178,33 +264,33 @@ class SearchPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         query_var = tk.StringVar(value="")
-        query_entry = ttk.Entry(
-            popup, textvariable=query_var, style="Filter.TEntry")
+        query_entry = self._create_query_entry(content, query_var)
         query_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
         header = tk.Label(
-            popup,
+            content,
             text="Matches  Title (matches = number of title matches)",
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=4,
         )
         header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
 
-        body = tk.Frame(popup, bg=THEME["APP_BG"])
+        body = tk.Frame(content, bg=self._theme_color("APP_BG"))
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
 
         count_list = self._create_listbox(
             body,
-            fg=THEME["FG_ACCENT"],
-            select_fg=THEME["FG_ACCENT"],
+            fg=self._theme_color("FG_ACCENT"),
+            select_fg=self._theme_color("FG_ACCENT"),
             width=LISTBOX["COUNT_WIDTH"],
             bold=True,
             takefocus=0,
@@ -214,21 +300,21 @@ class SearchPopupMixin:
         title_list.grid(row=0, column=1, sticky="nsew")
 
         hint = tk.Label(
-            popup,
-            text="Type title filter, Up/Down select, Enter open, Delete remove video+transcript, Esc close",
+            content,
+            text=self._status_hint("video_picker"),
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
             padx=8,
             pady=6,
         )
         hint.grid(row=3, column=0, sticky="ew")
         status_var = tk.StringVar(value="")
         status_lbl = self._create_status_label(
-            popup,
+            content,
             status_var,
-            fg=THEME["FG_SOFT"],
+            fg=self._theme_color("FG_SOFT"),
             font_delta=-3,
         )
         status_lbl.grid(row=4, column=0, sticky="ew")
@@ -246,7 +332,7 @@ class SearchPopupMixin:
             count_list.delete(0, tk.END)
             title_list.delete(0, tk.END)
             self._video_picker_results = []
-            rows = self.ingester.search_video_titles(query, limit=300)
+            rows = self._search_video_titles_with_query(query, limit=300)
             self._video_picker_results = [dict(r) for r in rows]
             for row in self._video_picker_results:
                 title = str(

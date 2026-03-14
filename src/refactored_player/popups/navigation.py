@@ -4,7 +4,7 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
-from ..constants import FONT, FONT_SIZE_OFFSETS, POPUP_SIZES, THEME
+from ..constants import FONT_SIZE_OFFSETS, POPUP_SIZES
 from ..utils import format_hms as _fmt_hms
 
 
@@ -20,13 +20,14 @@ class NavigationPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         value_var = tk.StringVar(value="")
-        entry = ttk.Entry(popup, textvariable=value_var, style="Filter.TEntry")
+        entry = ttk.Entry(content, textvariable=value_var, style="Filter.TEntry")
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
         status_var = tk.StringVar(
-            value="Type digits only: 2=SS, 3-4=MMSS, 5+=HHMMSS")
-        self._create_status_label(popup, status_var).grid(
+            value=self._status_hint("goto"))
+        self._create_status_label(content, status_var).grid(
             row=1,
             column=0,
             sticky="ew",
@@ -41,27 +42,41 @@ class NavigationPopupMixin:
             if not digits:
                 return ""
             if len(digits) <= 2:
-                sec = digits.zfill(2)
-                return f"00:00:{sec}"
+                return digits
             if len(digits) <= 4:
-                mm = digits[:-2].zfill(2)
-                ss = digits[-2:]
-                return f"00:{mm}:{ss}"
-            hh_raw = digits[:-4]
-            hh = hh_raw if len(hh_raw) >= 2 else hh_raw.zfill(2)
-            mm = digits[-4:-2]
-            ss = digits[-2:]
-            return f"{hh}:{mm}:{ss}"
+                return f"{digits[:-2]}:{digits[-2:]}"
+            return f"{digits[:-4]}:{digits[-4:-2]}:{digits[-2:]}"
+
+        def digit_cursor(raw: str, cursor: int) -> int:
+            return len(re.sub(r"\D", "", raw[:max(0, cursor)]))
+
+        def display_cursor(formatted: str, digits_before_cursor: int) -> int:
+            if digits_before_cursor <= 0:
+                return 0
+            seen = 0
+            for idx, char in enumerate(formatted):
+                if char.isdigit():
+                    seen += 1
+                    if seen >= digits_before_cursor:
+                        return idx + 1
+            return len(formatted)
 
         def on_time_change(*_args: object) -> None:
             if fmt_guard["active"]:
                 return
-            formatted = format_compact_time(value_var.get())
-            if formatted == value_var.get():
+            raw_value = value_var.get()
+            cursor = 0
+            try:
+                cursor = int(entry.index(tk.INSERT))
+            except Exception:
+                cursor = len(raw_value)
+            digits_before = digit_cursor(raw_value, cursor)
+            formatted = format_compact_time(raw_value)
+            if formatted == raw_value:
                 return
             fmt_guard["active"] = True
             value_var.set(formatted)
-            entry.icursor(tk.END)
+            entry.icursor(display_cursor(formatted, digits_before))
             fmt_guard["active"] = False
 
         def parse_time(raw: str) -> float | None:
@@ -110,6 +125,7 @@ class NavigationPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
         pre_var = tk.StringVar(value=str(self._skim_pre_ms))
         post_var = tk.StringVar(value=str(self._skim_post_ms))
@@ -118,29 +134,29 @@ class NavigationPopupMixin:
                 self._skim_pre_ms}ms, post={self._skim_post_ms}ms)"
         )
 
-        pre_entry = ttk.Entry(popup, textvariable=pre_var,
+        pre_entry = ttk.Entry(content, textvariable=pre_var,
                               style="Filter.TEntry")
         pre_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
         post_entry = ttk.Entry(
-            popup, textvariable=post_var, style="Filter.TEntry")
+            content, textvariable=post_var, style="Filter.TEntry")
         post_entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         hint = tk.Label(
-            popup,
-            text="Line1=pre-buffer ms | Line2=post-buffer ms | Enter apply | Ctrl-J toggle skim",
+            content,
+            text=self._status_hint("skim"),
             anchor="w",
-            bg=THEME["SURFACE_BG"],
-            fg=THEME["FG_MUTED"],
-            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"]),
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_MUTED"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
             padx=8,
             pady=6,
         )
         hint.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         status_lbl = self._create_status_label(
-            popup,
+            content,
             status_var,
-            fg="#d2d2d2",
+            fg=self._theme_color("FG_SOFT"),
         )
         status_lbl.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
 

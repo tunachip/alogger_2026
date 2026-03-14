@@ -19,14 +19,15 @@ class SubscriptionsPopupMixin:
         )
         if popup is None:
             return
+        content = self._popup_content(popup)
 
-        listbox = self._create_listbox(popup, font_delta=-3)
+        listbox = self._create_listbox(content, font_delta=-3)
         listbox.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
 
         status_var = tk.StringVar(
-            value="R refresh | Delete remove selected | P poll now")
+            value=self._status_hint("subscriptions"))
         status_lbl = self._create_status_label(
-            popup, status_var, font_delta=-3)
+            content, status_var, font_delta=-3)
         status_lbl.grid(row=1, column=0, sticky="ew")
         rows_cache: list[dict[str, Any]] = []
 

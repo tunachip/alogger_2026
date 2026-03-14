@@ -8,13 +8,14 @@ from pathlib import Path
 import vlc
 
 from .models import SegmentRow
-from .utils import format_hms as _fmt_hms
+from .utils import format_hms as _fmt_hms, matches_search_query, search_terms
 
 
 class TranscriptMixin:
     def _load_segments(self, transcript_json: Path) -> list[SegmentRow]:
         if not transcript_json.exists():
-            raise FileNotFoundError(f"transcript json not found: {transcript_json}")
+            raise FileNotFoundError(
+                f"transcript json not found: {transcript_json}")
         payload = json.loads(transcript_json.read_text(encoding="utf-8"))
         raw_segments = payload.get("segments", [])
         if not isinstance(raw_segments, list):
@@ -42,7 +43,11 @@ class TranscriptMixin:
         if not query:
             self.filtered_indexes = list(range(len(self.segments)))
         else:
-            self.filtered_indexes = [idx for idx, seg in enumerate(self.segments) if query in seg.text_lc]
+            self.filtered_indexes = [
+                idx
+                for idx, seg in enumerate(self.segments)
+                if matches_search_query(seg.text_lc, query)
+            ]
         self.selected_filtered_pos = 0
         self._refresh_caption_view()
         if self._skim_mode:
@@ -55,26 +60,39 @@ class TranscriptMixin:
         self._row_ranges = []
         self._row_text_ranges = []
         query = self.filter_var.get().strip().lower()
+        terms = search_terms(query)
         for seg_idx in self.filtered_indexes:
             segment = self.segments[seg_idx]
             line_start = self.caption_view.index("end-1c")
             prefix = f"[{_fmt_hms(segment.start_sec)}] "
-            self.caption_view.insert(tk.END, prefix + segment.text + "\n", ("row",))
-            self.caption_view.tag_add("ts", line_start, f"{line_start}+{len(prefix)}c")
-            self.caption_view.tag_add("txt", f"{line_start}+{len(prefix)}c", f"{line_start}+{len(prefix) + len(segment.text)}c")
-            self._row_text_ranges.append((f"{line_start}+{len(prefix)}c", f"{line_start}+{len(prefix) + len(segment.text)}c"))
+            self.caption_view.insert(
+                tk.END,
+                prefix + segment.text + "\n",
+                ("row",))
+            self.caption_view.tag_add(
+                "ts",
+                line_start,
+                f"{line_start}+{len(prefix)}c")
+            self.caption_view.tag_add(
+                "txt",
+                f"{line_start}+{len(prefix)}c",
+                f"{line_start}+{len(prefix) + len(segment.text)}c")
+            self._row_text_ranges.append((
+                f"{line_start}+{len(prefix)}c",
+                f"{line_start}+{len(prefix) + len(segment.text)}c"
+            ))
             line_end = self.caption_view.index("end-1c")
             self._row_ranges.append((line_start, line_end))
-            if query:
+            for term in terms:
                 pos = 0
                 while True:
-                    hit = segment.text_lc.find(query, pos)
+                    hit = segment.text_lc.find(term, pos)
                     if hit == -1:
                         break
                     start = f"{line_start}+{len(prefix) + hit}c"
-                    end = f"{line_start}+{len(prefix) + hit + len(query)}c"
+                    end = f"{line_start}+{len(prefix) + hit + len(term)}c"
                     self.caption_view.tag_add("match", start, end)
-                    pos = hit + len(query)
+                    pos = hit + len(term)
         if self.filtered_indexes:
             self._select_pos(self.selected_filtered_pos)
         else:
@@ -96,7 +114,10 @@ class TranscriptMixin:
         self.caption_view.see(line_start)
         self.caption_view.configure(state="disabled")
         segment = self.segments[self.filtered_indexes[pos]]
-        self.status_var.set(f"Hovering segment #{segment.index} @ {_fmt_hms(segment.start_sec)} | matches={len(self.filtered_indexes)}")
+        _i = segment.index
+        _s = _fmt_hms(segment.start_sec)
+        _m = len(self.filtered_indexes)
+        self.status_var.set(f"Hovering segment #{_i} @ {_s} | matches={_m}")
 
     def _current_segment(self) -> SegmentRow | None:
         if not self.filtered_indexes:
@@ -139,22 +160,43 @@ class TranscriptMixin:
         segment = self.segments[self.filtered_indexes[row]]
         text_start, text_end = self._row_text_ranges[row]
         try:
-            click_abs = int(self.caption_view.count("1.0", click_index, "chars")[0])
-            start_abs = int(self.caption_view.count("1.0", text_start, "chars")[0])
-            end_abs = int(self.caption_view.count("1.0", text_end, "chars")[0])
+            click_abs = int(self.caption_view.count(
+                "1.0",
+                click_index,
+                "chars"
+            )[0])
+            start_abs = int(self.caption_view.count(
+                "1.0",
+                text_start,
+                "chars"
+            )[0])
+            end_abs = int(self.caption_view.count(
+                "1.0",
+                text_end,
+                "chars"
+            )[0])
         except Exception:
             self._seek_to_absolute(segment.start_sec)
             return "break"
         width = max(1, end_abs - start_abs)
         ratio = max(0.0, min(1.0, (click_abs - start_abs) / float(width)))
-        target = segment.start_sec + (segment.end_sec - segment.start_sec) * ratio
+        target = (
+            segment.start_sec
+            + (segment.end_sec - segment.start_sec)
+            * ratio
+        )
         self._seek_to_absolute(target)
-        self.status_var.set(f"Seek ~{int(ratio * 100)}% of segment @ {_fmt_hms(target)}")
+        _s = int(ratio * 100)
+        _t = _fmt_hms(target)
+        self.status_var.set(f"Seek ~{_s}% of segment @ {_t}")
         return "break"
 
     def _row_from_text_index(self, index: str) -> int | None:
         for row_index, (start, end) in enumerate(self._row_ranges):
-            if self.caption_view.compare(index, ">=", start) and self.caption_view.compare(index, "<=", end):
+            if (
+                self.caption_view.compare(index, ">=", start)
+                and self.caption_view.compare(index, "<=", end)
+            ):
                 return row_index
         return None
 
@@ -295,7 +337,11 @@ class TranscriptMixin:
         self._apply_theme()
         self._apply_font_scale_tree(self.root)
         self._wrap_indent_px = self._text_font.measure(self._timestamp_prefix)
-        self.caption_view.tag_configure("row", lmargin1=0, lmargin2=self._wrap_indent_px)
+        self.caption_view.tag_configure(
+            "row",
+            lmargin1=0,
+            lmargin2=self._wrap_indent_px
+        )
         self._refresh_caption_view()
         self.status_var.set(f"Text size: {new_size}")
 
@@ -321,15 +367,20 @@ class TranscriptMixin:
             self._sync_skim_cursor_with_pos(target_ms / 1000.0)
 
     def _tick_ui(self) -> None:
+        state = self.player.get_state()
+        self._refresh_pause_overlay(state)
         if self._active_popup_name is not None:
             self.root.after(250, self._tick_ui)
             return
-        state = self.player.get_state()
         pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
         self._tick_skim(state, pos_sec)
         length_ms = self.player.get_length()
-        length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
+        length_sec = (
+            max(0.0, length_ms / 1000.0)
+            if length_ms and length_ms > 0
+            else 0.0
+        )
         self._update_clock_view(pos_sec, length_sec)
         self.caption_now_var.set(self._caption_text_at(pos_sec))
         if state == vlc.State.Playing:
@@ -368,7 +419,9 @@ class TranscriptMixin:
         ranges = self._filtered_clip_ranges()
         if not ranges:
             self._skim_mode = False
-            self.status_var.set("Skim mode disabled: no filtered transcript matches")
+            self.status_var.set(
+                "Skim mode disabled: no filtered transcript matches"
+            )
             return
         self._skim_cursor = max(0, min(self._skim_cursor, len(ranges) - 1))
         start, _end, seg_idx = ranges[self._skim_cursor]
@@ -382,22 +435,34 @@ class TranscriptMixin:
     def _toggle_skim_mode(self) -> None:
         self._skim_mode = not self._skim_mode
         if self._skim_mode:
-            self._sync_skim_cursor_with_pos(max(0, self.player.get_time()) / 1000.0)
+            self._sync_skim_cursor_with_pos(
+                max(0, self.player.get_time()) / 1000.0
+            )
             self._start_skim_at_cursor(force_seek=True)
             if self._skim_mode:
-                self.status_var.set(f"Skim mode ON (pre={self._skim_pre_ms}ms, post={self._skim_post_ms}ms)")
+                _pre = self._skim_pre_ms
+                _post = self._skim_post_ms
+                self.status_var.set(
+                    f"Skim mode ON (pre={_pre}ms, post={_post}ms)"
+                )
             return
         self.status_var.set("Skim mode OFF")
 
     def _tick_skim(self, state: vlc.State, pos_sec: float) -> None:
         if not self._skim_mode:
             return
-        if state not in {vlc.State.Playing, vlc.State.Paused, vlc.State.NothingSpecial}:
+        if state not in {
+            vlc.State.Playing,
+            vlc.State.Paused,
+            vlc.State.NothingSpecial
+        }:
             return
         ranges = self._filtered_clip_ranges()
         if not ranges:
             self._skim_mode = False
-            self.status_var.set("Skim mode disabled: no filtered transcript matches")
+            self.status_var.set(
+                "Skim mode disabled: no filtered transcript matches"
+            )
             return
         self._skim_cursor = max(0, min(self._skim_cursor, len(ranges) - 1))
         start, end, _seg_idx = ranges[self._skim_cursor]
@@ -426,7 +491,8 @@ class TranscriptMixin:
             self.player.set_pause(0)
             self._skim_last_seek_at = now
             if next_seg_idx in self.filtered_indexes:
-                self.selected_filtered_pos = self.filtered_indexes.index(next_seg_idx)
+                self.selected_filtered_pos = \
+                        self.filtered_indexes.index(next_seg_idx)
                 self._select_pos(self.selected_filtered_pos)
 
     def _caption_text_at(self, pos_sec: float) -> str:
@@ -440,7 +506,11 @@ class TranscriptMixin:
             return segment.text
         return ""
 
-    def _render_time_progress_parts(self, pos_sec: float, length_sec: float) -> tuple[str, str]:
+    def _render_time_progress_parts(
+        self,
+        pos_sec: float,
+        length_sec: float
+    ) -> tuple[str, str]:
         prefix = f"[{_fmt_hms(pos_sec)}] "
         if length_sec <= 0:
             return prefix, "░" * self._progress_bar_width
@@ -458,8 +528,13 @@ class TranscriptMixin:
         self.clock_view.delete("1.0", tk.END)
         self.clock_view.insert("1.0", payload)
         self.clock_view.tag_remove("bar", "1.0", tk.END)
-        self.clock_view.tag_add("bar", f"1.{self._clock_prefix_len}", f"1.{self._clock_prefix_len + len(bar)}")
-        self.clock_view.tag_configure("bar", foreground="#f7d154")
+        self.clock_view.tag_add(
+            "bar", f"1.{self._clock_prefix_len}",
+            f"1.{self._clock_prefix_len + len(bar)}"
+        )
+        self.clock_view.tag_configure(
+            "bar", foreground=self._theme_color("FG_ACCENT")
+        )
         self.clock_view.configure(state="disabled")
 
     def _on_click_clock_progress(self, event: tk.Event[tk.Misc]) -> str:
@@ -491,15 +566,23 @@ class TranscriptMixin:
         self.caption_now_box.configure(wraplength=max(120, width - 24))
         self._update_progress_bar_width(width)
         self._refresh_clock_now()
+        self._position_video_overlay()
 
-    def _update_progress_bar_width(self, panel_width: int | None = None) -> None:
-        width = panel_width if panel_width is not None else int(self.left_panel.winfo_width())
+    def _update_progress_bar_width(
+        self,
+        panel_width: int | None = None
+    ) -> None:
+        width = (
+            panel_width
+            if panel_width is not None
+            else int(self.left_panel.winfo_width())
+        )
         if width <= 0:
             return
-        available_px = max(120, width - 24)
+        available = max(120, width - 24)
         prefix_px = self._text_font.measure("[00:00:00] ")
         block_px = max(1, self._text_font.measure("█"))
-        bar_chars = max(12, min(140, int((available_px - prefix_px) / block_px)))
+        bar_chars = max(12, min(140, int((available - prefix_px) / block_px)))
         self._progress_bar_width = bar_chars + 24
 
     def _refresh_clock_now(self) -> None:
@@ -509,18 +592,49 @@ class TranscriptMixin:
         pos_ms = max(0, self.player.get_time())
         pos_sec = pos_ms / 1000.0
         length_ms = self.player.get_length()
-        length_sec = max(0.0, length_ms / 1000.0) if length_ms and length_ms > 0 else 0.0
+        length_sec = (
+            max(0.0, length_ms / 1000.0)
+            if length_ms and length_ms > 0
+            else 0.0
+        )
         self._update_clock_view(pos_sec, length_sec)
 
     def _set_initial_split_ratio(self) -> None:
         if self._split_initialized:
             return
         total_w = self.shell.winfo_width()
-        if total_w <= 0:
+        total_h = self.shell.winfo_height()
+        if total_w <= 0 or total_h <= 0:
             return
-        self.shell.sash_place(0, int(total_w * 3 / 5), 0)
+        self._apply_shell_layout(total_w, total_h)
         self._split_initialized = True
 
     def _on_shell_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        total_w = self.shell.winfo_width()
+        total_h = self.shell.winfo_height()
+        if total_w > 0 and total_h > 0:
+            self._apply_shell_layout(total_w, total_h)
         if not self._split_initialized:
             self._set_initial_split_ratio()
+
+    def _apply_shell_layout(self, total_w: int, total_h: int) -> None:
+        should_stack = total_w < 1320 or total_w < int(total_h * 1.45)
+        orient = tk.VERTICAL if should_stack else tk.HORIZONTAL
+        layout_mode = "vertical" if should_stack else "horizontal"
+        layout_changed = self._shell_layout_mode != layout_mode
+        if str(self.shell.cget("orient")) != str(orient):
+            self.shell.configure(orient=orient)
+        if layout_changed:
+            if should_stack:
+                self.shell.paneconfigure(self.left_panel, minsize=320)
+                self.shell.paneconfigure(self.right_panel, minsize=180)
+            else:
+                self.shell.paneconfigure(self.left_panel, minsize=1000)
+                self.shell.paneconfigure(self.right_panel, minsize=200)
+            self._shell_layout_mode = layout_mode
+        self._shell_stacked = should_stack
+        if layout_changed or not self._split_initialized:
+            if should_stack:
+                self.shell.sash_place(0, 0, int(total_h * 2 / 3))
+            else:
+                self.shell.sash_place(0, int(total_w * 3 / 5), 0)
