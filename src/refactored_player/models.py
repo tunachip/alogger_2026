@@ -165,6 +165,7 @@ class QueryEntry(tk.Text):
         self.bind("<FocusOut>", lambda _e: self.after(50, self._hide_completion), add="+")
         self._textvariable.trace_add("write", self._on_var_change)
         self._set_value(self._textvariable.get())
+        self.icursor(len(self.get()))
 
     def configure_colors(
         self,

@@ -23,6 +23,7 @@ from .constants import (
     FONT_SIZE_OFFSETS,
     ICONS,
     LAYOUT,
+    PLAYBACK_SPEEDS,
     POPUP_SIZES,
     STATUS_HINTS,
     THEME,
@@ -88,6 +89,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._browse_thumb_dir: Path | None = None
         self._video_thumb_dir: Path | None = None
         self._browse_temp_files: set[Path] = set()
+        self._playback_rate = 1.0
         self._split_initialized = False
         self._transcript_hidden = False
         self._details_hidden = False
@@ -376,16 +378,59 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self.left_panel.configure(bg=panel_bg)
         self.right_panel.configure(bg=bg)
         self.video_panel.configure(bg=panel_bg)
+        self.clock_row.configure(bg=surface_bg)
         self.clock_view.configure(
             bg=surface_bg,
             fg=fg,
             insertbackground=fg,
             font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold")
         )
+        self.play_pause_button.configure(
+            bg=surface_bg,
+            fg=fg,
+            activebackground=self._theme_color("SELECT_BG"),
+            activeforeground=fg,
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold"),
+        )
+        self.playback_rate_button.configure(
+            bg=surface_bg,
+            fg=fg,
+            activebackground=self._theme_color("SELECT_BG"),
+            activeforeground=fg,
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold"),
+        )
+        self.playback_rate_menu.configure(
+            bg=surface_bg,
+            fg=fg,
+            activebackground=self._theme_color("SELECT_BG"),
+            activeforeground=fg,
+        )
         self.caption_now_box.configure(
             bg=surface_bg,
             fg=fg,
             font=(family, size + FONT_SIZE_OFFSETS["BODY"])
+        )
+        self.details_frame.configure(bg=surface_bg)
+        self.details_title.configure(
+            bg=surface_bg,
+            fg=fg,
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["BODY"]), "bold"),
+        )
+        self.details_meta.configure(
+            bg=surface_bg,
+            fg=soft,
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["SMALL"])),
+        )
+        self.details_genre.configure(
+            bg=surface_bg,
+            fg=self._theme_color("FG_INFO"),
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["SMALL"])),
+        )
+        self.details_description.configure(
+            bg=surface_bg,
+            fg=soft,
+            insertbackground=fg,
+            font=(family, max(8, size + FONT_SIZE_OFFSETS["SMALL"])),
         )
         self.root_status_box.configure(
             bg=surface_bg,
@@ -508,6 +553,8 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
                 pass
         self._apply_root_chrome_settings()
         self._refresh_clock_now()
+        self._refresh_transport_controls()
+        self._refresh_details_pane()
 
     def _apply_font_scale_tree(
         self,
@@ -870,13 +917,17 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             self.root,
             orient=tk.HORIZONTAL,
             sashrelief=tk.FLAT,
-            sashwidth=LAYOUT["SASH_WIDTH"]
+            sashwidth=LAYOUT["SASH_WIDTH"],
+            bg=THEME["APP_BG"],
+            bd=0,
+            relief="flat",
+            showhandle=False,
         )
         self.shell.grid(row=2, column=0, sticky="nsew")
         self.left_panel = tk.Frame(self.shell, bg=THEME["PANEL_BG"])
         self.right_panel = tk.Frame(self.shell, bg=THEME["APP_BG"])
-        self.shell.add(self.left_panel, minsize=1000)
-        self.shell.add(self.right_panel, minsize=200)
+        self.shell.add(self.left_panel, minsize=0)
+        self.shell.add(self.right_panel, minsize=0)
         self.shell.bind("<Configure>", self._on_shell_configure)
         self.root.after(0, self._set_initial_split_ratio)
         self.left_panel.rowconfigure(0, weight=1)
@@ -895,8 +946,28 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             pady=8,
         )
         self.video_pause_overlay.place_forget()
+        self.clock_row = tk.Frame(self.left_panel, bg=THEME["SURFACE_BG"], highlightthickness=0, bd=0)
+        self.clock_row.grid(row=2, column=0, sticky="ew")
+        self.clock_row.columnconfigure(1, weight=1)
+        self.play_pause_button = tk.Button(
+            self.clock_row,
+            text=ICONS["PLAY"],
+            command=lambda: self._on_toggle_play(None),
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG"],
+            activebackground=THEME["SELECT_BG"],
+            activeforeground=THEME["FG"],
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=10,
+            pady=6,
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
+            cursor="hand2",
+        )
+        self.play_pause_button.grid(row=0, column=0, sticky="w")
         self.clock_view = tk.Text(
-            self.left_panel,
+            self.clock_row,
             bg=THEME["SURFACE_BG"],
             fg=THEME["FG_ACCENT"],
             borderwidth=0,
@@ -909,9 +980,42 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             cursor="hand2",
             insertbackground=THEME["FG_ACCENT"],
         )
-        self.clock_view.grid(row=2, column=0, sticky="ew")
+        self.clock_view.grid(row=0, column=1, sticky="ew")
         self.clock_view.configure(state="disabled")
         self.clock_view.bind("<Button-1>", self._on_click_clock_progress)
+        self.playback_rate_var = tk.StringVar(value="1.00x")
+        self.playback_rate_button = tk.Menubutton(
+            self.clock_row,
+            textvariable=self.playback_rate_var,
+            direction="below",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG"],
+            activebackground=THEME["SELECT_BG"],
+            activeforeground=THEME["FG"],
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=10,
+            pady=6,
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
+            cursor="hand2",
+        )
+        self.playback_rate_button.grid(row=0, column=2, sticky="e")
+        self.playback_rate_menu = tk.Menu(
+            self.playback_rate_button,
+            tearoff=False,
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG"],
+            activebackground=THEME["SELECT_BG"],
+            activeforeground=THEME["FG"],
+            bd=0,
+        )
+        self.playback_rate_button.configure(menu=self.playback_rate_menu)
+        for speed in PLAYBACK_SPEEDS:
+            self.playback_rate_menu.add_command(
+                label=f"{speed:.2f}x",
+                command=lambda value=speed: self._set_playback_rate(value),
+            )
         self.caption_now_var = tk.StringVar(value="")
         self.caption_now_box = tk.Label(
             self.left_panel,
@@ -926,6 +1030,70 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             wraplength=400,
         )
         self.caption_now_box.grid(row=1, column=0, sticky="ew")
+        self.details_frame = tk.Frame(
+            self.left_panel,
+            bg=THEME["SURFACE_BG"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self.details_frame.grid(row=3, column=0, sticky="ew")
+        self.details_frame.columnconfigure(0, weight=1)
+        self.details_title_var = tk.StringVar(value="")
+        self.details_meta_var = tk.StringVar(value="")
+        self.details_genre_var = tk.StringVar(value="")
+        self.details_title = tk.Label(
+            self.details_frame,
+            textvariable=self.details_title_var,
+            anchor="w",
+            justify="left",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["BODY"], "bold"),
+            padx=10,
+            pady=4,
+            wraplength=400,
+        )
+        self.details_title.grid(row=0, column=0, sticky="ew")
+        self.details_meta = tk.Label(
+            self.details_frame,
+            textvariable=self.details_meta_var,
+            anchor="w",
+            justify="left",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_SOFT"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            padx=10,
+            pady=2,
+            wraplength=400,
+        )
+        self.details_meta.grid(row=1, column=0, sticky="ew")
+        self.details_genre = tk.Label(
+            self.details_frame,
+            textvariable=self.details_genre_var,
+            anchor="w",
+            justify="left",
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_INFO"],
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            padx=10,
+            pady=2,
+            wraplength=400,
+        )
+        self.details_genre.grid(row=2, column=0, sticky="ew")
+        self.details_description = tk.Text(
+            self.details_frame,
+            bg=THEME["SURFACE_BG"],
+            fg=THEME["FG_SOFT"],
+            borderwidth=0,
+            highlightthickness=0,
+            font=(FONT["STYLE"], FONT["SIZE"] + FONT_SIZE_OFFSETS["SMALL"]),
+            wrap="word",
+            padx=10,
+            pady=6,
+            height=6,
+        )
+        self.details_description.grid(row=3, column=0, sticky="ew")
+        self.details_description.configure(state="disabled")
         self.left_panel.bind("<Configure>", self._on_left_resize)
         self.status_var = tk.StringVar(value="Idle")
         self.root_status_box = tk.Label(
@@ -1053,6 +1221,64 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             self.video_pause_overlay.lift()
             return
         self.video_pause_overlay.place_forget()
+
+    def _refresh_transport_controls(self) -> None:
+        if not hasattr(self, "play_pause_button"):
+            return
+        icon = ICONS["PLAY"]
+        try:
+            state = self.player.get_state()
+        except Exception:
+            state = None
+        if state == vlc.State.Playing:
+            icon = ICONS["PAUSE"]
+        self.play_pause_button.configure(text=icon)
+        self.playback_rate_var.set(f"{float(getattr(self, '_playback_rate', 1.0)):.2f}x")
+
+    def _set_playback_rate(self, value: float) -> None:
+        rate = max(0.25, min(4.0, float(value)))
+        self._playback_rate = rate
+        try:
+            self.player.set_rate(rate)
+        except Exception:
+            pass
+        self._refresh_transport_controls()
+        self.status_var.set(f"Speed {rate:.2f}x")
+
+    def _refresh_details_pane(self) -> None:
+        if not hasattr(self, "details_frame"):
+            return
+        title = ""
+        meta = ""
+        genre_text = ""
+        description = ""
+        video_id = str(getattr(self, "current_video_id", None) or "").strip()
+        if video_id:
+            try:
+                row = self.ingester.db.get_video(video_id) or {}
+            except Exception:
+                row = {}
+            payload = self._row_metadata_payload(row)
+            title = str(row.get("title") or video_id).strip()
+            creator = str(row.get("channel") or row.get("uploader_id") or "unknown").strip().lstrip("@")
+            length = self._metadata_text_for_field(row, "LENGTH").split(" ", 1)[-1].strip() or "--:--"
+            meta = f"{creator} | {length}"
+            genre_value = self._display_genre_text(row)
+            genre_text = f"genre: {genre_value}" if genre_value else "genre: (none)"
+            summary = str(payload.get("summary") or "").strip()
+            raw_description = str(payload.get("description") or "").strip()
+            clean_description = "\n".join(
+                line for line in raw_description.splitlines()
+                if line.strip("- ").strip()
+            ).strip()
+            description = summary or clean_description
+        self.details_title_var.set(title)
+        self.details_meta_var.set(meta)
+        self.details_genre_var.set(genre_text)
+        self.details_description.configure(state="normal")
+        self.details_description.delete("1.0", tk.END)
+        self.details_description.insert("1.0", description or "(no details)")
+        self.details_description.configure(state="disabled")
 
     def _on_begin_window_drag(self, event: tk.Event[tk.Misc]) -> str:
         self._drag_origin_x = int(getattr(event, "x_root", 0))
@@ -1190,6 +1416,10 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self.root.bind("<Next>", self._guard_key_handler(self._on_page_down))
         self.root.bind("<Home>", self._guard_key_handler(self._on_home))
         self.root.bind("<End>", self._guard_key_handler(self._on_end))
+        self.root.bind("<Control-Prior>", self._guard_key_handler(self._on_ctrl_page_up))
+        self.root.bind("<Control-Next>", self._guard_key_handler(self._on_ctrl_page_down))
+        self.root.bind("<Control-Home>", self._guard_key_handler(self._on_ctrl_home))
+        self.root.bind("<Control-End>", self._guard_key_handler(self._on_ctrl_end))
         self.root.bind("<Control-minus>", self._guard_key_handler(self._on_font_smaller))
         self.root.bind("<Control-equal>", self._guard_key_handler(self._on_font_larger))
         self.root.bind("<Control-plus>", self._guard_key_handler(self._on_font_larger))

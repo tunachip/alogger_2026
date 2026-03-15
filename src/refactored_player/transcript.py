@@ -219,6 +219,7 @@ class TranscriptMixin:
                 self.player.play()
                 self.root.after(120, lambda: self.player.set_pause(0))
                 self.status_var.set("Playing")
+        self._refresh_transport_controls()
         return "break"
 
     def _on_left(self, _event: tk.Event[tk.Misc]) -> str:
@@ -266,6 +267,42 @@ class TranscriptMixin:
         if not self.filtered_indexes:
             return "break"
         self._select_pos(self.selected_filtered_pos + 1)
+        segment = self._current_segment()
+        if segment:
+            self._seek_to_absolute(segment.start_sec)
+        return "break"
+
+    def _on_ctrl_page_up(self, _event: tk.Event[tk.Misc]) -> str:
+        if not self.filtered_indexes:
+            return "break"
+        self._select_pos(self.selected_filtered_pos - 10)
+        segment = self._current_segment()
+        if segment:
+            self._seek_to_absolute(segment.start_sec)
+        return "break"
+
+    def _on_ctrl_page_down(self, _event: tk.Event[tk.Misc]) -> str:
+        if not self.filtered_indexes:
+            return "break"
+        self._select_pos(self.selected_filtered_pos + 10)
+        segment = self._current_segment()
+        if segment:
+            self._seek_to_absolute(segment.start_sec)
+        return "break"
+
+    def _on_ctrl_home(self, _event: tk.Event[tk.Misc]) -> str:
+        if not self.filtered_indexes:
+            return "break"
+        self._select_pos(0)
+        segment = self._current_segment()
+        if segment:
+            self._seek_to_absolute(segment.start_sec)
+        return "break"
+
+    def _on_ctrl_end(self, _event: tk.Event[tk.Misc]) -> str:
+        if not self.filtered_indexes:
+            return "break"
+        self._select_pos(len(self.filtered_indexes) - 1)
         segment = self._current_segment()
         if segment:
             self._seek_to_absolute(segment.start_sec)
@@ -536,6 +573,7 @@ class TranscriptMixin:
             "bar", foreground=self._theme_color("FG_ACCENT")
         )
         self.clock_view.configure(state="disabled")
+        self._refresh_transport_controls()
 
     def _on_click_clock_progress(self, event: tk.Event[tk.Misc]) -> str:
         if self._clock_last_length_sec <= 0:
@@ -564,6 +602,11 @@ class TranscriptMixin:
         if width <= 0:
             return
         self.caption_now_box.configure(wraplength=max(120, width - 24))
+        if hasattr(self, "details_title"):
+            wrap = max(120, width - 24)
+            self.details_title.configure(wraplength=wrap)
+            self.details_meta.configure(wraplength=wrap)
+            self.details_genre.configure(wraplength=wrap)
         self._update_progress_bar_width(width)
         self._refresh_clock_now()
         self._position_video_overlay()
@@ -626,11 +669,11 @@ class TranscriptMixin:
             self.shell.configure(orient=orient)
         if layout_changed:
             if should_stack:
-                self.shell.paneconfigure(self.left_panel, minsize=320)
-                self.shell.paneconfigure(self.right_panel, minsize=180)
+                self.shell.paneconfigure(self.left_panel, minsize=0)
+                self.shell.paneconfigure(self.right_panel, minsize=0)
             else:
-                self.shell.paneconfigure(self.left_panel, minsize=1000)
-                self.shell.paneconfigure(self.right_panel, minsize=200)
+                self.shell.paneconfigure(self.left_panel, minsize=0)
+                self.shell.paneconfigure(self.right_panel, minsize=0)
             self._shell_layout_mode = layout_mode
         self._shell_stacked = should_stack
         if layout_changed or not self._split_initialized:

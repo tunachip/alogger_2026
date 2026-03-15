@@ -122,14 +122,12 @@ class PopupBaseMixin:
 
     def _on_toggle_details(self, _event: tk.Event[tk.Misc]) -> str:
         if self._details_hidden:
-            self.caption_now_box.grid(row=1, column=0, sticky="ew")
-            self.clock_view.grid(row=2, column=0, sticky="ew")
+            self.details_frame.grid(row=3, column=0, sticky="ew")
             self._details_hidden = False
-            self._refresh_clock_now()
+            self._refresh_details_pane()
             self.status_var.set("Details shown")
             return "break"
-        self.caption_now_box.grid_remove()
-        self.clock_view.grid_remove()
+        self.details_frame.grid_remove()
         self._details_hidden = True
         return "break"
 

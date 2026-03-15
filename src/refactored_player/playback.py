@@ -301,9 +301,15 @@ class PlaybackMixin:
         self.filtered_indexes = list(range(len(self.segments)))
         self.selected_filtered_pos = 0
         self._set_player_media(video_path, audio_path, start_sec=start_sec)
+        try:
+            self.player.set_rate(float(getattr(self, "_playback_rate", 1.0)))
+        except Exception:
+            pass
         self.filter_var.set(filter_text)
         if not filter_text:
             self._refresh_caption_view()
+        self._refresh_transport_controls()
+        self._refresh_details_pane()
         _t = _fmt_hms(start_sec)
         if self.segments:
             self.status_var.set(
@@ -324,6 +330,8 @@ class PlaybackMixin:
         self._skim_mode = False
         self._refresh_caption_view()
         self.caption_now_var.set("")
+        self._refresh_details_pane()
+        self._refresh_transport_controls()
         try:
             self.player.stop()
         except Exception:

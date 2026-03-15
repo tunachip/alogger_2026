@@ -47,12 +47,23 @@
     "creator",
     "length"
   ],
+  "finder_fields": [
+    "title",
+    "creator",
+    "length"
+  ],
   "video_picker_field_widths": {
     "title": 48,
     "creator": 48,
     "length": 48
   },
   "queue_picker_field_widths": {},
+  "finder_field_widths": {
+    "matches": 120,
+    "title": 462,
+    "creator": 180,
+    "length": 197
+  },
   "video_picker_sort_fields": [
     "title",
     "creator",

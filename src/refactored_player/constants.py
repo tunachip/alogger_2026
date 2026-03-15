@@ -103,7 +103,18 @@ PICKER_FIELDS: dict[str, dict[str, Any]] = {
 ICONS = {
     "WORKER": "",
     "PAUSE": "⏸",
+    "PLAY": "▶",
 }
+
+PLAYBACK_SPEEDS = [
+    0.5,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    1.75,
+    2.0,
+]
 
 THEME_SETTING_IDS: dict[str, str] = {
     "APP_BG": "theme_bg",
@@ -243,8 +254,10 @@ def build_default_gui_settings() -> dict[str, Any]:
         "show_popup_top_bar": True,
         "video_picker_fields": ["title", "creator", "length"],
         "queue_picker_fields": ["title", "creator", "length"],
+        "finder_fields": ["title", "creator", "length"],
         "video_picker_field_widths": {},
         "queue_picker_field_widths": {},
+        "finder_field_widths": {},
         "video_picker_sort_fields": [],
         "queue_picker_sort_fields": [],
         "defer_local_picker_preview": True,
