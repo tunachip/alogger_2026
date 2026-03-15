@@ -39,7 +39,8 @@
   "show_popup_top_bar": true,
   "video_picker_fields": [
     "title",
-    "creator"
+    "creator",
+    "length"
   ],
   "queue_picker_fields": [
     "title",
@@ -47,15 +48,15 @@
     "length"
   ],
   "video_picker_field_widths": {
-    "title": 1315,
-    "creator": 140,
-    "length": 140,
-    "summary": 140
+    "title": 48,
+    "creator": 48,
+    "length": 48
   },
   "queue_picker_field_widths": {},
   "video_picker_sort_fields": [
+    "title",
     "creator",
-    "title"
+    "length"
   ],
   "queue_picker_sort_fields": [],
   "defer_local_picker_preview": true,
