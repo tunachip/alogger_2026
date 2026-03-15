@@ -36,6 +36,7 @@ THEME = {
 POPUP_SIZES = {
     "ROOT": "1640x880",
     "DEFAULT": "900x620",
+    "PICKER": "1540x760",
     "COMMAND": "720x520",
     "AI": "980x680",
     "GOTO": "420x160",
@@ -66,6 +67,37 @@ LISTBOX = {
     "COUNT_WIDTH": 8,
     "COMMAND_HEIGHT": 6,
     "AGENT_HEIGHT": 8,
+}
+
+PICKER_FIELDS: dict[str, dict[str, Any]] = {
+    "title": {
+        "label": "Title",
+        "width": 56,
+    },
+    "creator": {
+        "label": "Creator",
+        "width": 24,
+    },
+    "length": {
+        "label": "Length",
+        "width": 8,
+    },
+    "genre": {
+        "label": "Genre",
+        "width": 18,
+    },
+    "summary": {
+        "label": "Summary",
+        "width": 28,
+    },
+    "date": {
+        "label": "Date",
+        "width": 10,
+    },
+    "video_id": {
+        "label": "Video ID",
+        "width": 12,
+    },
 }
 
 ICONS = {
@@ -209,5 +241,15 @@ def build_default_gui_settings() -> dict[str, Any]:
         "show_root_top_bar": True,
         "show_launch_bar": True,
         "show_popup_top_bar": True,
+        "video_picker_fields": ["title", "creator", "length"],
+        "queue_picker_fields": ["title", "creator", "length"],
+        "video_picker_field_widths": {},
+        "queue_picker_field_widths": {},
+        "video_picker_sort_fields": [],
+        "queue_picker_sort_fields": [],
+        "defer_local_picker_preview": True,
+        "defer_browse_preview": True,
+        "video_picker_default_field": "title",
+        "finder_default_field": "ts",
         "keybinds": dict(DEFAULT_KEYBINDS),
     }

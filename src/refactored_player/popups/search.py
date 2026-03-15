@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import colorsys
 import json
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import Any
+from typing import Any, Callable
 
 from alog.pipeline import resolve_playback_media_path
 
-from ..constants import FONT_SIZE_OFFSETS, LISTBOX, POPUP_SIZES
+from ..constants import FONT_SIZE_OFFSETS, LISTBOX, PICKER_FIELDS, POPUP_SIZES
+from ..models import PickerTable
 from ..utils import (
     SearchClause,
     format_hms as _fmt_hms,
@@ -27,6 +30,327 @@ except Exception:
 
 
 class SearchPopupMixin:
+    def _default_query_text(self, setting_key: str, fallback_field: str) -> str:
+        field = str(self._ai_settings.get(setting_key) or fallback_field).strip().lower().removeprefix("$")
+        return f"${field} " if field else ""
+
+    def _picker_sort_setting_key(self, picker_name: str) -> str:
+        return "queue_picker_sort_fields" if picker_name == "queue_picker" else "video_picker_sort_fields"
+
+    def _picker_fields_setting_key(self, picker_name: str) -> str:
+        return "queue_picker_fields" if picker_name == "queue_picker" else "video_picker_fields"
+
+    def _picker_fields_for(self, picker_name: str) -> list[str]:
+        setting_key = self._picker_fields_setting_key(picker_name)
+        raw = self._ai_settings.get(setting_key)
+        values = raw if isinstance(raw, list) else []
+        fields = [
+            str(value).strip().lower()
+            for value in values
+            if str(value).strip().lower() in PICKER_FIELDS
+        ]
+        if not fields:
+            fields = ["title", "creator", "length"]
+        return fields
+
+    def _set_picker_fields(self, picker_name: str, fields: list[str]) -> None:
+        normalized = [
+            str(field).strip().lower()
+            for field in fields
+            if str(field).strip().lower() in PICKER_FIELDS
+        ]
+        if not normalized:
+            normalized = ["title", "creator", "length"]
+        self._ai_settings[self._picker_fields_setting_key(picker_name)] = normalized
+        self._save_gui_settings()
+
+    def _picker_sort_fields_for(self, picker_name: str) -> list[str]:
+        raw = self._ai_settings.get(self._picker_sort_setting_key(picker_name))
+        values = raw if isinstance(raw, list) else []
+        return [
+            str(value).strip().lower()
+            for value in values
+            if str(value).strip().lower() in self._picker_fields_for(picker_name)
+        ]
+
+    def _set_picker_sort_fields(self, picker_name: str, fields: list[str]) -> None:
+        visible = set(self._picker_fields_for(picker_name))
+        normalized = []
+        for field in fields:
+            token = str(field).strip().lower()
+            if token in visible and token not in normalized:
+                normalized.append(token)
+        self._ai_settings[self._picker_sort_setting_key(picker_name)] = normalized
+        self._save_gui_settings()
+
+    def _picker_widths_setting_key(self, picker_name: str) -> str:
+        return "queue_picker_field_widths" if picker_name == "queue_picker" else "video_picker_field_widths"
+
+    def _picker_field_widths_for(self, picker_name: str) -> dict[str, int]:
+        raw = self._ai_settings.get(self._picker_widths_setting_key(picker_name))
+        if not isinstance(raw, dict):
+            return {}
+        widths: dict[str, int] = {}
+        for key, value in raw.items():
+            token = str(key).strip().lower()
+            if token not in PICKER_FIELDS:
+                continue
+            try:
+                widths[token] = max(48, int(value))
+            except Exception:
+                continue
+        return widths
+
+    def _set_picker_field_widths(self, picker_name: str, widths: dict[str, int]) -> None:
+        normalized = {
+            str(key).strip().lower(): max(48, int(value))
+            for key, value in widths.items()
+            if str(key).strip().lower() in PICKER_FIELDS
+        }
+        self._ai_settings[self._picker_widths_setting_key(picker_name)] = normalized
+        self._save_gui_settings()
+
+    def _picker_columns_for(self, picker_name: str) -> list[tuple[str, str, int]]:
+        widths = self._picker_field_widths_for(picker_name)
+        sort_fields = self._picker_sort_fields_for(picker_name)
+        columns: list[tuple[str, str, int]] = []
+        for field in self._picker_fields_for(picker_name):
+            spec = PICKER_FIELDS.get(field, {})
+            numeral = "-"
+            if field in sort_fields:
+                idx = sort_fields.index(field)
+                numerals = ["Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ"]
+                numeral = numerals[idx] if idx < len(numerals) else str(idx + 1)
+            columns.append(
+                (
+                    field,
+                    f"{str(spec.get('label') or field.title())} {numeral}",
+                    int(widths.get(field) or spec.get("width") or 120),
+                )
+            )
+        return columns
+
+    def _cycle_picker_sort_field(
+        self,
+        picker_name: str,
+        field_name: str,
+        *,
+        reverse: bool = False,
+    ) -> None:
+        field = str(field_name or "").strip().lower()
+        visible_fields = self._picker_fields_for(picker_name)
+        if field not in visible_fields:
+            return
+        sort_fields = self._picker_sort_fields_for(picker_name)
+        if reverse:
+            if field not in sort_fields:
+                sort_fields.insert(0, field)
+            else:
+                idx = sort_fields.index(field)
+                if idx >= len(sort_fields) - 1:
+                    sort_fields.pop(idx)
+                else:
+                    sort_fields[idx], sort_fields[idx + 1] = sort_fields[idx + 1], sort_fields[idx]
+        else:
+            if field not in sort_fields:
+                sort_fields.append(field)
+            else:
+                idx = sort_fields.index(field)
+                if idx == 0:
+                    sort_fields.pop(idx)
+                else:
+                    sort_fields[idx], sort_fields[idx - 1] = sort_fields[idx - 1], sort_fields[idx]
+        self._set_picker_sort_fields(picker_name, sort_fields)
+
+    def _move_picker_field(
+        self,
+        picker_name: str,
+        field_name: str,
+        *,
+        delta: int,
+    ) -> None:
+        field = str(field_name or "").strip().lower()
+        fields = self._picker_fields_for(picker_name)
+        if field not in fields:
+            return
+        idx = fields.index(field)
+        nxt = max(0, min(len(fields) - 1, idx + int(delta)))
+        if idx == nxt:
+            return
+        fields[idx], fields[nxt] = fields[nxt], fields[idx]
+        self._set_picker_fields(picker_name, fields)
+
+    def _picker_field_value(self, row: dict[str, Any], field: str) -> str:
+        token = str(field or "").strip().lower()
+        if token == "title":
+            return str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
+        if token == "creator":
+            return " ".join(
+                part
+                for part in [
+                    str(row.get("channel") or "").strip(),
+                    str(row.get("uploader_id") or "").strip(),
+                ]
+                if part
+            ) or "unknown"
+        if token == "length":
+            return self._metadata_text_for_field(row, "LENGTH").split(" ", 1)[-1].strip() or "--:--"
+        if token == "genre":
+            return self._metadata_text_for_field(row, "GENRE").replace("\n", " ").strip()
+        if token == "summary":
+            return self._metadata_text_for_field(row, "SUMMARY").replace("\n", " ").strip()
+        if token == "date":
+            return str(row.get("upload_date") or "").strip()
+        if token == "video_id":
+            return str(row.get("video_id") or "").strip()
+        return ""
+
+    def _picker_row_values(
+        self,
+        row: dict[str, Any],
+        picker_name: str,
+    ) -> dict[str, str]:
+        values = {
+            field: self._picker_field_value(row, field)
+            for field in self._picker_fields_for(picker_name)
+        }
+        values["id"] = str(row.get("video_id") or "")
+        return values
+
+    def _picker_sort_key(
+        self,
+        row: dict[str, Any],
+        field: str,
+    ) -> tuple[int, Any]:
+        token = str(field or "").strip().lower()
+        if token == "length":
+            try:
+                return (0, int(row.get("duration_sec") or 0))
+            except Exception:
+                return (1, 0)
+        if token == "date":
+            return (0, str(row.get("upload_date") or "").strip().lower())
+        return (0, self._picker_field_value(row, token).lower())
+
+    def _sort_picker_rows(
+        self,
+        rows: list[dict[str, Any]],
+        picker_name: str,
+    ) -> list[dict[str, Any]]:
+        sort_fields = self._picker_sort_fields_for(picker_name)
+        if not sort_fields:
+            return rows
+        ordered = list(rows)
+        for field in reversed(sort_fields):
+            ordered.sort(key=lambda row, token=field: self._picker_sort_key(row, token))
+        return ordered
+
+    def _picker_clause_colors(self, count: int) -> list[str]:
+        accent = str(self._theme_color("FG_ACCENT") or "").strip()
+        if not accent.startswith("#") or len(accent) != 7:
+            return [accent for _ in range(max(1, count))]
+        try:
+            r = int(accent[1:3], 16) / 255.0
+            g = int(accent[3:5], 16) / 255.0
+            b = int(accent[5:7], 16) / 255.0
+        except Exception:
+            return [accent for _ in range(max(1, count))]
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
+        total = 10
+        order = [0, 5, 2, 7, 1, 6, 3, 8, 4, 9]
+        palette: list[str] = []
+        for idx in range(total):
+            nr, ng, nb = colorsys.hls_to_rgb((h + (idx / float(total))) % 1.0, l, max(0.15, s))
+            palette.append(
+                "#{:02x}{:02x}{:02x}".format(
+                    int(max(0, min(255, round(nr * 255.0)))),
+                    int(max(0, min(255, round(ng * 255.0)))),
+                    int(max(0, min(255, round(nb * 255.0)))),
+                )
+            )
+        arranged = [palette[idx] for idx in order]
+        return [arranged[idx % total] for idx in range(max(1, count))]
+
+    def _picker_highlight_specs(
+        self,
+        query_text: str,
+        visible_fields: list[str],
+    ) -> list[tuple[set[str], list[str], str]]:
+        query = str(query_text or "").strip()
+        if not query:
+            return []
+        specs: list[tuple[set[str], list[str], str]] = []
+        if "$" in query or ";" in query or "!" in query or "*" in query:
+            clauses = parse_advanced_search_query(query)
+            colors = self._picker_clause_colors(len(clauses))
+            field_map = {
+                "TITLE": {"title"},
+                "CREATOR": {"creator"},
+                "GENRE": {"genre"},
+                "SUMMARY": {"summary"},
+                "LENGTH": {"length"},
+                "ANY": set(visible_fields),
+            }
+            for idx, clause in enumerate(clauses):
+                if clause.negated or clause.expression.strip() == "*" or clause.field == "TS":
+                    continue
+                terms = search_terms(clause.expression)
+                if not terms:
+                    continue
+                targets = field_map.get(clause.field, {clause.field.lower()})
+                targets = {field for field in targets if field in visible_fields}
+                if targets:
+                    specs.append((targets, terms, colors[idx]))
+            return specs
+        clauses = parse_search_query(query)
+        colors = self._picker_clause_colors(len(clauses))
+        for idx, clause in enumerate(clauses):
+            terms = [term for term in clause if term]
+            if terms:
+                specs.append(({"title"}, terms, colors[idx]))
+        return specs
+
+    def _attach_picker_fields_menu(
+        self,
+        button: tk.Menubutton,
+        *,
+        picker_name: str,
+        on_change: Callable[[], None],
+    ) -> dict[str, tk.BooleanVar]:
+        field_vars: dict[str, tk.BooleanVar] = {}
+        menu = tk.Menu(
+            button,
+            tearoff=False,
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG"),
+            activebackground=self._theme_color("SELECT_BG"),
+            activeforeground=self._theme_color("FG"),
+            bd=0,
+        )
+        button.configure(menu=menu)
+
+        def _toggle(field_name: str) -> None:
+            fields = self._picker_fields_for(picker_name)
+            enabled = bool(field_vars[field_name].get())
+            if enabled and field_name not in fields:
+                fields.append(field_name)
+            elif not enabled and field_name in fields:
+                fields = [field for field in fields if field != field_name]
+            self._set_picker_fields(picker_name, fields)
+            for token, var in field_vars.items():
+                var.set(token in self._picker_fields_for(picker_name))
+            on_change()
+
+        for field_name, spec in PICKER_FIELDS.items():
+            var = tk.BooleanVar(value=field_name in self._picker_fields_for(picker_name))
+            field_vars[field_name] = var
+            menu.add_checkbutton(
+                label=str(spec.get("label") or field_name.title()),
+                variable=var,
+                command=lambda name=field_name: _toggle(name),
+            )
+        return field_vars
+
     def _darken_hex_color(self, color: str, factor: float = 0.82) -> str:
         token = str(color or "").strip()
         if not token.startswith("#") or len(token) != 7:
@@ -73,8 +397,13 @@ class SearchPopupMixin:
         if thumbnail_url and "youtube.com/watch" in thumbnail_url:
             thumbnail_url = ""
         image_path = None
-        if video_id:
-            image_path = self._download_browse_thumbnail(video_id, thumbnail_url or f"https://i.ytimg.com/vi/{video_id}/default.jpg")
+        if video_id and not bool(row.get("_skip_thumbnail_download")):
+            image_path = self._download_browse_thumbnail(
+                video_id,
+                thumbnail_url or f"https://i.ytimg.com/vi/{video_id}/default.jpg",
+                cache_dir=self._video_thumb_dir,
+                temporary=False,
+            )
         return {
             "title": title,
             "creator": creator,
@@ -121,6 +450,30 @@ class SearchPopupMixin:
                 pass
         photo_ref["image"] = None
         image_label.configure(image="", text="Preview unavailable")
+
+    def _render_video_preview_placeholder(
+        self,
+        row: dict[str, Any],
+        *,
+        image_label: tk.Label,
+        title_var: tk.StringVar,
+        creator_var: tk.StringVar,
+        genre_var: tk.StringVar,
+        description_widget: tk.Text,
+        photo_ref: dict[str, Any],
+        loading: bool,
+    ) -> None:
+        preview = self._video_preview_payload({**row, "_skip_thumbnail_download": True})
+        title_var.set(str(preview.get("title") or "untitled"))
+        creator_var.set(f"creator: {preview.get('creator') or 'unknown'}")
+        genre_value = str(preview.get("genre") or "").strip()
+        genre_var.set(f"genre: {genre_value}" if genre_value else "genre: (none)")
+        description_widget.configure(state="normal")
+        description_widget.delete("1.0", tk.END)
+        description_widget.insert("1.0", str(preview.get("description") or "(no description)"))
+        description_widget.configure(state="disabled")
+        photo_ref["image"] = None
+        image_label.configure(image="", text="Loading preview..." if loading else "Preview unavailable")
 
     def _build_video_preview_pane(
         self,
@@ -517,7 +870,7 @@ class SearchPopupMixin:
         popup = self._create_popup_window(
                     name="finder",
                     title="Search DB",
-                    size=POPUP_SIZES["DEFAULT"],
+                    size=POPUP_SIZES["PICKER"],
             attr_name="_search_popup",
             reuse_existing=True,
             row_weights={2: 1},
@@ -527,7 +880,7 @@ class SearchPopupMixin:
             return
         content = self._popup_content(popup)
 
-        query_var = tk.StringVar(value=self.filter_var.get().strip())
+        query_var = tk.StringVar(value=self.filter_var.get().strip() or self._default_query_text("finder_default_field", "ts"))
         query_entry = self._create_query_entry(
             content,
             query_var,
@@ -693,7 +1046,7 @@ class SearchPopupMixin:
         popup = self._create_popup_window(
                     name="open_video",
                     title="Open Video",
-                    size=POPUP_SIZES["DEFAULT"],
+                    size=POPUP_SIZES["PICKER"],
             attr_name="_video_picker_popup",
             reuse_existing=True,
             row_weights={2: 1},
@@ -703,7 +1056,7 @@ class SearchPopupMixin:
             return
         content = self._popup_content(popup)
 
-        query_var = tk.StringVar(value="")
+        query_var = tk.StringVar(value=self._default_query_text("video_picker_default_field", "title"))
         query_entry = self._create_query_entry(
             content,
             query_var,
@@ -711,34 +1064,63 @@ class SearchPopupMixin:
         )
         query_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
-        header = tk.Label(
-            content,
-            text="Matches  Title (matches = number of title matches)",
-            anchor="w",
+        header_row = tk.Frame(content, bg=self._theme_color("SURFACE_BG"))
+        header_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        header_row.columnconfigure(0, weight=1)
+        fields_button = tk.Menubutton(
+            header_row,
+            text="Fields",
+            direction="below",
             bg=self._theme_color("SURFACE_BG"),
-            fg=self._theme_color("FG_MUTED"),
-            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
+            fg=self._theme_color("FG_SOFT"),
+            activebackground=self._theme_color("SELECT_BG"),
+            activeforeground=self._theme_color("FG"),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
             padx=8,
             pady=4,
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
         )
-        header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        fields_button.grid(row=0, column=1, sticky="e")
 
         body = tk.Frame(content, bg=self._theme_color("APP_BG"))
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        body.columnconfigure(0, weight=0, minsize=360)
         body.rowconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
-
-        count_list = self._create_listbox(
+        preview = self._build_video_preview_pane(body)
+        preview["frame"].grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        list_shell = tk.Frame(
             body,
-            fg=self._theme_color("FG_ACCENT"),
-            select_fg=self._theme_color("FG_ACCENT"),
-            width=LISTBOX["COUNT_WIDTH"],
-            bold=True,
-            takefocus=0,
+            bg=self._theme_color("PANEL_BG"),
+            highlightthickness=1,
+            highlightbackground=self._theme_color("BORDER"),
+            bd=0,
         )
-        title_list = self._create_listbox(body)
-        count_list.grid(row=0, column=0, sticky="ns")
-        title_list.grid(row=0, column=1, sticky="nsew")
+        list_shell.grid(row=0, column=1, sticky="nsew")
+        list_shell.columnconfigure(0, weight=1)
+        list_shell.rowconfigure(1, weight=1)
+        header_strip = tk.Frame(list_shell, bg=self._theme_color("PANEL_BG"))
+        header_strip.grid(row=0, column=0, sticky="ew")
+        title_list = tk.Text(
+            list_shell,
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG"),
+            insertbackground=self._theme_color("FG"),
+            borderwidth=0,
+            highlightthickness=0,
+            wrap="none",
+            state="disabled",
+            cursor="arrow",
+            padx=8,
+            pady=4,
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
+        )
+        title_list.grid(row=1, column=0, sticky="nsew")
+        title_scroll = ttk.Scrollbar(list_shell, orient="vertical", command=title_list.yview)
+        title_scroll.grid(row=1, column=1, sticky="ns")
+        title_list.configure(yscrollcommand=title_scroll.set)
 
         hint = tk.Label(
             content,
@@ -760,66 +1142,231 @@ class SearchPopupMixin:
         )
         status_lbl.grid(row=4, column=0, sticky="ew")
         pending_delete: dict[str, str | None] = {"video_id": None}
+        row_ids: list[str] = []
+        selected_index = {"value": 0}
+        preview_request_id = {"value": 0}
+        char_width = max(1, self._text_font.measure("0"))
+
+        def _selected_video_id() -> str:
+            if 0 <= selected_index["value"] < len(row_ids):
+                return row_ids[selected_index["value"]]
+            return ""
+
+        def _refresh_header() -> None:
+            for child in header_strip.winfo_children():
+                child.destroy()
+            for idx, (field, label, width) in enumerate(self._picker_columns_for("video_picker")):
+                width_chars = max(6, int(round(width / float(char_width))))
+                base_label, marker = label.rsplit(" ", 1) if " " in label else (label, "-")
+                cell = tk.Frame(header_strip, bg=self._theme_color("PANEL_BG"))
+                cell.grid(row=0, column=idx, sticky="ew")
+                header_strip.columnconfigure(idx, weight=max(1, width_chars))
+                tk.Label(
+                    cell,
+                    text=base_label,
+                    anchor="w",
+                    bg=self._theme_color("PANEL_BG"),
+                    fg=self._theme_color("FG_MUTED"),
+                    font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
+                    padx=8,
+                    pady=4,
+                    width=max(4, width_chars - 2),
+                ).pack(side="left", fill="x", expand=True)
+                marker_label = tk.Label(
+                    cell,
+                    text=marker,
+                    anchor="e",
+                    bg=self._theme_color("PANEL_BG"),
+                    fg=self._theme_color("FG_MUTED"),
+                    font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
+                    padx=4,
+                    pady=4,
+                    cursor="hand2",
+                )
+                marker_label.pack(side="right")
+                marker_label.bind(
+                    "<Button-1>",
+                    lambda _e, name=field: (self._cycle_picker_sort_field("video_picker", name, reverse=False), refresh_results()),
+                    add="+",
+                )
+                marker_label.bind(
+                    "<Button-3>",
+                    lambda _e, name=field: (self._cycle_picker_sort_field("video_picker", name, reverse=True), refresh_results()),
+                    add="+",
+                )
+                marker_label.bind("<Enter>", lambda e: e.widget.configure(fg=self._theme_color("FG")), add="+")
+                marker_label.bind("<Leave>", lambda e: e.widget.configure(fg=self._theme_color("FG_MUTED")), add="+")
+
+        def _configure_tabs() -> None:
+            tabs: list[str] = []
+            offset = 0
+            for _field, _label, width in self._picker_columns_for("video_picker"):
+                offset += max(72, int(width))
+                tabs.append(f"{offset}p")
+            title_list.configure(tabs=tuple(tabs))
+
+        def _render_rows(query: str) -> None:
+            visible_fields = self._picker_fields_for("video_picker")
+            specs = self._picker_highlight_specs(query, visible_fields)
+            title_list.configure(state="normal")
+            title_list.delete("1.0", tk.END)
+            title_list.tag_configure(
+                "selected_row",
+                background=self._theme_color("SELECTED_ROW_BG"),
+                foreground=self._theme_color("FG"),
+            )
+            for idx, (_targets, _terms, color) in enumerate(specs):
+                title_list.tag_configure(f"match_{idx}", foreground=color)
+                title_list.tag_raise(f"match_{idx}")
+            row_ids.clear()
+            for row in self._video_picker_results:
+                row_ids.append(str(row.get("video_id") or ""))
+                for col_idx, field in enumerate(visible_fields):
+                    if col_idx:
+                        title_list.insert(tk.END, "\t")
+                    cell_text = self._picker_field_value(row, field)
+                    cell_start = title_list.index(tk.END)
+                    title_list.insert(tk.END, cell_text)
+                    cell_lower = cell_text.lower()
+                    for spec_idx, (target_fields, terms, _color) in enumerate(specs):
+                        if field not in target_fields:
+                            continue
+                        for term in terms:
+                            token = str(term or "").strip().lower()
+                            if not token:
+                                continue
+                            start_at = 0
+                            while True:
+                                found = cell_lower.find(token, start_at)
+                                if found < 0:
+                                    break
+                                title_list.tag_add(
+                                    f"match_{spec_idx}",
+                                    f"{cell_start}+{found}c",
+                                    f"{cell_start}+{found + len(token)}c",
+                                )
+                                start_at = found + len(token)
+                title_list.insert(tk.END, "\n")
+            title_list.configure(state="disabled")
 
         def _set_selection(idx: int) -> None:
-            self._set_listbox_selection(
-                [count_list, title_list],
-                idx,
-                len(self._video_picker_results),
+            if not row_ids:
+                return
+            idx = max(0, min(idx, len(row_ids) - 1))
+            selected_index["value"] = idx
+            title_list.configure(state="normal")
+            title_list.tag_remove("selected_row", "1.0", tk.END)
+            title_list.tag_add("selected_row", f"{idx + 1}.0", f"{idx + 1}.end")
+            for spec_idx, _spec in enumerate(self._picker_highlight_specs(query_var.get().strip(), self._picker_fields_for("video_picker"))):
+                title_list.tag_raise(f"match_{spec_idx}")
+            title_list.configure(state="disabled")
+            title_list.see(f"{idx + 1}.0")
+            sel_id = _selected_video_id()
+            row = next(
+                (
+                    item
+                    for item in self._video_picker_results
+                    if str(item.get("video_id") or "") == sel_id
+                ),
+                None,
             )
-            if 0 <= idx < len(self._video_picker_results):
-                self._render_video_preview(
-                    self._video_picker_results[idx],
-                    image_label=preview["image_label"],
-                    title_var=preview["title_var"],
-                    creator_var=preview["creator_var"],
-                    genre_var=preview["genre_var"],
-                    description_widget=preview["description"],
-                    photo_ref=preview["photo_ref"],
-                    image_size=preview["image_size"],
-                )
+            if row is not None:
+                preview_request_id["value"] += 1
+                request_id = int(preview_request_id["value"])
+                defer_preview = bool(self._ai_settings.get("defer_local_picker_preview", True))
+                if defer_preview:
+                    self._render_video_preview_placeholder(
+                        row,
+                        image_label=preview["image_label"],
+                        title_var=preview["title_var"],
+                        creator_var=preview["creator_var"],
+                        genre_var=preview["genre_var"],
+                        description_widget=preview["description"],
+                        photo_ref=preview["photo_ref"],
+                        loading=True,
+                    )
+
+                    def _worker(target_row: dict[str, Any], ticket: int) -> None:
+                        try:
+                            payload = self._video_preview_payload(target_row)
+                        except Exception:
+                            payload = {}
+
+                        def _apply() -> None:
+                            if (
+                                ticket != int(preview_request_id["value"])
+                                or not popup.winfo_exists()
+                                or _selected_video_id() != str(target_row.get("video_id") or "")
+                            ):
+                                return
+                            self._render_video_preview(
+                                target_row,
+                                image_label=preview["image_label"],
+                                title_var=preview["title_var"],
+                                creator_var=preview["creator_var"],
+                                genre_var=preview["genre_var"],
+                                description_widget=preview["description"],
+                                photo_ref=preview["photo_ref"],
+                                image_size=preview["image_size"],
+                            )
+
+                        try:
+                            self.root.after(0, _apply)
+                        except Exception:
+                            return
+
+                    threading.Thread(
+                        target=_worker,
+                        args=(dict(row), request_id),
+                        daemon=True,
+                    ).start()
+                else:
+                    self._render_video_preview(
+                        row,
+                        image_label=preview["image_label"],
+                        title_var=preview["title_var"],
+                        creator_var=preview["creator_var"],
+                        genre_var=preview["genre_var"],
+                        description_widget=preview["description"],
+                        photo_ref=preview["photo_ref"],
+                        image_size=preview["image_size"],
+                    )
 
         def refresh_results(*_args: object) -> None:
             query = query_var.get().strip()
-            selected_video_id = ""
-            sel = title_list.curselection()
-            if sel and 0 <= int(sel[0]) < len(self._video_picker_results):
-                selected_video_id = str(
-                    self._video_picker_results[int(sel[0])].get("video_id") or ""
-                ).strip()
-            count_list.delete(0, tk.END)
-            title_list.delete(0, tk.END)
+            selected_video_id = _selected_video_id()
+            _refresh_header()
+            _configure_tabs()
             self._video_picker_results = []
             rows = self._search_video_titles_with_query(query, limit=300)
-            self._video_picker_results = [dict(r) for r in rows]
-            selected_idx = -1
-            for row_idx, row in enumerate(self._video_picker_results):
-                title = str(
-                    row.get("title")
-                    or row.get("video_id")
-                    or "untitled"
-                ).replace("\n", " ").strip()
-                count = int(row.get("match_count") or 0)
-                count_list.insert(tk.END, f"{count:>4}")
-                title_list.insert(tk.END, title)
-                if (
-                    selected_video_id
-                    and str(row.get("video_id") or "").strip() == selected_video_id
-                ):
-                    selected_idx = row_idx
+            self._video_picker_results = self._sort_picker_rows([dict(r) for r in rows], "video_picker")
+            _render_rows(query)
             if self._video_picker_results:
-                _set_selection(selected_idx if selected_idx >= 0 else 0)
+                found_idx = next(
+                    (
+                        idx
+                        for idx, row in enumerate(self._video_picker_results)
+                        if str(row.get("video_id") or "") == selected_video_id
+                    ),
+                    0,
+                )
+                _set_selection(found_idx)
             status_var.set(f"{len(self._video_picker_results)} rows")
 
         def open_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
-            sel = title_list.curselection()
-            if not sel:
+            video_id = _selected_video_id()
+            if not video_id:
                 return "break"
-            idx = int(sel[0])
-            if idx < 0 or idx >= len(self._video_picker_results):
+            row = next(
+                (
+                    item
+                    for item in self._video_picker_results
+                    if str(item.get("video_id") or "") == video_id
+                ),
+                None,
+            )
+            if row is None:
                 return "break"
-            row = self._video_picker_results[idx]
-            video_id = str(row.get("video_id") or "")
             transcript_raw = str(row.get("transcript_json_path") or "").strip()
             transcript_path = Path(transcript_raw) if transcript_raw else None
             preferred = Path(str(row.get("local_video_path") or "")) if row.get(
@@ -850,24 +1397,24 @@ class SearchPopupMixin:
             return "break"
 
         def move_sel(delta: int) -> str:
-            sel = title_list.curselection()
-            cur = int(sel[0]) if sel else 0
-            _set_selection(cur + delta)
+            _set_selection(selected_index["value"] + delta)
             return "break"
 
         def delete_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
-            sel = title_list.curselection()
-            if not sel:
+            video_id = _selected_video_id()
+            if not video_id:
                 status_var.set("No video selected")
                 return "break"
-            idx = int(sel[0])
-            if idx < 0 or idx >= len(self._video_picker_results):
+            row = next(
+                (
+                    item
+                    for item in self._video_picker_results
+                    if str(item.get("video_id") or "") == video_id
+                ),
+                None,
+            )
+            if row is None:
                 status_var.set("Invalid selection")
-                return "break"
-            row = self._video_picker_results[idx]
-            video_id = str(row.get("video_id") or "")
-            if not video_id:
-                status_var.set("Selection has no video id")
                 return "break"
             if pending_delete.get("video_id") != video_id:
                 pending_delete["video_id"] = video_id
@@ -890,17 +1437,9 @@ class SearchPopupMixin:
             return "break"
 
         def queue_transcribe_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
-            sel = title_list.curselection()
-            if not sel:
-                status_var.set("No video selected")
-                return "break"
-            idx = int(sel[0])
-            if idx < 0 or idx >= len(self._video_picker_results):
-                status_var.set("Invalid selection")
-                return "break"
-            video_id = str(self._video_picker_results[idx].get("video_id") or "")
+            video_id = _selected_video_id()
             if not video_id:
-                status_var.set("Selection has no video id")
+                status_var.set("No video selected")
                 return "break"
             try:
                 result = self.ingester.enqueue_video_for_transcription(video_id)
@@ -913,17 +1452,9 @@ class SearchPopupMixin:
             return "break"
 
         def queue_summary_selected(_event: tk.Event[tk.Misc] | None = None) -> str:
-            sel = title_list.curselection()
-            if not sel:
-                status_var.set("No video selected")
-                return "break"
-            idx = int(sel[0])
-            if idx < 0 or idx >= len(self._video_picker_results):
-                status_var.set("Invalid selection")
-                return "break"
-            video_id = str(self._video_picker_results[idx].get("video_id") or "")
+            video_id = _selected_video_id()
             if not video_id:
-                status_var.set("Selection has no video id")
+                status_var.set("No video selected")
                 return "break"
             try:
                 result = self.ingester.enqueue_video_for_summary(video_id)
@@ -936,6 +1467,11 @@ class SearchPopupMixin:
             return "break"
 
         query_var.trace_add("write", refresh_results)
+        self._attach_picker_fields_menu(
+            fields_button,
+            picker_name="video_picker",
+            on_change=refresh_results,
+        )
         self._bind_popup_close(
             popup,
             after_close=lambda: setattr(self, "_video_picker_popup", None),
@@ -943,7 +1479,7 @@ class SearchPopupMixin:
         self._bind_fzf_like_keys(
             popup,
             entry=query_entry,
-            capture_widgets=[query_entry, title_list, count_list],
+            capture_widgets=[query_entry, title_list],
             on_enter=lambda: open_selected(),
             on_up=lambda: move_sel(-1),
             on_down=lambda: move_sel(1),
@@ -952,12 +1488,15 @@ class SearchPopupMixin:
             on_page_up=lambda: move_sel(-10),
             on_page_down=lambda: move_sel(10),
         )
+        title_list.bind(
+            "<ButtonRelease-1>",
+            lambda e: _set_selection(max(0, int(str(title_list.index(f"@{e.x},{e.y}")).split(".", 1)[0]) - 1)),
+            add="+",
+        )
         title_list.bind("<Double-Button-1>", open_selected)
         title_list.bind("<Delete>", delete_selected)
         title_list.bind("<Control-r>", queue_transcribe_selected)
         title_list.bind("<Control-y>", queue_summary_selected)
-        title_list.bind("<<ListboxSelect>>", lambda _e: _set_selection(int(title_list.curselection()[0])) if title_list.curselection() else "break")
-        count_list.bind("<Button-1>", lambda _e: "break")
         popup.bind("<Delete>", delete_selected)
         popup.bind("<Control-r>", queue_transcribe_selected)
         popup.bind("<Control-y>", queue_summary_selected)
@@ -973,7 +1512,7 @@ class SearchPopupMixin:
         popup = self._create_popup_window(
             name="queue_picker",
             title=f"Queue Videos: {stage.title()}",
-            size=POPUP_SIZES["CHANNEL"],
+            size=POPUP_SIZES["PICKER"],
             attr_name="_queue_picker_popup",
             reuse_existing=True,
             row_weights={2: 1},
@@ -991,9 +1530,12 @@ class SearchPopupMixin:
         )
         query_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
 
+        header_row = tk.Frame(content, bg=self._theme_color("SURFACE_BG"))
+        header_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        header_row.columnconfigure(0, weight=1)
         header = tk.Label(
-            content,
-            text=f"Queue {stage.title()}  Title",
+            header_row,
+            text=f"Queue {stage.title()}",
             anchor="w",
             bg=self._theme_color("SURFACE_BG"),
             fg=self._theme_color("FG_MUTED"),
@@ -1001,30 +1543,51 @@ class SearchPopupMixin:
             padx=8,
             pady=4,
         )
-        header.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        header.grid(row=0, column=0, sticky="ew")
+        fields_button = tk.Menubutton(
+            header_row,
+            text="Fields",
+            direction="below",
+            bg=self._theme_color("SURFACE_BG"),
+            fg=self._theme_color("FG_SOFT"),
+            activebackground=self._theme_color("SELECT_BG"),
+            activeforeground=self._theme_color("FG"),
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=8,
+            pady=4,
+            font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
+        )
+        fields_button.grid(row=0, column=1, sticky="e")
 
         body = tk.Frame(content, bg=self._theme_color("APP_BG"))
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=0, minsize=360)
-        body.columnconfigure(1, weight=0)
-        body.columnconfigure(2, weight=1)
+        body.columnconfigure(1, weight=1)
 
         preview = self._build_video_preview_pane(body)
         preview["frame"].grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        count_list = self._create_listbox(
+        title_list = PickerTable(
             body,
-            fg=self._theme_color("FG_ACCENT"),
-            select_fg=self._theme_color("FG_ACCENT"),
-            width=LISTBOX["COUNT_WIDTH"],
-            bold=True,
-            takefocus=0,
-            selectmode=tk.SINGLE,
+            columns=self._picker_columns_for("queue_picker"),
+            bg=self._theme_color("PANEL_BG"),
+            fg=self._theme_color("FG"),
+            muted_fg=self._theme_color("FG_MUTED"),
+            border=self._theme_color("BORDER"),
+            select_bg=self._theme_color("SELECTED_ROW_BG"),
+            select_fg=self._theme_color("FG"),
+            retained_bg=self._darken_hex_color(self._theme_color("SELECTED_ROW_BG")),
+            retained_fg=self._theme_color("FG"),
+            font=self._ui_font(FONT_SIZE_OFFSETS["BODY"]),
+            heading_font=self._ui_font(FONT_SIZE_OFFSETS["SMALL"]),
+            on_widths_changed=lambda widths: self._set_picker_field_widths("queue_picker", widths),
+            on_heading_click=lambda field: (self._cycle_picker_sort_field("queue_picker", field, reverse=False), refresh_results()),
+            on_heading_right_click=lambda field: (self._cycle_picker_sort_field("queue_picker", field, reverse=True), refresh_results()),
         )
-        title_list = self._create_listbox(body, selectmode=tk.SINGLE)
-        count_list.grid(row=0, column=1, sticky="ns")
-        title_list.grid(row=0, column=2, sticky="nsew")
+        title_list.grid(row=0, column=1, sticky="nsew")
 
         status_var = tk.StringVar(value=self._status_hint("queue_picker"))
         self._create_status_label(
@@ -1037,45 +1600,20 @@ class SearchPopupMixin:
         selected_indexes: set[int] = set()
         current_index = {"value": 0}
         rows_state: list[dict[str, Any]] = []
-        cursor_bg = self._theme_color("SELECTED_ROW_BG")
-        retained_bg = self._darken_hex_color(cursor_bg)
-        fg = self._theme_color("FG")
-        accent_fg = self._theme_color("FG_ACCENT")
 
         def _apply_state() -> None:
-            count_list.selection_clear(0, tk.END)
-            title_list.selection_clear(0, tk.END)
-            for widget, base_fg in ((count_list, accent_fg), (title_list, fg)):
-                for idx in range(len(rows_state)):
-                    try:
-                        widget.itemconfig(
-                            idx,
-                            bg=self._theme_color("PANEL_BG"),
-                            fg=base_fg,
-                        )
-                    except Exception:
-                        pass
-            for idx in sorted(selected_indexes):
-                if 0 <= idx < len(rows_state):
-                    try:
-                        count_list.itemconfig(idx, bg=retained_bg, fg=accent_fg)
-                        title_list.itemconfig(idx, bg=retained_bg, fg=fg)
-                    except Exception:
-                        pass
             if rows_state:
                 idx = max(0, min(current_index["value"], len(rows_state) - 1))
                 current_index["value"] = idx
-                count_list.selection_set(idx)
-                title_list.selection_set(idx)
-                count_list.activate(idx)
-                title_list.activate(idx)
-                count_list.see(idx)
-                title_list.see(idx)
-                try:
-                    count_list.itemconfig(idx, bg=cursor_bg, fg=accent_fg)
-                    title_list.itemconfig(idx, bg=cursor_bg, fg=fg)
-                except Exception:
-                    pass
+                current_video_id = str(rows_state[idx].get("video_id") or "")
+                title_list.select_item_id(current_video_id)
+                title_list.set_retained(
+                    {
+                        str(rows_state[row_idx].get("video_id") or "")
+                        for row_idx in selected_indexes
+                        if 0 <= row_idx < len(rows_state)
+                    }
+                )
                 self._render_video_preview(
                     rows_state[idx],
                     image_label=preview["image_label"],
@@ -1129,44 +1667,57 @@ class SearchPopupMixin:
 
         def refresh_results(*_args: object) -> None:
             query = query_var.get().strip()
-            previous_video_id = ""
-            if rows_state and 0 <= current_index["value"] < len(rows_state):
-                previous_video_id = str(rows_state[current_index["value"]].get("video_id") or "")
-            count_list.delete(0, tk.END)
-            title_list.delete(0, tk.END)
+            previous_video_id = title_list.selected_item_id()
+            title_list.configure_columns(self._picker_columns_for("queue_picker"))
             rows_state.clear()
-            rows_state.extend(dict(r) for r in self._search_video_titles_with_query(query, limit=300))
+            rows_state.extend(
+                self._sort_picker_rows(
+                    [dict(r) for r in self._search_video_titles_with_query(query, limit=300)],
+                    "queue_picker",
+                )
+            )
             selected_indexes.clear()
             current_index["value"] = 0
+            title_list.replace_rows(
+                [
+                    self._picker_row_values(row, "queue_picker")
+                    for row in rows_state
+                ]
+            )
             for row_idx, row in enumerate(rows_state):
-                title = str(row.get("title") or row.get("video_id") or "untitled").replace("\n", " ").strip()
-                count = int(row.get("match_count") or 0)
-                count_list.insert(tk.END, f"{count:>4}")
-                title_list.insert(tk.END, title)
                 if previous_video_id and str(row.get("video_id") or "") == previous_video_id:
                     current_index["value"] = row_idx
             _apply_state()
             status_var.set(f"{len(rows_state)} rows | stage={stage}")
 
         def _select_clicked(event: tk.Event[tk.Misc]) -> str:
-            widget = event.widget
-            try:
-                idx = int(widget.nearest(event.y))
-            except Exception:
+            item_id = title_list.item_id_at_y(int(event.y))
+            if not item_id:
                 return "break"
-            current_index["value"] = idx
-            if idx in selected_indexes:
-                selected_indexes.remove(idx)
+            current_index["value"] = next(
+                (
+                    idx
+                    for idx, row in enumerate(rows_state)
+                    if str(row.get("video_id") or "") == item_id
+                ),
+                0,
+            )
+            if current_index["value"] in selected_indexes:
+                selected_indexes.remove(current_index["value"])
             _apply_state()
             return "break"
 
         query_var.trace_add("write", refresh_results)
+        self._attach_picker_fields_menu(
+            fields_button,
+            picker_name="queue_picker",
+            on_change=refresh_results,
+        )
         self._bind_popup_close(
             popup,
             after_close=lambda: setattr(self, "_queue_picker_popup", None),
         )
         title_list.bind("<Button-1>", _select_clicked)
-        count_list.bind("<Button-1>", lambda _e: "break")
         popup.bind("<Return>", _queue_selected)
         title_list.bind("<Return>", _queue_selected)
         popup.bind("<Control-Up>", lambda _e: _move_cursor(-1, add_current=True))
@@ -1184,7 +1735,7 @@ class SearchPopupMixin:
         self._bind_fzf_like_keys(
             popup,
             entry=query_entry,
-            capture_widgets=[query_entry, title_list, count_list],
+            capture_widgets=[query_entry, title_list],
             on_enter=lambda: _queue_selected(),
             on_up=lambda: _move_cursor(-1),
             on_down=lambda: _move_cursor(1),

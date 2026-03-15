@@ -86,6 +86,7 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._channel_default_ref = ""
         self._browse_preview_cache: dict[str, dict[str, Any]] = {}
         self._browse_thumb_dir: Path | None = None
+        self._video_thumb_dir: Path | None = None
         self._browse_temp_files: set[Path] = set()
         self._split_initialized = False
         self._transcript_hidden = False
@@ -141,8 +142,15 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
         self._browse_thumb_dir = (
             self.ingester_config.db_path.parent / "browse_previews"
         )
+        self._video_thumb_dir = (
+            self.ingester_config.db_path.parent / "video_previews"
+        )
         try:
             self._browse_thumb_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            self._video_thumb_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
         self._gui_settings_path = (
@@ -258,6 +266,27 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             foreground=THEME["FG_MUTED"],
             borderwidth=0,
             padding=(8, 4),
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=THEME["SURFACE_BG"],
+            troughcolor=THEME["PANEL_BG"],
+            arrowcolor=THEME["FG_MUTED"],
+            bordercolor=THEME["BORDER"],
+            lightcolor=THEME["SURFACE_BG"],
+            darkcolor=THEME["SURFACE_BG"],
+            gripcount=0,
+        )
+        style.map(
+            "Vertical.TScrollbar",
+            background=[
+                ("active", THEME["SELECT_BG"]),
+                ("pressed", THEME["FG_ACCENT"]),
+            ],
+            arrowcolor=[
+                ("active", THEME["FG_SOFT"]),
+                ("pressed", THEME["FG"]),
+            ],
         )
         style.map(
             "Terminal.TNotebook.Tab",
@@ -416,6 +445,27 @@ class TranscriptPlayer(TranscriptMixin, PlaybackMixin, PopupMixin):
             foreground=[
                 ("selected", fg),
                 ("active", soft)
+            ],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=surface_bg,
+            troughcolor=panel_bg,
+            arrowcolor=muted,
+            bordercolor=border,
+            lightcolor=surface_bg,
+            darkcolor=surface_bg,
+            gripcount=0,
+        )
+        style.map(
+            "Vertical.TScrollbar",
+            background=[
+                ("active", self._theme_color("SELECT_BG")),
+                ("pressed", accent),
+            ],
+            arrowcolor=[
+                ("active", soft),
+                ("pressed", fg),
             ],
         )
         if hasattr(self, "title_label"):

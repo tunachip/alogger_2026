@@ -3,6 +3,7 @@ from __future__ import annotations
 import colorsys
 import tkinter as tk
 from dataclasses import dataclass
+from tkinter import ttk
 from typing import Callable
 
 from .constants import LAYOUT, POPUP_SIZES, THEME
@@ -535,3 +536,183 @@ class QueryEntry(tk.Text):
             self._hide_completion()
             return "break"
         return None
+
+
+class PickerTable(ttk.Treeview):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        columns: list[tuple[str, str, int]],
+        bg: str,
+        fg: str,
+        muted_fg: str,
+        border: str,
+        select_bg: str,
+        select_fg: str,
+        retained_bg: str,
+        retained_fg: str,
+        font: tuple[str, int] | tuple[str, int, str],
+        heading_font: tuple[str, int] | tuple[str, int, str],
+        on_widths_changed: Callable[[dict[str, int]], None] | None = None,
+        on_heading_click: Callable[[str], None] | None = None,
+        on_heading_right_click: Callable[[str], None] | None = None,
+    ) -> None:
+        self._style_name = f"PickerTable{hex(id(self))}.Treeview"
+        self._heading_style_name = f"{self._style_name}.Heading"
+        style = ttk.Style(parent)
+        style.configure(
+            self._style_name,
+            background=bg,
+            fieldbackground=bg,
+            foreground=fg,
+            bordercolor=border,
+            lightcolor=border,
+            darkcolor=border,
+            borderwidth=0,
+            rowheight=max(22, int(font[1]) + 10 if len(font) > 1 else 24),
+            font=font,
+        )
+        style.map(
+            self._style_name,
+            background=[("selected", select_bg)],
+            foreground=[("selected", select_fg)],
+        )
+        style.configure(
+            self._heading_style_name,
+            background=bg,
+            foreground=muted_fg,
+            borderwidth=0,
+            relief="flat",
+            font=heading_font,
+            padding=(8, 4),
+        )
+        super().__init__(
+            parent,
+            columns=[name for name, _label, _width in columns],
+            show="headings",
+            selectmode="browse",
+            style=self._style_name,
+        )
+        self._columns_spec = list(columns)
+        self._retained_bg = retained_bg
+        self._retained_fg = retained_fg
+        self._base_bg = bg
+        self._base_fg = fg
+        self._select_bg = select_bg
+        self._select_fg = select_fg
+        self._on_widths_changed = on_widths_changed
+        self._on_heading_click = on_heading_click
+        self._on_heading_right_click = on_heading_right_click
+        self.tag_configure("retained", background=retained_bg, foreground=retained_fg)
+        self.tag_configure("normal", background=bg, foreground=fg)
+        for name, label, width in columns:
+            self.heading(name, text=label)
+            self.column(name, width=width, stretch=True, anchor="w", minwidth=48)
+        self.bind("<Button-1>", self._on_mouse_down, add="+")
+        self.bind("<Button-3>", self._on_mouse_right_down, add="+")
+        self.bind("<ButtonRelease-1>", self._emit_widths_changed, add="+")
+        self.bind("<Configure>", self._emit_widths_changed, add="+")
+
+    def configure_columns(self, columns: list[tuple[str, str, int]]) -> None:
+        self._columns_spec = list(columns)
+        self.configure(columns=[name for name, _label, _width in columns])
+        self["displaycolumns"] = [name for name, _label, _width in columns]
+        for name, label, width in columns:
+            self.heading(name, text=label)
+            self.column(name, width=width, stretch=True, anchor="w", minwidth=48)
+
+    def replace_rows(
+        self,
+        rows: list[dict[str, str]],
+        *,
+        id_key: str = "id",
+    ) -> None:
+        for item_id in self.get_children():
+            self.delete(item_id)
+        display_columns = list(self["displaycolumns"])
+        for row in rows:
+            item_id = str(row.get(id_key) or "")
+            values = [str(row.get(column) or "") for column in display_columns]
+            if item_id:
+                self.insert("", "end", iid=item_id, values=values, tags=("normal",))
+            else:
+                self.insert("", "end", values=values, tags=("normal",))
+
+    def selected_item_id(self) -> str:
+        selection = self.selection()
+        return str(selection[0]) if selection else ""
+
+    def select_item_id(self, item_id: str) -> None:
+        if not item_id or not self.exists(item_id):
+            return
+        self.selection_set(item_id)
+        self.focus(item_id)
+        self.see(item_id)
+
+    def select_index(self, index: int) -> None:
+        children = list(self.get_children())
+        if not children:
+            return
+        target = children[max(0, min(index, len(children) - 1))]
+        self.select_item_id(str(target))
+
+    def current_index(self) -> int:
+        selected = self.selected_item_id()
+        if not selected:
+            return 0
+        children = list(self.get_children())
+        try:
+            return children.index(selected)
+        except ValueError:
+            return 0
+
+    def item_id_at_y(self, y: int) -> str:
+        return str(self.identify_row(y) or "")
+
+    def set_retained(self, retained_ids: set[str]) -> None:
+        selected = self.selected_item_id()
+        for item_id in self.get_children():
+            tags = ["normal"]
+            if str(item_id) in retained_ids and str(item_id) != selected:
+                tags = ["retained"]
+            self.item(item_id, tags=tuple(tags))
+
+    def _emit_widths_changed(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        if self._on_widths_changed is None:
+            return
+        widths = {
+            str(name): int(self.column(name, "width"))
+            for name, _label, _width in self._columns_spec
+        }
+        self._on_widths_changed(widths)
+
+    def _heading_column_from_event(self, event: tk.Event[tk.Misc]) -> str:
+        region = str(self.identify_region(int(getattr(event, "x", 0)), int(getattr(event, "y", 0))) or "")
+        if region != "heading":
+            return ""
+        column_token = str(self.identify_column(int(getattr(event, "x", 0))) or "")
+        if not column_token.startswith("#"):
+            return ""
+        try:
+            index = int(column_token[1:]) - 1
+        except Exception:
+            return ""
+        columns = list(self["displaycolumns"])
+        if index < 0 or index >= len(columns):
+            return ""
+        return str(columns[index])
+
+    def _on_mouse_down(self, event: tk.Event[tk.Misc]) -> str | None:
+        column = self._heading_column_from_event(event)
+        if not column or self._on_heading_click is None:
+            return None
+        self._on_heading_click(column)
+        return "break"
+
+    def _on_mouse_right_down(self, event: tk.Event[tk.Misc]) -> str | None:
+        column = self._heading_column_from_event(event)
+        if not column or self._on_heading_right_click is None:
+            return None
+        self._on_heading_right_click(column)
+        return "break"

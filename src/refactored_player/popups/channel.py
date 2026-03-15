@@ -37,12 +37,20 @@ class ChannelPopupMixin:
             f"{base}/default.jpg",
         ]
 
-    def _download_browse_thumbnail(self, video_id: str, thumbnail_url: str) -> Path | None:
+    def _download_browse_thumbnail(
+        self,
+        video_id: str,
+        thumbnail_url: str,
+        *,
+        cache_dir: Path | None = None,
+        temporary: bool = True,
+    ) -> Path | None:
         if not video_id or not thumbnail_url:
             return None
-        if self._browse_thumb_dir is None:
+        target_dir = cache_dir or self._browse_thumb_dir
+        if target_dir is None:
             return None
-        out_path = self._browse_thumb_dir / f"{video_id}.png"
+        out_path = target_dir / f"{video_id}.png"
         if out_path.exists():
             return out_path
         candidate_urls: list[str] = []
@@ -65,11 +73,13 @@ class ChannelPopupMixin:
                     with Image.open(io.BytesIO(raw)) as img:
                         img = img.convert("RGB")
                         img.save(out_path, format="PNG")
-                    self._browse_temp_files.add(out_path)
+                    if temporary:
+                        self._browse_temp_files.add(out_path)
                     return out_path
-                raw_path = self._browse_thumb_dir / f"{video_id}.img"
+                raw_path = target_dir / f"{video_id}.img"
                 raw_path.write_bytes(raw)
-                self._browse_temp_files.add(raw_path)
+                if temporary:
+                    self._browse_temp_files.add(raw_path)
                 return raw_path
             except Exception:
                 continue

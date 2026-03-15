@@ -31,7 +31,7 @@ class SettingsPopupMixin:
         tabs = ttk.Notebook(content, style="Terminal.TNotebook")
         tabs.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 6))
 
-        tab_names = ["Ingest", "Theme", "Subscription", "AI", "Keybinds"]
+        tab_names = ["Ingest", "Theme", "Search", "Subscription", "AI", "Keybinds"]
         tab_frames: list[tk.Frame] = []
         key_lists: list[tk.Listbox] = []
         val_lists: list[tk.Listbox] = []
@@ -251,6 +251,29 @@ class SettingsPopupMixin:
                 ])
                 return rows
             if tab_idx == 2:
+                return [
+                    {
+                        "id": "defer_local_picker_preview",
+                        "key": "Instant Local Preview",
+                        "value": "on" if bool(self._ai_settings.get("defer_local_picker_preview", True)) else "off",
+                    },
+                    {
+                        "id": "defer_browse_preview",
+                        "key": "Instant Browse Preview",
+                        "value": "on" if bool(self._ai_settings.get("defer_browse_preview", True)) else "off",
+                    },
+                    {
+                        "id": "video_picker_default_field",
+                        "key": "Open Default Field",
+                        "value": str(self._ai_settings.get("video_picker_default_field") or "title"),
+                    },
+                    {
+                        "id": "finder_default_field",
+                        "key": "Finder Default Field",
+                        "value": str(self._ai_settings.get("finder_default_field") or "ts"),
+                    },
+                ]
+            if tab_idx == 3:
                 rows = [
                     {
                         "id": "subscription_db_max_videos",
@@ -280,7 +303,7 @@ class SettingsPopupMixin:
                 except Exception:
                     pass
                 return rows
-            if tab_idx == 3:
+            if tab_idx == 4:
                 return [
                     {
                         "id": "ai_provider",
@@ -447,8 +470,13 @@ class SettingsPopupMixin:
                     "show_root_top_bar",
                     "show_launch_bar",
                     "show_popup_top_bar",
+                    "defer_local_picker_preview",
+                    "defer_browse_preview",
                 }:
                     self._ai_settings[row_id] = token.lower() in {"1", "true", "yes", "on"}
+                elif row_id in {"video_picker_default_field", "finder_default_field"}:
+                    cleaned = token.strip().lower().removeprefix("$") or ("title" if row_id == "video_picker_default_field" else "ts")
+                    self._ai_settings[row_id] = cleaned
                 elif row_id == "subscription_db_max_videos":
                     self._ai_settings["subscription_db_max_videos"] = max(
                         0, int(token or "0"))

@@ -11,6 +11,7 @@
   "default_worker_count": 6,
   "default_downloaders": 6,
   "default_transcribers": 1,
+  "default_summarizers": 1,
   "job_retry_limit": 1,
   "auto_transcribe_default": true,
   "subscription_db_max_videos": 0,
@@ -23,7 +24,7 @@
   "theme_fg": "#ffffff",
   "theme_soft_fg": "#d2d2d2",
   "theme_muted_fg": "#8f8f8f",
-  "theme_accent_fg": "#00ffff",
+  "theme_accent_fg": "#ffff77",
   "theme_info_fg": "#7fd7ff",
   "theme_idle_fg": "#39d5ff",
   "theme_error_fg": "#ff8a8a",
@@ -36,6 +37,29 @@
   "show_root_top_bar": true,
   "show_launch_bar": true,
   "show_popup_top_bar": true,
+  "video_picker_fields": [
+    "title",
+    "creator"
+  ],
+  "queue_picker_fields": [
+    "title",
+    "creator",
+    "length"
+  ],
+  "video_picker_field_widths": {
+    "title": 119,
+    "creator": 118,
+    "length": 119
+  },
+  "queue_picker_field_widths": {},
+  "video_picker_sort_fields": [
+    "title"
+  ],
+  "queue_picker_sort_fields": [],
+  "defer_local_picker_preview": true,
+  "defer_browse_preview": true,
+  "video_picker_default_field": "title",
+  "finder_default_field": "ts",
   "keybinds": {
     "open_command": "Ctrl+P",
     "open_ingest": "Ctrl+N",
@@ -59,5 +83,6 @@
     "clear_input": "Ctrl+C",
     "toggle_transcript": "Ctrl+T",
     "toggle_details": "Ctrl+D"
-  }
+  },
+  "defer_picker_preview": false
 }
