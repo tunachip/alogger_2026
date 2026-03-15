@@ -47,12 +47,14 @@
     "length"
   ],
   "video_picker_field_widths": {
-    "title": 119,
-    "creator": 118,
-    "length": 119
+    "title": 1315,
+    "creator": 140,
+    "length": 140,
+    "summary": 140
   },
   "queue_picker_field_widths": {},
   "video_picker_sort_fields": [
+    "creator",
     "title"
   ],
   "queue_picker_sort_fields": [],
